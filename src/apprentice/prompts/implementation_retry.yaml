@@ -1,0 +1,30 @@
+name: implementation_retry
+version: "1.0.0"
+description: "Retry prompt for implementation agent after validation failure"
+
+system_prompt: |
+  You are an expert algorithm implementer. Your previous attempt had issues
+  that need to be fixed. Review the feedback carefully and produce a corrected
+  implementation.
+
+variables:
+  - algorithm_name
+  - tier
+  - previous_code
+  - validation_issues
+
+user_prompt_template: |
+  Your previous implementation of **{{ algorithm_name }}** (tier {{ tier }}) had the following issues:
+
+  {% for issue in validation_issues %}
+  - [{{ issue.severity }}] {{ issue.message }}
+    Suggestion: {{ issue.suggestion }}
+  {% endfor %}
+
+  Previous code:
+  ```python
+  {{ previous_code }}
+  ```
+
+  Please fix ALL listed issues and return the corrected implementation.
+  Return **only** the Python source code inside a ```python ... ``` fence.

@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from apprentice.core.config import ApprenticeConfig
-    from apprentice.core.pipeline import PipelineResult
+    from apprentice.core.orchestrator import OrchestrationResult
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -83,67 +83,34 @@ def _load_cfg(config_path: Path | None) -> ApprenticeConfig:
     return cfg
 
 
-def _create_pipeline(cfg: ApprenticeConfig) -> tuple[Any, Any, Any]:
-    """Create pipeline with all stages and gates wired."""
-    from apprentice.core.pipeline import Pipeline, PipelineConfig
-    from apprentice.gates.consistency import ConsistencyGate
-    from apprentice.gates.correctness import CorrectnessGate
-    from apprentice.gates.lint import LintGate
-    from apprentice.gates.schema_compliance import SchemaComplianceGate
+def _create_orchestrator(cfg: ApprenticeConfig) -> tuple[Any, Any]:
+    """Create orchestrator with implementation agent wired."""
+    from apprentice.agents.implementation import ImplementationAgent
+    from apprentice.core.orchestrator import BudgetAllocation, OrchestratorAgent
     from apprentice.providers import create_provider
-    from apprentice.stages.assessment import AssessmentStage
-    from apprentice.stages.implementation import ImplementationStage
-    from apprentice.stages.instrumentation import InstrumentationStage
-    from apprentice.stages.validation import ValidationStage
-    from apprentice.stages.visualization import VisualizationStage
 
     provider = create_provider(cfg.provider.default, cfg.provider.model)
+    agents: dict[str, Any] = {"implementation": ImplementationAgent()}
+    orchestrator = OrchestratorAgent(agents=agents, provider=provider)
 
-    stages: dict[str, Any] = {
-        "implementation": ImplementationStage(),
-        "instrumentation": InstrumentationStage(),
-        "visualization": VisualizationStage(),
-        "assessment": AssessmentStage(),
-        "validation": ValidationStage(),
-    }
-
-    gates: dict[str, Any] = {
-        "lint": LintGate(),
-        "correctness": CorrectnessGate(),
-        "consistency": ConsistencyGate(),
-        "schema_compliance": SchemaComplianceGate(),
-    }
-
-    pipeline_config = PipelineConfig(
-        stages=[
-            "implementation",
-            "instrumentation",
-            "visualization",
-            "assessment",
-            "validation",
-        ],
-        gates={
-            "lint": ["implementation"],
-            "correctness": ["implementation"],
-            "consistency": ["validation"],
-            "schema_compliance": ["validation"],
-        },
-        parallel_stages=[["instrumentation", "visualization", "assessment"]],
-        budget_per_stage=cfg.budget.stage.max_tokens_per_stage,
+    budget = BudgetAllocation(
+        total_tokens=cfg.budget.cycle.max_tokens_per_cycle,
+        total_usd=cfg.budget.cycle.max_cost_per_cycle_usd,
+        implementation_pct=cfg.budget.agent.implementation_budget_pct,
+        tool_agent_pct=cfg.budget.agent.tool_agent_budget_pct,
+        review_pct=cfg.budget.agent.review_budget_pct,
     )
-
-    pipeline = Pipeline(stages=stages, gates=gates, config=pipeline_config)
-    return pipeline, provider, pipeline_config
+    return orchestrator, budget
 
 
 def _cmd_build(cfg: ApprenticeConfig, algorithm: str, tier: int, description: str) -> int:
     from apprentice.core.observability import get_logger
-    from apprentice.models.work_item import PipelineContext, WorkItem, WorkItemSource
+    from apprentice.models.work_item import WorkItem, WorkItemSource
 
     logger = get_logger(__name__)
     logger.info("build started: %s (tier %d)", algorithm, tier)
 
-    pipeline, provider, _ = _create_pipeline(cfg)
+    orchestrator, budget = _create_orchestrator(cfg)
 
     work_item = WorkItem(
         id=f"manual-{algorithm}",
@@ -151,20 +118,14 @@ def _cmd_build(cfg: ApprenticeConfig, algorithm: str, tier: int, description: st
         tier=tier,
         source=WorkItemSource.MANUAL,
         rationale=description,
-        allocated_tokens=cfg.budget.cycle.max_tokens_per_cycle,
-    )
-
-    context = PipelineContext(
-        config={"provider": provider, "references": [], "artifacts": {}},
-        budget_remaining_tokens=cfg.budget.cycle.max_tokens_per_cycle,
-        budget_remaining_usd=cfg.budget.cycle.max_cost_per_cycle_usd,
+        allocated_tokens=budget.total_tokens,
     )
 
     start = time.monotonic()
-    result = pipeline.run(work_item, context)
+    result = orchestrator.orchestrate(work_item, budget)
     elapsed = time.monotonic() - start
 
-    _print_pipeline_result(result, elapsed)
+    _print_orchestration_result(result, elapsed)
     return 0 if result.success else 1
 
 
@@ -258,8 +219,18 @@ def _cmd_config(cfg: ApprenticeConfig) -> int:
     return 0
 
 
-def _print_pipeline_result(result: PipelineResult, elapsed: float) -> None:
+def _print_orchestration_result(result: OrchestrationResult, elapsed: float) -> None:
     bundle = result.artifacts
+    agent_summaries = [
+        {
+            "agent": ar.agent_name,
+            "success": ar.success,
+            "tokens": ar.tokens_used,
+            "cost_usd": ar.cost_usd,
+            "attempts": ar.attempt_number,
+        }
+        for ar in result.agent_results
+    ]
     _print_json(
         {
             "success": result.success,
@@ -274,8 +245,7 @@ def _print_pipeline_result(result: PipelineResult, elapsed: float) -> None:
                 "manim_scene": bundle.manim_scene_path,
                 "anki_deck": bundle.anki_deck_path,
             },
-            "stages_run": len(result.stage_results),
-            "gates_run": len(result.gate_results),
+            "agents": agent_summaries,
             "total_tokens": result.total_tokens,
             "total_cost_usd": result.total_cost_usd,
             "duration_seconds": round(elapsed, 2),
