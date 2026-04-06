@@ -115,10 +115,19 @@ class StageBudgetConfig:
 
 
 @dataclass(frozen=True)
+class AgentBudgetConfig:
+    max_tokens_per_agent_call: int
+    implementation_budget_pct: int
+    tool_agent_budget_pct: int
+    review_budget_pct: int
+
+
+@dataclass(frozen=True)
 class BudgetConfig:
     global_budget: GlobalBudgetConfig
     cycle: CycleBudgetConfig
     stage: StageBudgetConfig
+    agent: AgentBudgetConfig
 
 
 @dataclass(frozen=True)
@@ -170,10 +179,18 @@ class TemplatesConfig:
 
 
 @dataclass(frozen=True)
+class AgentsConfig:
+    max_implementation_retries: int
+    max_review_rounds: int
+    max_tool_agent_retries: int
+
+
+@dataclass(frozen=True)
 class ApprenticeConfig:
     budget: BudgetConfig
     rate_limits: RateLimitsConfig
     gates: GatesConfig
+    agents: AgentsConfig
     circuit_breaker: CircuitBreakerConfig
     provider: ProviderConfig
     observability: ObservabilityConfig
@@ -202,7 +219,18 @@ def _parse_budget(data: dict[str, object]) -> BudgetConfig:
     stage = StageBudgetConfig(
         max_tokens_per_stage=_require_int(stage_raw, "max_tokens_per_stage", "budget.stage"),
     )
-    return BudgetConfig(global_budget=global_budget, cycle=cycle, stage=stage)
+    agent_raw = _get_section(raw, "agent")
+    agent = AgentBudgetConfig(
+        max_tokens_per_agent_call=_require_int(
+            agent_raw, "max_tokens_per_agent_call", "budget.agent"
+        ),
+        implementation_budget_pct=_require_int(
+            agent_raw, "implementation_budget_pct", "budget.agent"
+        ),
+        tool_agent_budget_pct=_require_int(agent_raw, "tool_agent_budget_pct", "budget.agent"),
+        review_budget_pct=_require_int(agent_raw, "review_budget_pct", "budget.agent"),
+    )
+    return BudgetConfig(global_budget=global_budget, cycle=cycle, stage=stage, agent=agent)
 
 
 def _parse_rate_limits(data: dict[str, object]) -> RateLimitsConfig:
@@ -223,6 +251,15 @@ def _parse_gates(data: dict[str, object]) -> GatesConfig:
         max_lint_retries=_require_int(raw, "max_lint_retries", "gates"),
         max_correctness_retries=_require_int(raw, "max_correctness_retries", "gates"),
         max_review_rounds=_require_int(raw, "max_review_rounds", "gates"),
+    )
+
+
+def _parse_agents(data: dict[str, object]) -> AgentsConfig:
+    raw = _get_section(data, "agents")
+    return AgentsConfig(
+        max_implementation_retries=_require_int(raw, "max_implementation_retries", "agents"),
+        max_review_rounds=_require_int(raw, "max_review_rounds", "agents"),
+        max_tool_agent_retries=_require_int(raw, "max_tool_agent_retries", "agents"),
     )
 
 
@@ -289,6 +326,7 @@ def load_config(path: Path | None = None) -> ApprenticeConfig:
         budget=_parse_budget(data),
         rate_limits=_parse_rate_limits(data),
         gates=_parse_gates(data),
+        agents=_parse_agents(data),
         circuit_breaker=_parse_circuit_breaker(data),
         provider=_parse_provider(data),
         observability=_parse_observability(data),
