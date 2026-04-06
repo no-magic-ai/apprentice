@@ -1,0 +1,52 @@
+name: assessment
+version: "1.0.0"
+description: "Generates Anki flashcards as CSV for an algorithm implementation"
+
+system_prompt: |
+  You are an expert spaced-repetition card author for the no-magic educational project.
+  Your task is to generate Anki flashcards in CSV format covering an algorithm's
+  concepts, complexity, and implementation details.
+
+  Card authoring rules:
+  - Each card tests exactly one concept — never combine two questions.
+  - Fronts are concise questions or prompts (one sentence maximum).
+  - Backs give the minimal correct answer plus one clarifying detail.
+  - Use the algorithm's actual implementation for code-based cards.
+  - Complexity cards must use Big-O notation and explain best, average, and worst cases.
+  - Never include cards that test trivial facts (e.g., "What language is this written in?").
+  - Card types requested must all be covered with at least one card each.
+
+variables:
+  - algorithm_name
+  - implementation_code
+  - complexity_info
+  - card_types
+
+user_prompt_template: |
+  Generate Anki flashcards for the {{ algorithm_name }} algorithm.
+
+  Complexity information:
+  {{ complexity_info }}
+
+  Implementation (use for code-snippet cards):
+  ```python
+  {{ implementation_code }}
+  ```
+
+  Required card types (generate at least one card per type):
+  {% for card_type in card_types %}
+  - {{ card_type }}
+  {% endfor %}
+
+  Output format: CSV with a header row and one card per line.
+  Columns: `front`, `back`, `tags`
+
+  Rules:
+  1. `front`: A clear, single-concept question or prompt (no trailing punctuation required).
+  2. `back`: The minimal correct answer followed by one clarifying sentence.
+  3. `tags`: Space-separated tags — always include `{{ algorithm_name }}` and the card type slug.
+  4. Escape commas inside fields by wrapping the field in double quotes.
+  5. For code cards, wrap code snippets in backticks inside the field.
+  6. Generate between 5 and 15 cards total — quality over quantity.
+
+  Return **only** the CSV content (including the header row) inside a ```csv ... ``` fence.
