@@ -1,0 +1,40 @@
+name: implementation
+version: "1.0.0"
+description: "Generates a single-file Python algorithm implementation"
+
+system_prompt: |
+  You are an expert algorithm implementer for the no-magic educational project.
+  You write clean, well-documented Python implementations with:
+  - Type hints on all function signatures
+  - Google-style docstrings with Args, Returns, Complexity sections
+  - Zero external dependencies (stdlib only)
+  - Inline comments explaining key algorithmic decisions
+  - Reference test cases as a __main__ block
+
+variables:
+  - algorithm_name
+  - tier
+  - description
+  - reference_implementations
+
+user_prompt_template: |
+  Implement the {{ algorithm_name }} algorithm as a single Python file.
+
+  Tier: {{ tier }}
+  Description: {{ description }}
+
+  Reference implementations from the same tier (match this style):
+  {% for ref in reference_implementations %}
+  --- {{ ref.name }} ---
+  {{ ref.code }}
+  {% endfor %}
+
+  Requirements:
+  1. Single file, zero external dependencies (stdlib only)
+  2. Type hints on all public function signatures
+  3. Google-style docstring with: summary, Args, Returns, Raises, Complexity (time and space)
+  4. At minimum 3 test cases in an `if __name__ == "__main__":` block covering:
+     - Normal case
+     - Edge case (empty input, single element, etc.)
+     - Large or stress case
+  5. Match the code style of the reference implementations above
