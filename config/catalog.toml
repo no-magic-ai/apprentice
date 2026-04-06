@@ -1,0 +1,34 @@
+# Algorithm registry — tracks existing and candidate algorithms.
+# Used by the Discovery stage for gap analysis and deduplication.
+
+[metadata]
+version = "1.0.0"
+last_updated = "2025-01-01"
+
+# Seed entries from no-magic repo — expand as catalog grows.
+# Each entry records the algorithm's tier and known aliases for fuzzy dedup.
+
+[[algorithms]]
+name = "binary_search"
+tier = 1
+aliases = ["bisect", "binary_search_iterative"]
+
+[[algorithms]]
+name = "bubble_sort"
+tier = 1
+aliases = ["bubblesort"]
+
+[[algorithms]]
+name = "linear_regression"
+tier = 2
+aliases = ["ols", "ordinary_least_squares"]
+
+[[algorithms]]
+name = "quicksort"
+tier = 2
+aliases = ["quick_sort", "qsort"]
+
+[[algorithms]]
+name = "dijkstra"
+tier = 3
+aliases = ["dijkstras_algorithm", "shortest_path_dijkstra"]

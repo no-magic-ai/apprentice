@@ -1,0 +1,47 @@
+[budget.global]
+monthly_token_ceiling = 2_000_000
+monthly_cost_ceiling_usd = 50.0
+
+[budget.cycle]
+max_tokens_per_cycle = 100_000
+max_cost_per_cycle_usd = 5.0
+max_algorithms_per_cycle = 3
+
+[budget.stage]
+max_tokens_per_stage = 20_000
+
+[rate_limits]
+max_prs_per_day = 2
+max_prs_per_week = 5
+max_concurrent_items = 1
+cooldown_hours = 4
+max_files_per_pr = 10
+max_lines_per_pr = 2000
+
+[gates]
+max_lint_retries = 2
+max_correctness_retries = 1
+max_review_rounds = 2
+
+[circuit_breaker]
+failure_threshold = 3
+half_open_probe_after_minutes = 60
+max_open_cycles_before_manual_reset = 3
+
+[provider]
+default = "anthropic"
+model = "claude-sonnet-4-20250514"
+fallback_model = "claude-haiku-4-5-20251001"
+fallback_trigger = "budget_warning"
+
+[observability]
+log_level = "INFO"
+log_format = "json"
+log_path = "${HOME}/.apprentice/logs"
+metrics_enabled = true
+alert_on_circuit_open = true
+alert_webhook = ""
+
+[templates]
+version = "1.0.0"
+base_path = "config/templates"
