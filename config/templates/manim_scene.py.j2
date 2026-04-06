@@ -1,0 +1,25 @@
+"""Manim visualization for {{ algorithm_name }}."""
+
+from __future__ import annotations
+
+from manim import *
+
+
+class {{ class_name }}Scene(Scene):
+    """Animated visualization of the {{ algorithm_name }} algorithm."""
+
+    # Color palette matching no-magic style
+    HIGHLIGHT_COLOR = YELLOW
+    COMPARE_COLOR = RED
+    SWAP_COLOR = GREEN
+    DONE_COLOR = BLUE
+
+    def construct(self) -> None:
+        title = Text("{{ algorithm_name }}", font_size=36)
+        self.play(Write(title))
+        self.wait(0.5)
+        self.play(title.animate.to_edge(UP))
+
+        {{ animation_steps }}
+
+        self.wait(1)
