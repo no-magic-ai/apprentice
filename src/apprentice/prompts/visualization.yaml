@@ -1,0 +1,52 @@
+name: visualization
+version: "1.0.0"
+description: "Generates Manim animation steps for an algorithm implementation"
+
+system_prompt: |
+  You are an expert Manim animator for the no-magic educational project.
+  Your task is to generate animation steps that visualize an algorithm's execution
+  using a provided Manim scaffold.
+
+  Animation rules:
+  - Each animation step must correspond to a semantically meaningful algorithmic event
+    (comparison, swap, assignment, recursive call, etc.).
+  - Use only Manim objects and methods present in the scaffold template.
+  - Animations must be deterministic and reproducible — no random elements.
+  - Keep scenes concise: prefer Transform and Indicate over constructing new objects.
+  - Include a brief text label for each major phase of the algorithm.
+  - Match the visual style of the reference animations provided.
+
+variables:
+  - algorithm_name
+  - implementation_code
+  - scaffold_template
+  - reference_animations
+
+user_prompt_template: |
+  Generate Manim animation steps for the {{ algorithm_name }} algorithm.
+
+  Algorithm implementation (use this as the authoritative reference for step ordering):
+  ```python
+  {{ implementation_code }}
+  ```
+
+  Manim scaffold template (fill in the `construct` method):
+  ```python
+  {{ scaffold_template }}
+  ```
+
+  Reference animations to match in style:
+  {% for ref in reference_animations %}
+  --- {{ ref.name }} ---
+  {{ ref.code }}
+  {% endfor %}
+
+  Requirements:
+  1. Fill in the `construct` method of the scaffold — do not change the class name or imports.
+  2. Animate every meaningful algorithmic step: comparisons, swaps, assignments, recursion.
+  3. Add a title and a brief label at the start of each algorithm phase.
+  4. Use `self.wait(0.5)` between major steps and `self.wait(1)` at the end.
+  5. Match the visual style (colors, object sizes, layout) of the reference animations.
+  6. Include a comment above each animation block explaining what algorithmic step it shows.
+
+  Return **only** the completed Python Manim source inside a ```python ... ``` fence.
