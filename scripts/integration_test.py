@@ -22,12 +22,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-# Ensure src/ is importable
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from apprentice.core.config import load_config
 from apprentice.core.metrics import PipelineReport, aggregate_runs
 from apprentice.core.observability import get_logger, setup_logging
+from apprentice.core.progress import IntegrationProgress, suppress_noisy_loggers
 from apprentice.core.session_store import RunRecord, SessionStore
 
 _REPORT_DIR = Path.home() / ".apprentice" / "reports"
@@ -132,7 +132,11 @@ def _run_single(
             logger.info("completed: %s in %.1fs", algorithm, elapsed)
         else:
             record = store.fail_run(
-                record, session_state, budget_summary, elapsed, "no generated_code in session state"
+                record,
+                session_state,
+                budget_summary,
+                elapsed,
+                "no generated_code in session state",
             )
             logger.warning("failed: %s in %.1fs — no output", algorithm, elapsed)
 
@@ -144,11 +148,6 @@ def _run_single(
     return record
 
 
-def _generate_report(records: list[RunRecord]) -> PipelineReport:
-    """Generate a report from run records."""
-    return aggregate_runs(records)
-
-
 def _save_report(report: PipelineReport) -> Path:
     """Save the report as a JSON file."""
     _REPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -158,11 +157,6 @@ def _save_report(report: PipelineReport) -> Path:
     return path
 
 
-def _print_report(report: PipelineReport) -> None:
-    """Print a summary of the report."""
-    print(json.dumps(report.to_dict(), indent=2, default=str))
-
-
 def main() -> int:
     args = _parse_args()
 
@@ -170,6 +164,7 @@ def main() -> int:
     setup_logging(
         {"log_level": cfg.observability.log_level, "log_path": cfg.observability.log_path}
     )
+    suppress_noisy_loggers()
     logger = get_logger("integration_test")
 
     store = SessionStore()
@@ -179,39 +174,55 @@ def main() -> int:
         if not records:
             print("No past runs found.")
             return 0
-        report = _generate_report(records)
-        _print_report(report)
+        report = aggregate_runs(records)
+        progress = IntegrationProgress(0, "", "")
+        progress.print_summary(report)
         return 0
 
     algorithms = _select_algorithms(args.tier, args.limit)
+    backend = args.backend or cfg.provider.backend
+    model_str = args.model or cfg.provider.model
 
     if args.dry_run:
-        print(f"Would test {len(algorithms)} algorithms:")
+        from rich.console import Console
+
+        console = Console(stderr=True)
+        console.print(f"[bold]Would test {len(algorithms)} algorithms:[/]")
         for name, tier in algorithms:
-            print(f"  - {name} (tier {tier})")
-        print(f"Backend: {args.backend or cfg.provider.backend}")
-        print(f"Model: {args.model or cfg.provider.model}")
+            console.print(f"  [dim]•[/] {name} [dim](tier {tier})[/]")
+        console.print(f"[dim]Backend:[/] {backend}")
+        console.print(f"[dim]Model:[/] {model_str}")
         return 0
 
     logger.info("starting integration test: %d algorithms", len(algorithms))
+
+    ip = IntegrationProgress(len(algorithms), backend, model_str)
     records: list[RunRecord] = []
 
-    for algorithm, tier in algorithms:
-        record = _run_single(algorithm, tier, cfg, args.backend, args.model, store, logger)
-        records.append(record)
+    with ip.start():
+        for algorithm, tier in algorithms:
+            ip.on_algorithm_start(algorithm, tier)
+            record = _run_single(algorithm, tier, cfg, args.backend, args.model, store, logger)
+            records.append(record)
+            ip.on_algorithm_complete(
+                algorithm,
+                record.status == "completed",
+                record.elapsed_seconds,
+            )
 
-    report = _generate_report(records)
+    report = aggregate_runs(records)
     report_path = _save_report(report)
 
-    _print_report(report)
+    ip.print_summary(report)
     logger.info("report saved to %s", report_path)
 
     target_rate = 0.95
     if report.success_rate < target_rate:
-        logger.warning(
-            "success rate %.1f%% below target %.1f%%",
-            report.success_rate * 100,
-            target_rate * 100,
+        from rich.console import Console
+
+        Console(stderr=True).print(
+            f"[bold red]Success rate {report.success_rate * 100:.0f}% "
+            f"below target {target_rate * 100:.0f}%[/]"
         )
         return 1
 

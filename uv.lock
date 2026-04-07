@@ -199,6 +199,7 @@ dependencies = [
     { name = "litellm", version = "1.83.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.14'" },
     { name = "openai" },
     { name = "pyyaml" },
+    { name = "rich" },
 ]
 
 [package.dev-dependencies]
@@ -216,6 +217,7 @@ requires-dist = [
     { name = "litellm", specifier = ">=1.50.0" },
     { name = "openai", specifier = ">=2.30.0" },
     { name = "pyyaml", specifier = ">=6.0.3" },
+    { name = "rich", specifier = ">=14.3.3" },
     { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0" },
 ]
 

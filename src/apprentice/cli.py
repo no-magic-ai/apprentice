@@ -150,12 +150,11 @@ def _resolve_model(cfg: ApprenticeConfig, args: Any) -> Any:
 
 
 def _cmd_build(cfg: ApprenticeConfig, args: Any) -> int:
-    from apprentice.core.observability import get_logger
     from apprentice.core.orchestrator import build_pipeline, get_budget_tracker_from_pipeline
+    from apprentice.core.progress import PipelineProgress, suppress_noisy_loggers
     from apprentice.core.session_store import SessionStore
 
-    logger = get_logger(__name__)
-    logger.info("build started: %s (tier %d)", args.algorithm, args.tier)
+    suppress_noisy_loggers()
 
     store = SessionStore()
     record = store.create_run(args.algorithm, args.tier)
@@ -163,10 +162,13 @@ def _cmd_build(cfg: ApprenticeConfig, args: Any) -> int:
     model = _resolve_model(cfg, args)
     pipeline = build_pipeline(model, cfg, include_packaging=False)
 
+    progress = PipelineProgress(args.algorithm, args.tier)
     start = time.monotonic()
     try:
         session_state = asyncio.run(
-            _run_pipeline(pipeline, args.algorithm, args.tier, args.description)
+            _run_pipeline_with_progress(
+                pipeline, args.algorithm, args.tier, args.description, progress
+            )
         )
         elapsed = time.monotonic() - start
 
@@ -176,17 +178,19 @@ def _cmd_build(cfg: ApprenticeConfig, args: Any) -> int:
         has_output = bool(session_state.get("generated_code"))
         if has_output:
             store.complete_run(record, session_state, budget_summary, elapsed)
+            progress.finish(True, elapsed)
         else:
             store.fail_run(record, session_state, budget_summary, elapsed, "no output generated")
+            progress.finish(False, elapsed)
 
     except Exception as exc:
         elapsed = time.monotonic() - start
         store.fail_run(record, {}, {}, elapsed, str(exc))
-        logger.error("build failed: %s", exc)
+        progress.finish(False, elapsed)
         _print_json({"error": str(exc), "run_id": record.run_id})
         return 1
 
-    _print_build_result(args.algorithm, args.tier, session_state, elapsed, record.run_id)
+    progress.print_result(session_state, record.run_id)
     return 0
 
 
@@ -238,6 +242,17 @@ async def _run_pipeline(
     description: str,
 ) -> dict[str, Any]:
     """Run the ADK pipeline and return the final session state."""
+    return await _run_pipeline_with_progress(pipeline, algorithm, tier, description, None)
+
+
+async def _run_pipeline_with_progress(
+    pipeline: Any,
+    algorithm: str,
+    tier: int,
+    description: str,
+    progress: Any,
+) -> dict[str, Any]:
+    """Run the ADK pipeline with optional progress tracking."""
     from google.adk.agents import InvocationContext, RunConfig
     from google.adk.artifacts import InMemoryArtifactService
     from google.adk.events.event import Event
@@ -285,8 +300,13 @@ async def _run_pipeline(
         run_config=RunConfig(max_llm_calls=50),
     )
 
-    async for _event in pipeline.run_async(ctx):
-        pass
+    if progress is not None:
+        with progress.start():
+            async for event in pipeline.run_async(ctx):
+                progress.on_event(event)
+    else:
+        async for _event in pipeline.run_async(ctx):
+            pass
 
     return dict(session.state)
 
