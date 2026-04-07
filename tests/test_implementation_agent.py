@@ -40,7 +40,7 @@ class TestImplementationAgent:
         model = LiteLlm(model="anthropic/claude-sonnet-4-20250514")
         agent = build_implementation_agent(model)
         reviewer = next(a for a in agent.sub_agents if a.name == "self_reviewer")
-        assert len(reviewer.tools) >= 3
+        assert len(reviewer.tools) == 2
 
     def test_drafter_output_key(self) -> None:
         model = LiteLlm(model="anthropic/claude-sonnet-4-20250514")
