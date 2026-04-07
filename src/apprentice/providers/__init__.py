@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from apprentice.providers.anthropic import AnthropicProvider
 from apprentice.providers.base import Completion, ProviderInterface
+from apprentice.providers.factory import create_model, create_model_from_override
 from apprentice.providers.openai import OpenAIProvider
 
 __all__ = [
@@ -11,6 +12,8 @@ __all__ = [
     "Completion",
     "OpenAIProvider",
     "ProviderInterface",
+    "create_model",
+    "create_model_from_override",
     "create_provider",
 ]
 
