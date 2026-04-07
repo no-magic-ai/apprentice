@@ -51,7 +51,7 @@ class TestLoadConfig:
 
     def test_provider(self) -> None:
         cfg = load_config(_PROJECT_CONFIG)
-        assert cfg.provider.default == "anthropic"
+        assert cfg.provider.backend == "anthropic"
         assert "claude" in cfg.provider.model
 
     def test_observability(self) -> None:
