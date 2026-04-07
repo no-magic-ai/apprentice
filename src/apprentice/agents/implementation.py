@@ -9,8 +9,6 @@ from typing import TYPE_CHECKING, Any
 from google.adk.agents import LlmAgent, LoopAgent
 from google.adk.tools import exit_loop  # type: ignore[attr-defined]
 
-from apprentice.validators.tools import correctness_validate, lint_validate, stdlib_check
-
 if TYPE_CHECKING:
     from google.adk.models.lite_llm import LiteLlm
 
@@ -33,35 +31,50 @@ Write ONLY the Python source code, nothing else.
 
 _REVIEWER_INSTRUCTION = """\
 You are a code reviewer for algorithm implementations.
-Your job is to validate generated code using the available tools.
 
-Steps:
-1. First, call save_code with the generated code from the previous message to write it to disk.
-2. Use the returned file path to run stdlib_check to verify no third-party imports.
-3. Run lint_validate on the same file path to check style and structure.
-4. Run correctness_validate on the same file path to verify it executes cleanly.
+Call validate_implementation with the COMPLETE Python source code from the \
+drafter's previous message. The tool saves the code to disk and runs all \
+validators (stdlib-only imports, lint, correctness) in one step.
 
-If ALL validators pass, call the exit_loop tool to finish successfully.
-If any validator fails, summarize the issues clearly for the drafter to fix.
-Include the specific error messages and suggestions in your feedback.
+If the tool returns all_passed=true, call exit_loop immediately.
+If any validator failed, respond with a summary of the failures for the drafter.
 """
 
 
-def save_code(code: str, algorithm_name: str = "algorithm") -> dict[str, Any]:
-    """Save generated Python code to a temporary file for validation.
+def validate_implementation(code: str, algorithm_name: str = "algorithm") -> dict[str, Any]:
+    """Save code to disk and run all validators in a single call.
+
+    Writes the code to a temp file, then runs stdlib check, lint validation,
+    and correctness validation. Returns combined results.
 
     Args:
-        code: The Python source code to save.
-        algorithm_name: Name used for the temp file (default: "algorithm").
+        code: Complete Python source code to validate.
+        algorithm_name: Name for the temp file (default: "algorithm").
 
     Returns:
-        Dict with 'path' to the saved file.
+        Dict with 'all_passed' bool, 'file_path', and per-validator results.
     """
+    from apprentice.validators.tools import correctness_validate, lint_validate, stdlib_check
+
     tmp_dir = Path(tempfile.gettempdir()) / "apprentice_artifacts"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     dest = tmp_dir / f"{algorithm_name}.py"
     dest.write_text(code, encoding="utf-8")
-    return {"path": str(dest)}
+    file_path = str(dest)
+
+    stdlib_result = stdlib_check(file_path)
+    lint_result = lint_validate(file_path)
+    correctness_result = correctness_validate(file_path)
+
+    all_passed = stdlib_result["passed"] and lint_result["passed"] and correctness_result["passed"]
+
+    return {
+        "all_passed": all_passed,
+        "file_path": file_path,
+        "stdlib": stdlib_result,
+        "lint": lint_result,
+        "correctness": correctness_result,
+    }
 
 
 def build_implementation_agent(
@@ -72,7 +85,7 @@ def build_implementation_agent(
 
     The loop contains:
     1. A drafter LlmAgent that generates algorithm code
-    2. A self-reviewer LlmAgent that validates and decides retry/exit
+    2. A self-reviewer LlmAgent that validates with a single composite tool
 
     Args:
         model: LiteLlm model instance for both sub-agents.
@@ -92,7 +105,7 @@ def build_implementation_agent(
         name="self_reviewer",
         model=model,
         instruction=_REVIEWER_INSTRUCTION,
-        tools=[save_code, lint_validate, correctness_validate, stdlib_check, exit_loop],
+        tools=[validate_implementation, exit_loop],
         output_key="review_feedback",
     )
 
