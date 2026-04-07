@@ -238,7 +238,7 @@ async def _run_pipeline(
     description: str,
 ) -> dict[str, Any]:
     """Run the ADK pipeline and return the final session state."""
-    from google.adk.agents import InvocationContext
+    from google.adk.agents import InvocationContext, RunConfig
     from google.adk.artifacts import InMemoryArtifactService
     from google.adk.events.event import Event
     from google.adk.sessions import InMemorySessionService
@@ -282,6 +282,7 @@ async def _run_pipeline(
         session=session,
         session_service=session_service,
         artifact_service=artifact_service,
+        run_config=RunConfig(),
     )
 
     async for _event in pipeline.run_async(ctx):
@@ -292,7 +293,7 @@ async def _run_pipeline(
 
 async def _run_agent(agent: Any, prompt: str) -> dict[str, Any]:
     """Run a single ADK agent and return session state."""
-    from google.adk.agents import InvocationContext
+    from google.adk.agents import InvocationContext, RunConfig
     from google.adk.artifacts import InMemoryArtifactService
     from google.adk.events.event import Event
     from google.adk.sessions import InMemorySessionService
@@ -324,6 +325,7 @@ async def _run_agent(agent: Any, prompt: str) -> dict[str, Any]:
         session=session,
         session_service=session_service,
         artifact_service=artifact_service,
+        run_config=RunConfig(),
     )
 
     async for _event in agent.run_async(ctx):
