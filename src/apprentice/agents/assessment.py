@@ -14,7 +14,8 @@ You are an expert spaced-repetition card author for the no-magic educational pro
 Your task is to generate Anki flashcards in CSV format covering an algorithm's
 concepts, complexity, and implementation details.
 
-The implementation code is available at: {implementation_path}
+The implementation code is provided in the conversation history as
+the generated_code output from the drafter agent.
 
 Card authoring rules:
 - Each card tests exactly one concept — never combine two questions.
@@ -42,7 +43,7 @@ Do NOT use markdown fences. Write ONLY the CSV content, nothing else.
 def build_assessment_agent(model: LiteLlm) -> LlmAgent:
     """Build an ADK LlmAgent for Anki flashcard generation.
 
-    Reads {implementation_path} from session state and produces
+    Reads the generated code from conversation history and produces
     a CSV-format Anki deck.
 
     Args:

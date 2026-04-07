@@ -19,7 +19,8 @@ You are an expert Manim animator for the no-magic educational project.
 Your task is to generate a complete Manim animation scene that visualizes
 an algorithm's execution.
 
-The implementation code is available at: {implementation_path}
+The implementation code is provided in the conversation history as
+the generated_code output from the drafter agent.
 
 Animation rules:
 - Each animation step must correspond to a semantically meaningful algorithmic event
@@ -54,7 +55,7 @@ def load_manim_template() -> dict[str, Any]:
 def build_visualization_agent(model: LiteLlm) -> LlmAgent:
     """Build an ADK LlmAgent for Manim visualization generation.
 
-    Reads {implementation_path} from session state and produces
+    Reads the generated code from conversation history and produces
     a Manim Scene script.
 
     Args:

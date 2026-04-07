@@ -14,9 +14,10 @@ You are an expert in algorithm instrumentation for the no-magic educational proj
 Your task is to add trace hooks to a clean algorithm implementation so that learners
 can observe each meaningful step as it executes.
 
-The implementation code is available at: {implementation_path}
+The original implementation code is provided in the conversation history as
+the generated_code output from the drafter agent.
 
-Read the implementation and add trace hooks following these rules:
+Instrumentation rules:
 - Never alter the algorithm's correctness or time complexity class.
 - Emit trace events as JSON dicts with keys: "step", "operation", "state".
 - Place hooks at semantically meaningful points: comparisons, swaps,
@@ -34,7 +35,7 @@ Write ONLY the Python source code, nothing else.
 def build_instrumentation_agent(model: LiteLlm) -> LlmAgent:
     """Build an ADK LlmAgent for algorithm instrumentation.
 
-    Reads {implementation_path} from session state and produces
+    Reads the generated code from conversation history and produces
     instrumented code with trace hooks.
 
     Args:

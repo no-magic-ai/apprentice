@@ -282,7 +282,7 @@ async def _run_pipeline(
         session=session,
         session_service=session_service,
         artifact_service=artifact_service,
-        run_config=RunConfig(),
+        run_config=RunConfig(max_llm_calls=50),
     )
 
     async for _event in pipeline.run_async(ctx):
@@ -325,7 +325,7 @@ async def _run_agent(agent: Any, prompt: str) -> dict[str, Any]:
         session=session,
         session_service=session_service,
         artifact_service=artifact_service,
-        run_config=RunConfig(),
+        run_config=RunConfig(max_llm_calls=30),
     )
 
     async for _event in agent.run_async(ctx):
