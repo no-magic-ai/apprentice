@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import tempfile
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from google.adk.agents import LlmAgent, LoopAgent
 from google.adk.tools import exit_loop  # type: ignore[attr-defined]
 
+from apprentice.validators.tools import correctness_validate, lint_validate, stdlib_check
+
 if TYPE_CHECKING:
     from google.adk.models.lite_llm import LiteLlm
-
-from apprentice.validators.tools import correctness_validate, lint_validate, stdlib_check
 
 _DRAFTER_INSTRUCTION = """\
 You are an expert algorithm implementer for the no-magic educational project.
@@ -22,29 +24,44 @@ You write clean, well-documented Python implementations with:
 - Reference test cases in an `if __name__ == "__main__":` block
 
 Generate the algorithm implementation based on the task description.
-If previous feedback is available in {{review_feedback}}, fix ALL listed issues.
+If the conversation history contains feedback from a previous review,
+fix ALL listed issues in your new implementation.
 
 Write the complete Python source code. Do NOT use markdown fences.
 Write ONLY the Python source code, nothing else.
-
-Save the generated code by writing it to the session state under the key 'generated_code'.
 """
 
 _REVIEWER_INSTRUCTION = """\
 You are a code reviewer for algorithm implementations.
 Your job is to validate generated code using the available tools.
 
-The generated code is available at the file path in {{implementation_path}}.
-
 Steps:
-1. Run stdlib_check on the implementation file to verify no third-party imports.
-2. Run lint_validate on the implementation file to check style and structure.
-3. Run correctness_validate on the implementation file to verify it executes cleanly.
+1. First, call save_code with the generated code from the previous message to write it to disk.
+2. Use the returned file path to run stdlib_check to verify no third-party imports.
+3. Run lint_validate on the same file path to check style and structure.
+4. Run correctness_validate on the same file path to verify it executes cleanly.
 
 If ALL validators pass, call the exit_loop tool to finish successfully.
 If any validator fails, summarize the issues clearly for the drafter to fix.
 Include the specific error messages and suggestions in your feedback.
 """
+
+
+def save_code(code: str, algorithm_name: str = "algorithm") -> dict[str, Any]:
+    """Save generated Python code to a temporary file for validation.
+
+    Args:
+        code: The Python source code to save.
+        algorithm_name: Name used for the temp file (default: "algorithm").
+
+    Returns:
+        Dict with 'path' to the saved file.
+    """
+    tmp_dir = Path(tempfile.gettempdir()) / "apprentice_artifacts"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    dest = tmp_dir / f"{algorithm_name}.py"
+    dest.write_text(code, encoding="utf-8")
+    return {"path": str(dest)}
 
 
 def build_implementation_agent(
@@ -75,7 +92,7 @@ def build_implementation_agent(
         name="self_reviewer",
         model=model,
         instruction=_REVIEWER_INSTRUCTION,
-        tools=[lint_validate, correctness_validate, stdlib_check, exit_loop],
+        tools=[save_code, lint_validate, correctness_validate, stdlib_check, exit_loop],
         output_key="review_feedback",
     )
 
