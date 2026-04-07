@@ -1,290 +1,119 @@
-"""OrchestratorAgent — coordinates agents to produce a complete algorithm entry."""
+"""ADK Orchestrator — builds the full agent pipeline using ADK primitives."""
 
 from __future__ import annotations
 
-import time
-import uuid
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from apprentice.core.observability import get_logger, log_stage_metrics
-from apprentice.models.artifact import ArtifactBundle
-from apprentice.models.work_item import WorkItem, WorkItemStatus
+from google.adk.agents import ParallelAgent, SequentialAgent
 
 if TYPE_CHECKING:
-    from apprentice.agents.base import AgentInterface
-    from apprentice.models.agent import AgentContext, AgentResult, AgentTask
+    from google.adk.models.lite_llm import LiteLlm
 
-_FALLBACK_PCT = 10
-_IMPLEMENTATION_PCT = 40
-_TOOL_AGENT_PCT = 15
-_REVIEW_PCT = 15
+from apprentice.agents.assessment import build_assessment_agent
+from apprentice.agents.implementation import build_implementation_agent
+from apprentice.agents.instrumentation import build_instrumentation_agent
+from apprentice.agents.packaging import build_packaging_agent
+from apprentice.agents.review import build_review_agent
+from apprentice.agents.visualization import build_visualization_agent
+from apprentice.core.budget import (
+    BudgetTracker,
+    make_after_agent_callback,
+    make_before_agent_callback,
+)
 
-
-@dataclass
-class BudgetAllocation:
-    """Per-agent token budget, derived from work item total."""
-
-    total_tokens: int
-    total_usd: float
-    implementation_pct: int = _IMPLEMENTATION_PCT
-    tool_agent_pct: int = _TOOL_AGENT_PCT
-    review_pct: int = _REVIEW_PCT
-
-    def for_agent(self, agent_type: str) -> tuple[int, float]:
-        """Return (tokens, usd) allocation for an agent type.
-
-        Args:
-            agent_type: One of "implementation", "instrumentation", or a tool-agent
-                        name. Unrecognised types receive a 10% fallback.
-
-        Returns:
-            A (tokens, usd) tuple derived from the percentage of the total budget.
-        """
-        pct_map: dict[str, int] = {
-            "implementation": self.implementation_pct,
-            "instrumentation": self.tool_agent_pct,
-            "visualization": self.tool_agent_pct,
-            "anki": self.tool_agent_pct,
-            "review": self.review_pct,
-        }
-        pct = pct_map.get(agent_type, _FALLBACK_PCT)
-        tokens = int(self.total_tokens * pct / 100)
-        usd = self.total_usd * pct / 100
-        return tokens, usd
+if TYPE_CHECKING:
+    from apprentice.core.config import ApprenticeConfig
 
 
-@dataclass
-class OrchestrationResult:
-    """Complete result of an orchestrated build."""
+def build_pipeline(
+    model: LiteLlm,
+    config: ApprenticeConfig,
+    include_packaging: bool = False,
+) -> SequentialAgent:
+    """Build the full ADK pipeline as a SequentialAgent.
 
-    work_item: WorkItem
-    artifacts: ArtifactBundle
-    agent_results: list[AgentResult] = field(default_factory=list)
-    total_tokens: int = 0
-    total_cost_usd: float = 0.0
-    success: bool = False
+    Pipeline structure:
+        1. Implementation (LoopAgent: drafter → self_reviewer, max 3 iterations)
+        2. Parallel artifact generation:
+           - Instrumentation (LlmAgent)
+           - Visualization (LlmAgent)
+           - Assessment (LlmAgent)
+        3. Review (LoopAgent: reviewer, max 2 iterations)
+        4. Packaging (LlmAgent, only when include_packaging=True)
+
+    Args:
+        model: LiteLlm model instance for all agents.
+        config: Full apprentice configuration.
+        include_packaging: Whether to include the packaging agent
+            (True for 'submit', False for 'build').
+
+    Returns:
+        A configured SequentialAgent representing the full pipeline.
+    """
+    tracker = BudgetTracker(
+        total_tokens=config.budget.cycle.max_tokens_per_cycle,
+        total_usd=config.budget.cycle.max_cost_per_cycle_usd,
+    )
+
+    sub_agents: list[Any] = [
+        build_implementation_agent(
+            model,
+            max_retries=config.agents.max_implementation_retries,
+        ),
+        ParallelAgent(
+            name="artifact_generation",
+            description="Generates instrumentation, visualization, and assessment artifacts concurrently.",
+            sub_agents=[
+                build_instrumentation_agent(model),
+                build_visualization_agent(model),
+                build_assessment_agent(model),
+            ],
+        ),
+        build_review_agent(
+            model,
+            max_iterations=config.agents.max_review_rounds,
+        ),
+    ]
+
+    if include_packaging:
+        sub_agents.append(build_packaging_agent(model))
+
+    return SequentialAgent(
+        name="apprentice_pipeline",
+        description="Full apprentice pipeline: implement → generate artifacts → review → package.",
+        sub_agents=sub_agents,
+        before_agent_callback=make_before_agent_callback(tracker),
+        after_agent_callback=make_after_agent_callback(tracker),
+    )
 
 
-class OrchestratorAgent:
-    """Coordinates agents to produce a complete algorithm entry."""
+def build_discovery_pipeline(model: LiteLlm) -> Any:
+    """Build a standalone discovery agent for the suggest command.
 
-    def __init__(
-        self,
-        agents: dict[str, AgentInterface],
-        provider: Any,
-    ) -> None:
-        self._agents = agents
-        self._provider = provider
-        self._logger = get_logger(__name__)
+    Args:
+        model: LiteLlm model instance.
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+    Returns:
+        A configured discovery LlmAgent.
+    """
+    from apprentice.agents.discovery import build_discovery_agent
 
-    def _make_task(
-        self,
-        task_type: str,
-        work_item: WorkItem,
-        input_artifacts: dict[str, str],
-        constraints: dict[str, Any],
-    ) -> AgentTask:
-        from apprentice.models.agent import AgentTask
+    return build_discovery_agent(model)
 
-        return AgentTask(
-            task_id=str(uuid.uuid4()),
-            task_type=task_type,
-            work_item=work_item,
-            input_artifacts=input_artifacts,
-            constraints=constraints,
-        )
 
-    def _make_context(
-        self,
-        tokens: int,
-        usd: float,
-        config: dict[str, Any],
-        prompt_registry_path: str = "",
-    ) -> AgentContext:
-        from apprentice.models.agent import AgentContext
+def get_budget_tracker_from_pipeline(pipeline: SequentialAgent) -> BudgetTracker | None:
+    """Extract the BudgetTracker from a pipeline's callbacks.
 
-        return AgentContext(
-            provider=self._provider,
-            budget_remaining_tokens=tokens,
-            budget_remaining_usd=usd,
-            config=config,
-            prompt_registry_path=prompt_registry_path,
-        )
+    Args:
+        pipeline: The pipeline SequentialAgent.
 
-    def _dispatch(
-        self,
-        agent_name: str,
-        task: AgentTask,
-        context: AgentContext,
-    ) -> AgentResult | None:
-        """Execute one agent; return AgentResult or None on exception."""
-        agent = self._agents.get(agent_name)
-        if agent is None:
-            self._logger.error(
-                "agent_not_registered",
-                extra={"agent_name": agent_name, "task_id": task.task_id},
-            )
-            return None
-
-        start = time.monotonic()
-        try:
-            result: AgentResult = agent.execute(task, context)
-        except Exception:
-            duration = time.monotonic() - start
-            self._logger.exception(
-                "agent_exception",
-                extra={
-                    "agent_name": agent_name,
-                    "task_id": task.task_id,
-                    "work_item_id": task.work_item.id,
-                    "duration_seconds": duration,
-                },
-            )
-            log_stage_metrics(
-                stage_name=agent_name,
-                tokens_used=0,
-                cost_usd=0.0,
-                duration_seconds=duration,
-                passed=False,
-            )
-            return None
-
-        duration = time.monotonic() - start
-        log_stage_metrics(
-            stage_name=agent_name,
-            tokens_used=result.tokens_used,
-            cost_usd=result.cost_usd,
-            duration_seconds=duration,
-            passed=result.success,
-        )
-        return result
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def orchestrate(
-        self,
-        work_item: WorkItem,
-        budget: BudgetAllocation,
-    ) -> OrchestrationResult:
-        """Coordinate agents to produce a complete algorithm entry.
-
-        Current scope (v0.3): implementation agent only.
-        Tool-agents and review agent are added in v0.4.
-
-        Args:
-            work_item: The algorithm to process.
-            budget: Token and USD allocation for this work item.
-
-        Returns:
-            OrchestrationResult with artifacts and per-agent results.
-        """
-        work_item.status = WorkItemStatus.IN_PROGRESS
-
-        bundle = ArtifactBundle(
-            id=str(uuid.uuid4()),
-            work_item_id=work_item.id,
-        )
-        agent_results: list[AgentResult] = []
-        total_tokens = 0
-        total_cost_usd = 0.0
-
-        # --- Implementation agent (40% of budget) ---
-        impl_tokens, impl_usd = budget.for_agent("implementation")
-        impl_task = self._make_task(
-            task_type="implement",
-            work_item=work_item,
-            input_artifacts={},
-            constraints={
-                "budget_tokens": impl_tokens,
-                "budget_usd": impl_usd,
-            },
-        )
-        impl_context = self._make_context(
-            tokens=impl_tokens,
-            usd=impl_usd,
-            config={},
-        )
-
-        self._logger.info(
-            "dispatching_agent",
-            extra={
-                "agent_name": "implementation",
-                "task_id": impl_task.task_id,
-                "work_item_id": work_item.id,
-                "budget_tokens": impl_tokens,
-                "budget_usd": impl_usd,
-            },
-        )
-
-        impl_result = self._dispatch("implementation", impl_task, impl_context)
-
-        if impl_result is None:
-            # Exception already logged in _dispatch; shelve and return early.
-            work_item.status = WorkItemStatus.SHELVED
-            return OrchestrationResult(
-                work_item=work_item,
-                artifacts=bundle,
-                agent_results=agent_results,
-                total_tokens=total_tokens,
-                total_cost_usd=total_cost_usd,
-                success=False,
-            )
-
-        agent_results.append(impl_result)
-        total_tokens += impl_result.tokens_used
-        total_cost_usd += impl_result.cost_usd
-        work_item.actual_tokens += impl_result.tokens_used
-
-        if not impl_result.success:
-            self._logger.error(
-                "agent_reported_failure",
-                extra={
-                    "agent_name": impl_result.agent_name,
-                    "task_id": impl_result.task_id,
-                    "work_item_id": work_item.id,
-                    "diagnostics": impl_result.diagnostics,
-                },
-            )
-            work_item.status = WorkItemStatus.SHELVED
-            return OrchestrationResult(
-                work_item=work_item,
-                artifacts=bundle,
-                agent_results=agent_results,
-                total_tokens=total_tokens,
-                total_cost_usd=total_cost_usd,
-                success=False,
-            )
-
-        bundle.implementation_path = impl_result.artifacts.get("implementation", "")
-
-        self._logger.info(
-            "agent_completed",
-            extra={
-                "agent_name": impl_result.agent_name,
-                "task_id": impl_result.task_id,
-                "work_item_id": work_item.id,
-                "tokens_used": impl_result.tokens_used,
-                "cost_usd": impl_result.cost_usd,
-                "implementation_path": bundle.implementation_path,
-            },
-        )
-
-        # Tool-agents (instrumentation, visualization, anki) and review agent
-        # are added in v0.4.
-
-        work_item.status = WorkItemStatus.COMPLETED
-        return OrchestrationResult(
-            work_item=work_item,
-            artifacts=bundle,
-            agent_results=agent_results,
-            total_tokens=total_tokens,
-            total_cost_usd=total_cost_usd,
-            success=True,
-        )
+    Returns:
+        The BudgetTracker if found, None otherwise.
+    """
+    cb = pipeline.before_agent_callback
+    if cb is not None and hasattr(cb, "__closure__") and cb.__closure__:
+        for cell in cb.__closure__:
+            contents = cell.cell_contents
+            if isinstance(contents, BudgetTracker):
+                return contents
+    return None
