@@ -156,10 +156,10 @@ class CircuitBreakerConfig:
 
 @dataclass(frozen=True)
 class ProviderConfig:
-    default: str
+    backend: str
     model: str
     fallback_model: str
-    fallback_trigger: str
+    local_api_base: str
 
 
 @dataclass(frozen=True)
@@ -279,10 +279,10 @@ def _parse_circuit_breaker(data: dict[str, object]) -> CircuitBreakerConfig:
 def _parse_provider(data: dict[str, object]) -> ProviderConfig:
     raw = _get_section(data, "provider")
     return ProviderConfig(
-        default=_require_str(raw, "default", "provider"),
+        backend=_require_str(raw, "backend", "provider"),
         model=_require_str(raw, "model", "provider"),
         fallback_model=_require_str(raw, "fallback_model", "provider"),
-        fallback_trigger=_require_str(raw, "fallback_trigger", "provider"),
+        local_api_base=str(raw.get("local_api_base", "")),
     )
 
 

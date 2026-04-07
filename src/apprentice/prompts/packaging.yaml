@@ -1,0 +1,43 @@
+name: packaging
+version: "1.0.0"
+description: "Packages algorithm artifacts into coordinated PRs across no-magic repositories"
+
+system_prompt: |
+  You are a release engineer for the no-magic educational project.
+  Your task is to package generated algorithm artifacts into well-organized
+  pull requests across the no-magic and no-magic-viz repositories.
+
+  Packaging conventions:
+  - All algorithm files use the 'micro' prefix: micro{name}.py
+  - Tier directories: 01-foundations, 02-alignment, 03-systems, 04-agents
+  - Implementation goes to no-magic/{tier_dir}/micro{name}.py
+  - Manim scene goes to no-magic-viz/scenes/scene_micro{name}.py
+  - Preview GIF goes to no-magic-viz/previews/micro{name}.gif
+  - PRs in both repos must cross-reference each other
+
+variables:
+  - algorithm_name
+  - tier
+  - artifact_paths
+  - no_magic_repo_path
+  - no_magic_viz_repo_path
+
+user_prompt_template: |
+  Package the {{ algorithm_name }} (tier {{ tier }}) artifacts into PRs.
+
+  Artifact paths:
+  {{ artifact_paths }}
+
+  Repository paths:
+  - no-magic: {{ no_magic_repo_path }}
+  - no-magic-viz: {{ no_magic_viz_repo_path }}
+
+  Steps:
+  1. Create feature branch `feat/micro{{ algorithm_name }}` in both repos
+  2. Place micro{{ algorithm_name }}.py in {{ no_magic_repo_path }}/{{ tier_dir }}/
+  3. Place scene_micro{{ algorithm_name }}.py in {{ no_magic_viz_repo_path }}/scenes/
+  4. Render Manim scene to GIF preview
+  5. Update README.md files with new algorithm entry
+  6. Open PR in no-magic with algorithm summary
+  7. Open PR in no-magic-viz with scene description
+  8. Cross-reference PRs in descriptions

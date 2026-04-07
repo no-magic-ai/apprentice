@@ -1,13 +1,15 @@
 [project]
 name = "apprentice"
-version = "0.1.0"
+version = "0.4.0"
 description = "Agentic Algorithm Factory for no-magic"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
 dependencies = [
     "anthropic>=0.52.0",
+    "google-adk>=1.0.0",
     "jinja2>=3.1,<4",
+    "litellm>=1.50.0",
     "openai>=2.30.0",
     "pyyaml>=6.0.3",
     "tomli>=2.0; python_version < '3.11'",

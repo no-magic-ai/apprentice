@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sys
 import time
@@ -12,7 +13,6 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from apprentice.core.config import ApprenticeConfig
-    from apprentice.core.orchestrator import OrchestrationResult
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -31,20 +31,37 @@ def main(argv: list[str] | None = None) -> int:
 
     subparsers = parser.add_subparsers(dest="command")
 
-    build_parser = subparsers.add_parser("build", help="Run full pipeline for an algorithm")
+    build_parser = subparsers.add_parser("build", help="Run pipeline through review (no packaging)")
     build_parser.add_argument("algorithm", help="Algorithm name to build")
     build_parser.add_argument("--tier", type=int, default=2, help="Algorithm tier (default: 2)")
     build_parser.add_argument(
         "--description", type=str, default="", help="Optional algorithm description"
     )
+    build_parser.add_argument(
+        "--backend", type=str, default=None, help="Override provider backend (e.g. ollama)"
+    )
+    build_parser.add_argument(
+        "--model", type=str, default=None, help="Override model (e.g. ollama_chat/llama3.3)"
+    )
+
+    submit_parser = subparsers.add_parser("submit", help="Package last build into PRs")
+    submit_parser.add_argument("algorithm", help="Algorithm name to package")
+    submit_parser.add_argument("--tier", type=int, default=2, help="Algorithm tier (default: 2)")
+    submit_parser.add_argument("--backend", type=str, default=None, help="Override backend")
+    submit_parser.add_argument("--model", type=str, default=None, help="Override model")
 
     suggest_parser = subparsers.add_parser("suggest", help="Discover candidate algorithms")
     suggest_parser.add_argument("--tier", type=int, default=2, help="Target tier (default: 2)")
     suggest_parser.add_argument("--limit", type=int, default=5, help="Max candidates (default: 5)")
+    suggest_parser.add_argument("--backend", type=str, default=None, help="Override backend")
+    suggest_parser.add_argument("--model", type=str, default=None, help="Override model")
 
     subparsers.add_parser("preview", help="Inspect last build artifacts")
     subparsers.add_parser("status", help="Show budget usage and queue state")
     subparsers.add_parser("config", help="Display current configuration")
+
+    dev_parser = subparsers.add_parser("dev", help="Launch ADK dev UI for interactive debugging")
+    dev_parser.add_argument("--port", type=int, default=8080, help="Dev UI port (default: 8080)")
 
     args = parser.parse_args(argv)
 
@@ -55,15 +72,19 @@ def main(argv: list[str] | None = None) -> int:
     cfg = _load_cfg(args.config)
 
     if args.command == "build":
-        return _cmd_build(cfg, args.algorithm, args.tier, args.description)
+        return _cmd_build(cfg, args)
+    if args.command == "submit":
+        return _cmd_submit(cfg, args)
     if args.command == "suggest":
-        return _cmd_suggest(cfg, args.tier, args.limit)
+        return _cmd_suggest(cfg, args)
     if args.command == "preview":
         return _cmd_preview()
     if args.command == "status":
         return _cmd_status(cfg)
     if args.command == "config":
         return _cmd_config(cfg)
+    if args.command == "dev":
+        return _cmd_dev(cfg, args)
 
     parser.print_help()
     return 1
@@ -83,90 +104,194 @@ def _load_cfg(config_path: Path | None) -> ApprenticeConfig:
     return cfg
 
 
-def _create_orchestrator(cfg: ApprenticeConfig) -> tuple[Any, Any]:
-    """Create orchestrator with implementation agent wired."""
-    from apprentice.agents.implementation import ImplementationAgent
-    from apprentice.core.orchestrator import BudgetAllocation, OrchestratorAgent
-    from apprentice.providers import create_provider
+def _resolve_model(cfg: ApprenticeConfig, args: Any) -> Any:
+    """Resolve the LiteLlm model from config with optional CLI overrides."""
+    from apprentice.providers.factory import create_model, create_model_from_override
 
-    provider = create_provider(cfg.provider.default, cfg.provider.model)
-    agents: dict[str, Any] = {"implementation": ImplementationAgent()}
-    orchestrator = OrchestratorAgent(agents=agents, provider=provider)
+    backend_override = getattr(args, "backend", None)
+    model_override = getattr(args, "model", None)
 
-    budget = BudgetAllocation(
-        total_tokens=cfg.budget.cycle.max_tokens_per_cycle,
-        total_usd=cfg.budget.cycle.max_cost_per_cycle_usd,
-        implementation_pct=cfg.budget.agent.implementation_budget_pct,
-        tool_agent_pct=cfg.budget.agent.tool_agent_budget_pct,
-        review_pct=cfg.budget.agent.review_budget_pct,
-    )
-    return orchestrator, budget
+    if model_override:
+        backend = backend_override or cfg.provider.backend
+        return create_model_from_override(
+            model_string=model_override,
+            backend=backend,
+            local_api_base=cfg.provider.local_api_base,
+        )
+    if backend_override:
+        from apprentice.core.config import ProviderConfig
+
+        override_cfg = ProviderConfig(
+            backend=backend_override,
+            model=cfg.provider.model,
+            fallback_model=cfg.provider.fallback_model,
+            local_api_base=cfg.provider.local_api_base,
+        )
+        return create_model(override_cfg)
+
+    return create_model(cfg.provider)
 
 
-def _cmd_build(cfg: ApprenticeConfig, algorithm: str, tier: int, description: str) -> int:
+def _cmd_build(cfg: ApprenticeConfig, args: Any) -> int:
     from apprentice.core.observability import get_logger
-    from apprentice.models.work_item import WorkItem, WorkItemSource
+    from apprentice.core.orchestrator import build_pipeline
 
     logger = get_logger(__name__)
-    logger.info("build started: %s (tier %d)", algorithm, tier)
+    logger.info("build started: %s (tier %d)", args.algorithm, args.tier)
 
-    orchestrator, budget = _create_orchestrator(cfg)
-
-    work_item = WorkItem(
-        id=f"manual-{algorithm}",
-        algorithm_name=algorithm,
-        tier=tier,
-        source=WorkItemSource.MANUAL,
-        rationale=description,
-        allocated_tokens=budget.total_tokens,
-    )
+    model = _resolve_model(cfg, args)
+    pipeline = build_pipeline(model, cfg, include_packaging=False)
 
     start = time.monotonic()
-    result = orchestrator.orchestrate(work_item, budget)
+    session_state = asyncio.run(
+        _run_pipeline(pipeline, args.algorithm, args.tier, args.description)
+    )
     elapsed = time.monotonic() - start
 
-    _print_orchestration_result(result, elapsed)
-    return 0 if result.success else 1
+    _print_build_result(args.algorithm, args.tier, session_state, elapsed)
+    return 0
 
 
-def _cmd_suggest(cfg: ApprenticeConfig, tier: int, limit: int) -> int:
+def _cmd_submit(cfg: ApprenticeConfig, args: Any) -> int:
     from apprentice.core.observability import get_logger
-    from apprentice.models.work_item import PipelineContext, WorkItem, WorkItemSource
-    from apprentice.providers import create_provider
-    from apprentice.stages.discovery import DiscoveryStage
+    from apprentice.core.orchestrator import build_pipeline
 
     logger = get_logger(__name__)
-    logger.info("suggesting algorithms for tier %d (limit %d)", tier, limit)
+    logger.info("submit started: %s (tier %d)", args.algorithm, args.tier)
 
-    provider = create_provider(cfg.provider.default, cfg.provider.model)
+    model = _resolve_model(cfg, args)
+    pipeline = build_pipeline(model, cfg, include_packaging=True)
 
-    work_item = WorkItem(
-        id=f"suggest-tier-{tier}",
-        algorithm_name=f"discovery-tier-{tier}",
-        tier=tier,
-        source=WorkItemSource.DISCOVERY,
-        rationale=f"Suggest up to {limit} algorithms for tier {tier}",
+    start = time.monotonic()
+    session_state = asyncio.run(_run_pipeline(pipeline, args.algorithm, args.tier, ""))
+    elapsed = time.monotonic() - start
+
+    _print_build_result(args.algorithm, args.tier, session_state, elapsed)
+    return 0
+
+
+def _cmd_suggest(cfg: ApprenticeConfig, args: Any) -> int:
+    from apprentice.core.observability import get_logger
+    from apprentice.core.orchestrator import build_discovery_pipeline
+
+    logger = get_logger(__name__)
+    logger.info("suggesting algorithms for tier %d (limit %d)", args.tier, args.limit)
+
+    model = _resolve_model(cfg, args)
+    discovery = build_discovery_pipeline(model)
+
+    session_state = asyncio.run(
+        _run_agent(discovery, f"Suggest {args.limit} algorithms for tier {args.tier}")
     )
-
-    context = PipelineContext(
-        config={"provider": provider, "limit": limit},
-        budget_remaining_tokens=cfg.budget.stage.max_tokens_per_stage,
-        budget_remaining_usd=cfg.budget.cycle.max_cost_per_cycle_usd,
-    )
-
-    stage = DiscoveryStage()
-    result = stage.execute(work_item, context)
 
     _print_json(
         {
-            "tier": tier,
-            "candidates_file": result.artifacts.get("discovery", ""),
-            "tokens_used": result.tokens_used,
-            "cost_usd": result.cost_usd,
-            "diagnostics": result.diagnostics,
+            "tier": args.tier,
+            "candidates": session_state.get("discovery_candidates", ""),
         }
     )
     return 0
+
+
+async def _run_pipeline(
+    pipeline: Any,
+    algorithm: str,
+    tier: int,
+    description: str,
+) -> dict[str, Any]:
+    """Run the ADK pipeline and return the final session state."""
+    from google.adk.agents import InvocationContext
+    from google.adk.artifacts import InMemoryArtifactService
+    from google.adk.events.event import Event
+    from google.adk.sessions import InMemorySessionService
+    from google.genai import types
+
+    session_service = InMemorySessionService()  # type: ignore[no-untyped-call]
+    artifact_service = InMemoryArtifactService()
+
+    session = await session_service.create_session(
+        app_name="apprentice",
+        user_id="cli",
+        state={
+            "algorithm_name": algorithm,
+            "algorithm_tier": tier,
+            "description": description,
+        },
+    )
+
+    user_content = types.Content(
+        role="user",
+        parts=[
+            types.Part(
+                text=(
+                    f"Build a complete implementation of the {algorithm} algorithm "
+                    f"(tier {tier}). Description: {description or 'N/A'}"
+                )
+            )
+        ],
+    )
+
+    user_event = Event(
+        invocation_id="build_001",
+        author="user",
+        content=user_content,
+    )
+    session.events.append(user_event)
+
+    ctx = InvocationContext(
+        invocation_id="build_001",
+        agent=pipeline,
+        session=session,
+        session_service=session_service,
+        artifact_service=artifact_service,
+    )
+
+    async for _event in pipeline.run_async(ctx):
+        pass
+
+    return dict(session.state)
+
+
+async def _run_agent(agent: Any, prompt: str) -> dict[str, Any]:
+    """Run a single ADK agent and return session state."""
+    from google.adk.agents import InvocationContext
+    from google.adk.artifacts import InMemoryArtifactService
+    from google.adk.events.event import Event
+    from google.adk.sessions import InMemorySessionService
+    from google.genai import types
+
+    session_service = InMemorySessionService()  # type: ignore[no-untyped-call]
+    artifact_service = InMemoryArtifactService()
+
+    session = await session_service.create_session(
+        app_name="apprentice",
+        user_id="cli",
+    )
+
+    user_content = types.Content(
+        role="user",
+        parts=[types.Part(text=prompt)],
+    )
+
+    user_event = Event(
+        invocation_id="run_001",
+        author="user",
+        content=user_content,
+    )
+    session.events.append(user_event)
+
+    ctx = InvocationContext(
+        invocation_id="run_001",
+        agent=agent,
+        session=session,
+        session_service=session_service,
+        artifact_service=artifact_service,
+    )
+
+    async for _event in agent.run_async(ctx):
+        pass
+
+    return dict(session.state)
 
 
 def _cmd_preview() -> int:
@@ -209,6 +334,10 @@ def _cmd_status(cfg: ApprenticeConfig) -> int:
             "circuit_breaker": {
                 "failure_threshold": cfg.circuit_breaker.failure_threshold,
             },
+            "provider": {
+                "backend": cfg.provider.backend,
+                "model": cfg.provider.model,
+            },
         }
     )
     return 0
@@ -219,35 +348,40 @@ def _cmd_config(cfg: ApprenticeConfig) -> int:
     return 0
 
 
-def _print_orchestration_result(result: OrchestrationResult, elapsed: float) -> None:
-    bundle = result.artifacts
-    agent_summaries = [
-        {
-            "agent": ar.agent_name,
-            "success": ar.success,
-            "tokens": ar.tokens_used,
-            "cost_usd": ar.cost_usd,
-            "attempts": ar.attempt_number,
-        }
-        for ar in result.agent_results
-    ]
+def _cmd_dev(cfg: ApprenticeConfig, args: Any) -> int:
+    import subprocess
+
+    port = args.port
+    _print_json({"message": f"Starting ADK dev UI on port {port}", "command": "adk web"})
+    try:
+        subprocess.run(
+            ["adk", "web", "--port", str(port)],
+            check=True,
+        )
+    except FileNotFoundError:
+        _print_json({"error": "adk CLI not found. Install google-adk: uv add google-adk"})
+        return 1
+    except subprocess.CalledProcessError:
+        return 1
+    return 0
+
+
+def _print_build_result(
+    algorithm: str,
+    tier: int,
+    session_state: dict[str, Any],
+    elapsed: float,
+) -> None:
     _print_json(
         {
-            "success": result.success,
-            "work_item": {
-                "id": result.work_item.id,
-                "algorithm": result.work_item.algorithm_name,
-                "status": result.work_item.status.value,
-            },
-            "artifacts": {
-                "implementation": bundle.implementation_path,
-                "instrumented": bundle.instrumented_path,
-                "manim_scene": bundle.manim_scene_path,
-                "anki_deck": bundle.anki_deck_path,
-            },
-            "agents": agent_summaries,
-            "total_tokens": result.total_tokens,
-            "total_cost_usd": result.total_cost_usd,
+            "algorithm": algorithm,
+            "tier": tier,
+            "session_state_keys": list(session_state.keys()),
+            "generated_code": bool(session_state.get("generated_code")),
+            "instrumented_code": bool(session_state.get("instrumented_code")),
+            "manim_scene_code": bool(session_state.get("manim_scene_code")),
+            "anki_deck_content": bool(session_state.get("anki_deck_content")),
+            "review_verdict": session_state.get("review_verdict", ""),
             "duration_seconds": round(elapsed, 2),
         }
     )

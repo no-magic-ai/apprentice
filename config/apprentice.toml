@@ -40,10 +40,10 @@ half_open_probe_after_minutes = 60
 max_open_cycles_before_manual_reset = 3
 
 [provider]
-default = "anthropic"
-model = "claude-sonnet-4-20250514"
-fallback_model = "claude-haiku-4-5-20251001"
-fallback_trigger = "budget_warning"
+backend = "anthropic"
+model = "anthropic/claude-sonnet-4-20250514"
+fallback_model = "anthropic/claude-haiku-4-5-20251001"
+local_api_base = ""
 
 [observability]
 log_level = "INFO"
