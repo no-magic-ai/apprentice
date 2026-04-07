@@ -29,21 +29,30 @@ class TestImplementationAgent:
         agent = build_implementation_agent(model, max_retries=5)
         assert agent.max_iterations == 5
 
-    def test_has_drafter_and_reviewer(self) -> None:
+    def test_has_drafter(self) -> None:
         model = LiteLlm(model="anthropic/claude-sonnet-4-20250514")
         agent = build_implementation_agent(model)
         names = [a.name for a in agent.sub_agents]
         assert "drafter" in names
-        assert "self_reviewer" in names
 
-    def test_reviewer_has_tools(self) -> None:
+    def test_single_sub_agent(self) -> None:
         model = LiteLlm(model="anthropic/claude-sonnet-4-20250514")
         agent = build_implementation_agent(model)
-        reviewer = next(a for a in agent.sub_agents if a.name == "self_reviewer")
-        assert len(reviewer.tools) == 2
+        assert len(agent.sub_agents) == 1
 
     def test_drafter_output_key(self) -> None:
         model = LiteLlm(model="anthropic/claude-sonnet-4-20250514")
         agent = build_implementation_agent(model)
-        drafter = next(a for a in agent.sub_agents if a.name == "drafter")
+        drafter = agent.sub_agents[0]
         assert drafter.output_key == "generated_code"
+
+    def test_has_after_agent_callback(self) -> None:
+        model = LiteLlm(model="anthropic/claude-sonnet-4-20250514")
+        agent = build_implementation_agent(model)
+        drafter = agent.sub_agents[0]
+        assert drafter.after_agent_callback is not None
+
+    def test_has_before_agent_callback(self) -> None:
+        model = LiteLlm(model="anthropic/claude-sonnet-4-20250514")
+        agent = build_implementation_agent(model)
+        assert agent.before_agent_callback is not None

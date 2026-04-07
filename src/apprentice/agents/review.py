@@ -1,4 +1,10 @@
-"""Review Agent — ADK LoopAgent that validates all artifacts for consistency and schema."""
+"""Review Agent — programmatic artifact validation via ADK callbacks.
+
+No LLM is used for review — consistency and schema validators run
+as pure Python in an after_agent_callback. The LoopAgent iterates
+only if validation fails and there's a preceding agent to fix artifacts.
+Since artifact agents don't retry, this effectively runs once.
+"""
 
 from __future__ import annotations
 
@@ -8,115 +14,115 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from google.adk.agents import LlmAgent, LoopAgent
-from google.adk.tools import exit_loop  # type: ignore[attr-defined]
 
 if TYPE_CHECKING:
     from google.adk.models.lite_llm import LiteLlm
 
-_REVIEWER_INSTRUCTION = """\
-You are a quality reviewer for algorithm artifacts in the no-magic educational project.
 
-Call validate_artifacts with the artifact content from the conversation history:
-- implementation_code: the generated algorithm source code
-- instrumented_code: the instrumented source code (if available)
-- manim_scene_code: the Manim visualization scene (if available)
-- anki_deck_content: the Anki flashcard CSV (if available)
-
-The tool saves all artifacts to disk and runs consistency + schema validators.
-
-If the tool returns all_passed=true, call exit_loop immediately.
-If any validator failed, respond with a summary of the failures.
-"""
-
-
-def validate_artifacts(
-    implementation_code: str = "",
-    instrumented_code: str = "",
-    manim_scene_code: str = "",
-    anki_deck_content: str = "",
-    algorithm_name: str = "algorithm",
-) -> dict[str, Any]:
-    """Save all artifacts and run consistency + schema validators in one call.
-
-    Args:
-        implementation_code: Python source code for the algorithm.
-        instrumented_code: Python source with trace hooks.
-        manim_scene_code: Manim Scene Python source.
-        anki_deck_content: CSV content for Anki flashcards.
-        algorithm_name: Name used for temp file stems.
-
-    Returns:
-        Dict with 'all_passed' bool and per-validator results.
-    """
+def _validate_all_artifacts(state: dict[str, Any]) -> dict[str, Any]:
+    """Run consistency and schema validators on all artifacts in session state."""
     from apprentice.validators.tools import consistency_validate, schema_validate
 
+    algorithm_name = state.get("algorithm_name", "algorithm")
     tmp_dir = Path(tempfile.gettempdir()) / "apprentice_artifacts"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     paths: dict[str, str] = {}
 
-    if implementation_code:
-        impl_path = tmp_dir / f"{algorithm_name}.py"
-        impl_path.write_text(implementation_code, encoding="utf-8")
-        paths["implementation"] = str(impl_path)
+    impl_code = state.get("generated_code", "")
+    if impl_code:
+        p = tmp_dir / f"{algorithm_name}.py"
+        p.write_text(impl_code, encoding="utf-8")
+        paths["implementation"] = str(p)
 
-    if instrumented_code:
-        instr_path = tmp_dir / f"{algorithm_name}_instrumented.py"
-        instr_path.write_text(instrumented_code, encoding="utf-8")
-        paths["instrumented"] = str(instr_path)
+    instr_code = state.get("instrumented_code", "")
+    if instr_code:
+        p = tmp_dir / f"{algorithm_name}_instrumented.py"
+        p.write_text(instr_code, encoding="utf-8")
+        paths["instrumented"] = str(p)
 
-    if manim_scene_code:
-        manim_path = tmp_dir / f"{algorithm_name}_scene.py"
-        manim_path.write_text(manim_scene_code, encoding="utf-8")
-        paths["manim_scene"] = str(manim_path)
+    manim_code = state.get("manim_scene_code", "")
+    if manim_code:
+        p = tmp_dir / f"{algorithm_name}_scene.py"
+        p.write_text(manim_code, encoding="utf-8")
+        paths["manim_scene"] = str(p)
 
-    if anki_deck_content:
-        anki_path = tmp_dir / f"{algorithm_name}_cards.csv"
-        anki_path.write_text(anki_deck_content, encoding="utf-8")
-        paths["anki_deck"] = str(anki_path)
+    anki_content = state.get("anki_deck_content", "")
+    if anki_content:
+        p = tmp_dir / f"{algorithm_name}_cards.csv"
+        p.write_text(anki_content, encoding="utf-8")
+        paths["anki_deck"] = str(p)
+
+    if not paths:
+        return {
+            "all_passed": False,
+            "failures": ["No artifacts found in session state"],
+            "artifact_paths": {},
+        }
 
     artifacts_json = json.dumps(paths)
-    consistency_result = consistency_validate(artifacts_json)
-    schema_result = schema_validate(artifacts_json)
+    consistency = consistency_validate(artifacts_json)
+    schema = schema_validate(artifacts_json)
 
-    all_passed = consistency_result["passed"] and schema_result["passed"]
+    all_passed = consistency["passed"] and schema["passed"]
 
-    return {
-        "all_passed": all_passed,
-        "consistency": consistency_result,
-        "schema": schema_result,
-        "artifact_paths": paths,
-    }
+    failures: list[str] = []
+    for result in (consistency, schema):
+        for issue in result.get("issues", []):
+            if issue.get("severity") == "error":
+                failures.append(f"{issue.get('artifact', '')}: {issue.get('message', '')}")
+
+    return {"all_passed": all_passed, "failures": failures, "artifact_paths": paths}
 
 
 def build_review_agent(
     model: LiteLlm,
     max_iterations: int = 2,
 ) -> LoopAgent:
-    """Build an ADK LoopAgent for artifact review and validation.
+    """Build a review stage that validates artifacts programmatically.
 
-    Uses a single composite validate_artifacts tool that saves files and
-    runs both consistency and schema validators in one call.
+    Uses a no-op LlmAgent as a placeholder inside a LoopAgent.
+    The before_agent_callback runs validators and either exits (pass)
+    or continues with feedback (fail). No LLM calls are made.
 
     Args:
-        model: LiteLlm model instance.
+        model: LiteLlm model instance (used for the placeholder agent).
         max_iterations: Maximum review rounds.
 
     Returns:
         A configured LoopAgent.
     """
-    reviewer = LlmAgent(
+
+    async def review_callback(callback_context: Any) -> Any:
+        from google.genai import types
+
+        state = callback_context.state
+        result = _validate_all_artifacts(state)
+
+        if result["all_passed"]:
+            state["review_verdict"] = "passed"
+            return types.Content(
+                role="model",
+                parts=[types.Part(text="All artifacts validated successfully.")],
+            )
+
+        state["review_verdict"] = "failed: " + "; ".join(result["failures"])
+        return types.Content(
+            role="model",
+            parts=[types.Part(text="Review: " + "; ".join(result["failures"]))],
+        )
+
+    placeholder = LlmAgent(
         name="reviewer",
         model=model,
-        instruction=_REVIEWER_INSTRUCTION,
-        tools=[validate_artifacts, exit_loop],
+        instruction="Artifacts are validated automatically.",
         output_key="review_verdict",
-        description="Validates artifacts for consistency and schema compliance.",
     )
 
     return LoopAgent(
         name="review_loop",
-        description="Iteratively reviews artifacts until all validators pass.",
+        description="Validates all artifacts for consistency and schema compliance.",
         max_iterations=max_iterations,
-        sub_agents=[reviewer],
+        sub_agents=[placeholder],
+        before_agent_callback=review_callback,
     )
