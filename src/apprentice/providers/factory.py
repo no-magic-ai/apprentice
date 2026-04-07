@@ -1,9 +1,9 @@
-"""LiteLlm model factory — creates ADK-compatible model instances from config."""
+"""Model factory — creates ADK-compatible model instances from config."""
 
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from google.adk.models.lite_llm import LiteLlm
 
@@ -17,25 +17,27 @@ _REQUIRED_ENV_VARS: dict[str, str | None] = {
     "gemini": "GOOGLE_API_KEY",
     "ollama": None,
     "local": None,
+    "claude_cli": None,
 }
 
 _SUPPORTED_BACKENDS = frozenset(_REQUIRED_ENV_VARS.keys())
 
 
-def create_model(config: ProviderConfig) -> LiteLlm:
-    """Create a LiteLlm model instance from apprentice config.
+def create_model(config: ProviderConfig) -> Any:
+    """Create an ADK-compatible model instance from apprentice config.
 
-    Supports backends: anthropic, openai, gemini, ollama, local (OpenAI-compatible).
+    Supports backends: anthropic, openai, gemini, ollama, local, claude_cli.
 
     For ollama: sets OLLAMA_API_BASE from config.local_api_base.
     For local: sets OPENAI_API_BASE and OPENAI_API_KEY=not-needed from config.
+    For claude_cli: uses `claude -p` subprocess (no API key needed).
     For cloud providers: reads API keys from environment variables.
 
     Args:
         config: Provider configuration from apprentice.toml.
 
     Returns:
-        A LiteLlm instance configured for the specified backend.
+        A LiteLlm or ClaudeCli instance configured for the specified backend.
 
     Raises:
         ValueError: If the backend is not supported.
@@ -47,6 +49,11 @@ def create_model(config: ProviderConfig) -> LiteLlm:
             f"Unsupported backend {backend!r}. Supported: {sorted(_SUPPORTED_BACKENDS)}"
         )
 
+    if backend == "claude_cli":
+        from apprentice.providers.claude_cli import ClaudeCli
+
+        return ClaudeCli(model=config.model or "claude-cli")
+
     _configure_environment(backend, config.local_api_base)
 
     return LiteLlm(model=config.model)
@@ -56,8 +63,8 @@ def create_model_from_override(
     model_string: str,
     backend: str,
     local_api_base: str = "",
-) -> LiteLlm:
-    """Create a LiteLlm model from CLI override flags.
+) -> Any:
+    """Create an ADK model from CLI override flags.
 
     Args:
         model_string: LiteLlm model string (e.g. "ollama_chat/llama3.3").
@@ -65,7 +72,7 @@ def create_model_from_override(
         local_api_base: API base URL for ollama/local backends.
 
     Returns:
-        A LiteLlm instance.
+        A LiteLlm or ClaudeCli instance.
 
     Raises:
         ValueError: If the backend is not supported.
@@ -75,6 +82,11 @@ def create_model_from_override(
         raise ValueError(
             f"Unsupported backend {backend!r}. Supported: {sorted(_SUPPORTED_BACKENDS)}"
         )
+
+    if backend == "claude_cli":
+        from apprentice.providers.claude_cli import ClaudeCli
+
+        return ClaudeCli(model=model_string or "claude-cli")
 
     _configure_environment(backend, local_api_base)
 

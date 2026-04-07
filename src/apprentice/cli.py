@@ -252,19 +252,27 @@ async def _run_pipeline_with_progress(
     description: str,
     progress: Any,
 ) -> dict[str, Any]:
-    """Run the ADK pipeline with optional progress tracking."""
-    from google.adk.agents import InvocationContext, RunConfig
+    """Run the ADK pipeline via Runner with optional progress tracking."""
+    from google.adk.agents import RunConfig
     from google.adk.artifacts import InMemoryArtifactService
-    from google.adk.events.event import Event
+    from google.adk.runners import Runner
     from google.adk.sessions import InMemorySessionService
     from google.genai import types
 
     session_service = InMemorySessionService()  # type: ignore[no-untyped-call]
     artifact_service = InMemoryArtifactService()
 
+    runner = Runner(
+        agent=pipeline,
+        app_name="apprentice",
+        session_service=session_service,
+        artifact_service=artifact_service,
+    )
+
+    user_id = "cli"
     session = await session_service.create_session(
         app_name="apprentice",
-        user_id="cli",
+        user_id=user_id,
         state={
             "algorithm_name": algorithm,
             "algorithm_tier": tier,
@@ -272,7 +280,7 @@ async def _run_pipeline_with_progress(
         },
     )
 
-    user_content = types.Content(
+    user_message = types.Content(
         role="user",
         parts=[
             types.Part(
@@ -284,74 +292,73 @@ async def _run_pipeline_with_progress(
         ],
     )
 
-    user_event = Event(
-        invocation_id="build_001",
-        author="user",
-        content=user_content,
-    )
-    session.events.append(user_event)
-
-    ctx = InvocationContext(
-        invocation_id="build_001",
-        agent=pipeline,
-        session=session,
-        session_service=session_service,
-        artifact_service=artifact_service,
-        run_config=RunConfig(max_llm_calls=50),
-    )
+    run_config = RunConfig(max_llm_calls=50)
 
     if progress is not None:
         with progress.start():
-            async for event in pipeline.run_async(ctx):
+            async for event in runner.run_async(
+                user_id=user_id,
+                session_id=session.id,
+                new_message=user_message,
+                run_config=run_config,
+            ):
                 progress.on_event(event)
     else:
-        async for _event in pipeline.run_async(ctx):
+        async for _event in runner.run_async(
+            user_id=user_id,
+            session_id=session.id,
+            new_message=user_message,
+            run_config=run_config,
+        ):
             pass
 
-    return dict(session.state)
+    updated_session = await session_service.get_session(
+        app_name="apprentice", user_id=user_id, session_id=session.id
+    )
+    return dict(updated_session.state) if updated_session else {}
 
 
 async def _run_agent(agent: Any, prompt: str) -> dict[str, Any]:
-    """Run a single ADK agent and return session state."""
-    from google.adk.agents import InvocationContext, RunConfig
+    """Run a single ADK agent via Runner and return session state."""
+    from google.adk.agents import RunConfig
     from google.adk.artifacts import InMemoryArtifactService
-    from google.adk.events.event import Event
+    from google.adk.runners import Runner
     from google.adk.sessions import InMemorySessionService
     from google.genai import types
 
     session_service = InMemorySessionService()  # type: ignore[no-untyped-call]
     artifact_service = InMemoryArtifactService()
 
-    session = await session_service.create_session(
+    runner = Runner(
+        agent=agent,
         app_name="apprentice",
-        user_id="cli",
+        session_service=session_service,
+        artifact_service=artifact_service,
     )
 
-    user_content = types.Content(
+    user_id = "cli"
+    session = await session_service.create_session(
+        app_name="apprentice",
+        user_id=user_id,
+    )
+
+    user_message = types.Content(
         role="user",
         parts=[types.Part(text=prompt)],
     )
 
-    user_event = Event(
-        invocation_id="run_001",
-        author="user",
-        content=user_content,
-    )
-    session.events.append(user_event)
-
-    ctx = InvocationContext(
-        invocation_id="run_001",
-        agent=agent,
-        session=session,
-        session_service=session_service,
-        artifact_service=artifact_service,
+    async for _event in runner.run_async(
+        user_id=user_id,
+        session_id=session.id,
+        new_message=user_message,
         run_config=RunConfig(max_llm_calls=30),
-    )
-
-    async for _event in agent.run_async(ctx):
+    ):
         pass
 
-    return dict(session.state)
+    updated_session = await session_service.get_session(
+        app_name="apprentice", user_id=user_id, session_id=session.id
+    )
+    return dict(updated_session.state) if updated_session else {}
 
 
 def _cmd_preview() -> int:

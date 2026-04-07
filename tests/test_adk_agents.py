@@ -41,15 +41,13 @@ class TestImplementationAgentBuilder:
         agent = build_implementation_agent(_model(), max_retries=5)
         assert agent.max_iterations == 5
 
-    def test_has_sub_agents(self) -> None:
+    def test_single_sub_agent(self) -> None:
         agent = build_implementation_agent(_model())
-        assert len(agent.sub_agents) == 2
+        assert len(agent.sub_agents) == 1
 
-    def test_sub_agent_names(self) -> None:
+    def test_drafter_name(self) -> None:
         agent = build_implementation_agent(_model())
-        names = [a.name for a in agent.sub_agents]
-        assert "drafter" in names
-        assert "self_reviewer" in names
+        assert agent.sub_agents[0].name == "drafter"
 
 
 class TestInstrumentationAgentBuilder:
