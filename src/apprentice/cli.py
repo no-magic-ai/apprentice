@@ -56,6 +56,17 @@ def main(argv: list[str] | None = None) -> int:
     suggest_parser.add_argument("--backend", type=str, default=None, help="Override backend")
     suggest_parser.add_argument("--model", type=str, default=None, help="Override model")
 
+    retry_parser = subparsers.add_parser("retry", help="Retry a failed pipeline run")
+    retry_parser.add_argument("run_id", help="Run ID to retry (from 'apprentice history')")
+    retry_parser.add_argument("--backend", type=str, default=None, help="Override backend")
+    retry_parser.add_argument("--model", type=str, default=None, help="Override model")
+
+    history_parser = subparsers.add_parser("history", help="List past pipeline runs")
+    history_parser.add_argument("--status", type=str, default=None, help="Filter by status")
+    history_parser.add_argument("--limit", type=int, default=20, help="Max entries (default: 20)")
+
+    subparsers.add_parser("metrics", help="Show aggregated pipeline metrics")
+
     subparsers.add_parser("preview", help="Inspect last build artifacts")
     subparsers.add_parser("status", help="Show budget usage and queue state")
     subparsers.add_parser("config", help="Display current configuration")
@@ -77,6 +88,12 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_submit(cfg, args)
     if args.command == "suggest":
         return _cmd_suggest(cfg, args)
+    if args.command == "retry":
+        return _cmd_retry(cfg, args)
+    if args.command == "history":
+        return _cmd_history(args)
+    if args.command == "metrics":
+        return _cmd_metrics()
     if args.command == "preview":
         return _cmd_preview()
     if args.command == "status":
@@ -134,21 +151,42 @@ def _resolve_model(cfg: ApprenticeConfig, args: Any) -> Any:
 
 def _cmd_build(cfg: ApprenticeConfig, args: Any) -> int:
     from apprentice.core.observability import get_logger
-    from apprentice.core.orchestrator import build_pipeline
+    from apprentice.core.orchestrator import build_pipeline, get_budget_tracker_from_pipeline
+    from apprentice.core.session_store import SessionStore
 
     logger = get_logger(__name__)
     logger.info("build started: %s (tier %d)", args.algorithm, args.tier)
+
+    store = SessionStore()
+    record = store.create_run(args.algorithm, args.tier)
 
     model = _resolve_model(cfg, args)
     pipeline = build_pipeline(model, cfg, include_packaging=False)
 
     start = time.monotonic()
-    session_state = asyncio.run(
-        _run_pipeline(pipeline, args.algorithm, args.tier, args.description)
-    )
-    elapsed = time.monotonic() - start
+    try:
+        session_state = asyncio.run(
+            _run_pipeline(pipeline, args.algorithm, args.tier, args.description)
+        )
+        elapsed = time.monotonic() - start
 
-    _print_build_result(args.algorithm, args.tier, session_state, elapsed)
+        tracker = get_budget_tracker_from_pipeline(pipeline)
+        budget_summary = tracker.to_dict() if tracker else {}
+
+        has_output = bool(session_state.get("generated_code"))
+        if has_output:
+            store.complete_run(record, session_state, budget_summary, elapsed)
+        else:
+            store.fail_run(record, session_state, budget_summary, elapsed, "no output generated")
+
+    except Exception as exc:
+        elapsed = time.monotonic() - start
+        store.fail_run(record, {}, {}, elapsed, str(exc))
+        logger.error("build failed: %s", exc)
+        _print_json({"error": str(exc), "run_id": record.run_id})
+        return 1
+
+    _print_build_result(args.algorithm, args.tier, session_state, elapsed, record.run_id)
     return 0
 
 
@@ -366,14 +404,108 @@ def _cmd_dev(cfg: ApprenticeConfig, args: Any) -> int:
     return 0
 
 
+def _cmd_retry(cfg: ApprenticeConfig, args: Any) -> int:
+    from apprentice.core.observability import get_logger
+    from apprentice.core.orchestrator import build_pipeline, get_budget_tracker_from_pipeline
+    from apprentice.core.session_store import SessionStore
+
+    logger = get_logger(__name__)
+    store = SessionStore()
+
+    try:
+        old_record = store.load(args.run_id)
+    except FileNotFoundError:
+        _print_json({"error": f"Run not found: {args.run_id}"})
+        return 1
+
+    if old_record.status != "failed":
+        _print_json({"error": f"Run {args.run_id} is not failed (status: {old_record.status})"})
+        return 1
+
+    algorithm = old_record.algorithm_name
+    tier = old_record.tier
+    logger.info("retrying: %s (tier %d) from run %s", algorithm, tier, args.run_id)
+
+    model = _resolve_model(cfg, args)
+    pipeline = build_pipeline(model, cfg, include_packaging=False)
+
+    new_record = store.create_run(algorithm, tier)
+    start = time.monotonic()
+
+    try:
+        session_state = asyncio.run(_run_pipeline(pipeline, algorithm, tier, ""))
+        elapsed = time.monotonic() - start
+
+        tracker = get_budget_tracker_from_pipeline(pipeline)
+        budget_summary = tracker.to_dict() if tracker else {}
+
+        has_output = bool(session_state.get("generated_code"))
+        if has_output:
+            store.complete_run(new_record, session_state, budget_summary, elapsed)
+        else:
+            store.fail_run(
+                new_record, session_state, budget_summary, elapsed, "no output generated"
+            )
+
+    except Exception as exc:
+        elapsed = time.monotonic() - start
+        store.fail_run(new_record, {}, {}, elapsed, str(exc))
+        logger.error("retry failed: %s", exc)
+        _print_json({"error": str(exc), "run_id": new_record.run_id})
+        return 1
+
+    _print_build_result(algorithm, tier, session_state, elapsed, new_record.run_id)
+    return 0
+
+
+def _cmd_history(args: Any) -> int:
+    from apprentice.core.session_store import SessionStore
+
+    store = SessionStore()
+    records = store.list_runs(status=args.status, limit=args.limit)
+
+    entries = [
+        {
+            "run_id": r.run_id,
+            "algorithm": r.algorithm_name,
+            "tier": r.tier,
+            "status": r.status,
+            "started_at": r.started_at,
+            "elapsed_seconds": r.elapsed_seconds,
+            "error": r.error[:100] if r.error else "",
+        }
+        for r in records
+    ]
+    _print_json({"runs": entries, "total": len(entries)})
+    return 0
+
+
+def _cmd_metrics() -> int:
+    from apprentice.core.metrics import aggregate_runs
+    from apprentice.core.session_store import SessionStore
+
+    store = SessionStore()
+    records = store.list_runs(limit=100)
+
+    if not records:
+        _print_json({"error": "No run records found. Run 'apprentice build' first."})
+        return 0
+
+    report = aggregate_runs(records)
+    _print_json(report.to_dict())
+    return 0
+
+
 def _print_build_result(
     algorithm: str,
     tier: int,
     session_state: dict[str, Any],
     elapsed: float,
+    run_id: str = "",
 ) -> None:
     _print_json(
         {
+            "run_id": run_id,
             "algorithm": algorithm,
             "tier": tier,
             "session_state_keys": list(session_state.keys()),
