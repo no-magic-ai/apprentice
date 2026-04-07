@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 import time
 from typing import Any
 
@@ -35,9 +36,23 @@ _PIPELINE_STAGES = [
 
 
 def suppress_noisy_loggers() -> None:
-    """Suppress LiteLLM, httpx, and other verbose loggers."""
+    """Suppress LiteLLM, httpx, and other verbose loggers.
+
+    Also removes stderr handlers from the root logger so Rich progress
+    display isn't interleaved with log lines. File handler is preserved
+    for structured JSON logs.
+    """
     for name in ("LiteLLM", "litellm", "httpx", "httpcore", "openai", "anthropic"):
         logging.getLogger(name).setLevel(logging.WARNING)
+
+    root = logging.getLogger()
+    root.handlers = [
+        h
+        for h in root.handlers
+        if not isinstance(h, logging.StreamHandler)
+        or not hasattr(h, "stream")
+        or h.stream is not sys.stderr
+    ]
 
 
 class PipelineProgress:

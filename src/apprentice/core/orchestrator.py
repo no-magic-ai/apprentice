@@ -83,7 +83,9 @@ def build_pipeline(
         description="Full apprentice pipeline: implement → generate artifacts → review → package.",
         sub_agents=sub_agents,
         before_agent_callback=make_before_agent_callback(tracker),
-        after_agent_callback=make_after_agent_callback(tracker),
+        after_agent_callback=make_after_agent_callback(
+            tracker, model_name=getattr(model, "model", "")
+        ),
     )
 
 

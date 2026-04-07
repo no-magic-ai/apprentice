@@ -128,19 +128,53 @@ def make_before_agent_callback(
 
 def make_after_agent_callback(
     tracker: BudgetTracker,
+    model_name: str = "",
 ) -> Any:
     """Create an ADK after_agent_callback that tracks cost after completion.
 
+    Estimates token usage from session state content using tiktoken.
+
     Args:
         tracker: Budget tracker instance.
+        model_name: Model identifier for cost estimation.
 
     Returns:
         An async callback function compatible with ADK agent callbacks.
     """
+    _output_keys = frozenset(
+        {
+            "generated_code",
+            "instrumented_code",
+            "manim_scene_code",
+            "anki_deck_content",
+            "review_feedback",
+            "review_verdict",
+            "discovery_candidates",
+        }
+    )
+
+    _seen_keys: set[str] = set()
 
     async def after_agent_track_cost(callback_context: Any) -> Any:
+        from apprentice.core.tokens import estimate_cost
+
         agent_name = getattr(callback_context, "agent_name", "unknown")
-        tracker.record_agent_completion(agent_name)
+        state = getattr(callback_context, "state", {})
+
+        tokens = 0
+        cost = 0.0
+
+        for key in _output_keys:
+            if key in _seen_keys:
+                continue
+            value = state.get(key, "")
+            if value:
+                _seen_keys.add(key)
+                est = estimate_cost("", str(value), model_name)
+                tokens += est["output_tokens"]
+                cost += est["cost_usd"]
+
+        tracker.record_agent_completion(agent_name, tokens=tokens, cost=cost)
 
         _logger.info(
             "agent_completed",
