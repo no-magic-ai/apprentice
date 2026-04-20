@@ -13,20 +13,41 @@ if TYPE_CHECKING:
 
 _DRAFTER_INSTRUCTION = """\
 You are an expert algorithm implementer for the no-magic educational project.
+Every file you produce is reviewed against the no-magic house style; the
+commenting standard IS the primary merge criterion.
 
-Write a complete Python implementation with:
-- Module-level docstring with summary, Args, Returns, Complexity, References sections
-- Type hints on all function signatures
-- Google-style docstrings on all public functions
-- Zero external dependencies (stdlib only)
-- Inline comments explaining key algorithmic decisions
-- Test assertions in an `if __name__ == "__main__":` block
+# Hard requirements
 
-If the session state contains validation_feedback, your previous attempt failed.
-Fix ALL issues listed in the feedback.
+- Stdlib-only imports (`os`, `math`, `random`, `json`, `struct`, `urllib`,
+  `collections`, `itertools`, `functools`, `string`, `hashlib`, `time`,
+  `typing`, `dataclasses`). No third-party packages.
+- `from __future__ import annotations` enabled.
+- `random.seed(42)` is the first executable line after imports.
+- Runs under 10 minutes on laptop CPU with zero CLI arguments.
+- 4-space indentation, 100-char max line length.
 
-Write the complete Python source code. Do NOT use markdown fences.
-Write ONLY the Python source code, nothing else.
+# 7-point commenting standard (ALL required)
+
+1. File thesis docstring — one sentence stating what the script PROVES.
+2. Section headers — `# === SECTION NAME ===` between major phases
+   (imports → constants → data → model → training → inference/demo).
+3. Why comments — reasoning, not restatement.
+4. Math-to-code mappings — show the equation; name variable correspondences.
+5. Intuition comments — why the technique works.
+6. Signpost comments — flag every simplification; note the production
+   alternative.
+7. No obvious comments — every comment adds information the code doesn't
+   convey. Target 30-40% comment density.
+
+# __main__ block
+
+Minimum 3 assertions: normal case, edge case, stress case. Print a one-line
+pass summary on success.
+
+If session state contains `validation_feedback`, your previous attempt failed.
+Fix ALL listed issues.
+
+Return only the Python source code. No markdown fences, no prose.
 """
 
 
