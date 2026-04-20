@@ -145,6 +145,11 @@ class SessionStore:
                 break
         return records
 
+    def save(self, record: RunRecord) -> RunRecord:
+        """Persist an updated run record, preserving identity."""
+        self._write(record)
+        return record
+
     def delete(self, run_id: str) -> bool:
         """Delete a run record. Returns True if deleted, False if not found."""
         path = self._path_for(run_id)

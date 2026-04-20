@@ -49,6 +49,24 @@ def main(argv: list[str] | None = None) -> int:
     submit_parser.add_argument("--tier", type=int, default=2, help="Algorithm tier (default: 2)")
     submit_parser.add_argument("--backend", type=str, default=None, help="Override backend")
     submit_parser.add_argument("--model", type=str, default=None, help="Override model")
+    submit_parser.add_argument(
+        "--run-id",
+        type=str,
+        default=None,
+        help="Run ID whose approval authorizes this submit (from 'apprentice history')",
+    )
+
+    approve_parser = subparsers.add_parser(
+        "approve",
+        help="Record a human-review approval for a build run (required before submit)",
+    )
+    approve_parser.add_argument("run_id", help="Run ID to approve (from 'apprentice history')")
+    approve_parser.add_argument(
+        "--approver",
+        type=str,
+        default=None,
+        help="Approver identity (defaults to $GITHUB_USER or $USER)",
+    )
 
     suggest_parser = subparsers.add_parser("suggest", help="Discover candidate algorithms")
     suggest_parser.add_argument("--tier", type=int, default=2, help="Target tier (default: 2)")
@@ -86,6 +104,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_build(cfg, args)
     if args.command == "submit":
         return _cmd_submit(cfg, args)
+    if args.command == "approve":
+        return _cmd_approve(args)
     if args.command == "suggest":
         return _cmd_suggest(cfg, args)
     if args.command == "retry":
@@ -197,19 +217,136 @@ def _cmd_build(cfg: ApprenticeConfig, args: Any) -> int:
 def _cmd_submit(cfg: ApprenticeConfig, args: Any) -> int:
     from apprentice.core.observability import get_logger
     from apprentice.core.orchestrator import build_pipeline
+    from apprentice.core.session_store import SessionStore
 
     logger = get_logger(__name__)
-    logger.info("submit started: %s (tier %d)", args.algorithm, args.tier)
+    store = SessionStore()
+
+    run_id = args.run_id or _latest_completed_run_id(store, args.algorithm)
+    if run_id is None:
+        _print_json(
+            {
+                "error": (
+                    f"No completed build found for '{args.algorithm}'. "
+                    "Run 'apprentice build' first."
+                )
+            }
+        )
+        return 1
+
+    try:
+        record = store.load(run_id)
+    except FileNotFoundError:
+        _print_json({"error": f"Run not found: {run_id}"})
+        return 1
+
+    approval = record.session_state.get("review_approval") if record.session_state else None
+    if not approval:
+        _print_json(
+            {
+                "error": "no human-review approval recorded for this run",
+                "run_id": run_id,
+                "remediation": f"apprentice approve {run_id}",
+            }
+        )
+        return 1
+
+    logger.info("submit started: %s (tier %d, run %s)", args.algorithm, args.tier, run_id)
 
     model = _resolve_model(cfg, args)
-    pipeline = build_pipeline(model, cfg, include_packaging=True)
+    pipeline = build_pipeline(model, cfg, include_packaging=True, approval=approval)
 
     start = time.monotonic()
     session_state = asyncio.run(_run_pipeline(pipeline, args.algorithm, args.tier, ""))
     elapsed = time.monotonic() - start
 
-    _print_build_result(args.algorithm, args.tier, session_state, elapsed)
+    _print_build_result(args.algorithm, args.tier, session_state, elapsed, run_id)
     return 0
+
+
+def _cmd_approve(args: Any) -> int:
+    """Record a human-review approval for a completed build run."""
+    import os
+    from datetime import UTC, datetime
+
+    from apprentice.core.gate_agent import materialize_artifacts
+    from apprentice.core.session_store import SessionStore
+    from apprentice.gates.review import compute_artifact_hashes
+
+    store = SessionStore()
+
+    try:
+        record = store.load(args.run_id)
+    except FileNotFoundError:
+        _print_json({"error": f"Run not found: {args.run_id}"})
+        return 1
+
+    if record.status != "completed":
+        _print_json(
+            {
+                "error": (
+                    f"Run {args.run_id} is not completed "
+                    f"(status: {record.status}); nothing to approve."
+                )
+            }
+        )
+        return 1
+
+    approver = args.approver or os.environ.get("GITHUB_USER") or os.environ.get("USER") or ""
+    if not approver:
+        _print_json(
+            {
+                "error": (
+                    "cannot determine approver — pass --approver or set "
+                    "GITHUB_USER/USER environment variable."
+                )
+            }
+        )
+        return 1
+
+    bundle = materialize_artifacts(record.session_state or {})
+    hashes = compute_artifact_hashes(bundle)
+    if not hashes:
+        _print_json(
+            {
+                "error": (
+                    "no artifacts could be materialized from run state; "
+                    "rebuild before approving."
+                ),
+                "run_id": args.run_id,
+            }
+        )
+        return 1
+
+    approval = {
+        "approved_by": approver,
+        "approved_at": datetime.now(tz=UTC).isoformat(),
+        "run_id": args.run_id,
+        "artifact_hashes": hashes,
+    }
+
+    state = dict(record.session_state) if record.session_state else {}
+    state["review_approval"] = approval
+    record.session_state = state
+    store.save(record)
+
+    _print_json(
+        {
+            "approved": True,
+            "run_id": args.run_id,
+            "approved_by": approver,
+            "artifact_hashes": hashes,
+        }
+    )
+    return 0
+
+
+def _latest_completed_run_id(store: Any, algorithm: str) -> str | None:
+    """Return the most recent completed run_id for `algorithm`, or None."""
+    for record in store.list_runs(status="completed", limit=50):
+        if record.algorithm_name == algorithm:
+            return record.run_id
+    return None
 
 
 def _cmd_suggest(cfg: ApprenticeConfig, args: Any) -> int:
