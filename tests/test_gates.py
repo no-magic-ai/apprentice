@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from apprentice.gates.consistency import ConsistencyGate
 from apprentice.gates.correctness import CorrectnessGate
 from apprentice.gates.lint import LintGate
+from apprentice.gates.review import ReviewGate, compute_artifact_hashes
 from apprentice.gates.schema_compliance import SchemaComplianceGate
 from apprentice.models.artifact import ArtifactBundle
 from apprentice.models.work_item import GateVerdict, WorkItem
@@ -159,3 +160,56 @@ def gate_eval(
 ) -> object:
     item = _make_item(name)
     return gate.evaluate(item, bundle)
+
+
+class TestReviewGate:
+    def test_properties(self) -> None:
+        gate = ReviewGate()
+        assert gate.name == "review"
+        assert gate.blocking is True
+
+    def test_fail_when_no_approval(self, tmp_path: Path) -> None:
+        f = tmp_path / "algo.py"
+        f.write_text("print('ok')\n")
+        bundle = _make_bundle(implementation_path=str(f))
+        result = ReviewGate().evaluate(_make_item(), bundle)
+        assert result.verdict == GateVerdict.FAIL
+        assert "no approval" in result.diagnostics["error"]
+        assert "apprentice approve" in result.diagnostics["remediation"]
+
+    def test_pass_with_matching_hashes(self, tmp_path: Path) -> None:
+        f = tmp_path / "algo.py"
+        f.write_text("print('ok')\n")
+        bundle = _make_bundle(implementation_path=str(f))
+        approval = {
+            "approved_by": "tester",
+            "approved_at": "2026-04-21T00:00:00+00:00",
+            "artifact_hashes": compute_artifact_hashes(bundle),
+        }
+        result = ReviewGate(approval=approval).evaluate(_make_item(), bundle)
+        assert result.verdict == GateVerdict.PASS
+        assert result.diagnostics["approved_by"] == "tester"
+
+    def test_fail_when_artifact_changed_after_approval(self, tmp_path: Path) -> None:
+        f = tmp_path / "algo.py"
+        f.write_text("print('ok')\n")
+        bundle = _make_bundle(implementation_path=str(f))
+        original_hashes = compute_artifact_hashes(bundle)
+        f.write_text("print('tampered')\n")
+        approval = {
+            "approved_by": "tester",
+            "approved_at": "2026-04-21T00:00:00+00:00",
+            "artifact_hashes": original_hashes,
+        }
+        result = ReviewGate(approval=approval).evaluate(_make_item(), bundle)
+        assert result.verdict == GateVerdict.FAIL
+        assert "diffs" in result.diagnostics
+
+    def test_fail_on_incomplete_approval(self, tmp_path: Path) -> None:
+        f = tmp_path / "algo.py"
+        f.write_text("print('ok')\n")
+        bundle = _make_bundle(implementation_path=str(f))
+        approval = {"approved_by": "tester"}  # missing approved_at and hashes
+        result = ReviewGate(approval=approval).evaluate(_make_item(), bundle)
+        assert result.verdict == GateVerdict.FAIL
+        assert "missing fields" in result.diagnostics["error"]

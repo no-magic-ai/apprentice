@@ -15,7 +15,7 @@ class TestLoadPrompt:
     def test_loads_implementation_prompt(self) -> None:
         template = load_prompt("implementation", _PROMPTS_DIR)
         assert template.name == "implementation"
-        assert template.version == "1.0.0"
+        assert template.version == "2.0.0"
         assert "algorithm_name" in template.variables
 
     def test_missing_prompt_raises(self) -> None:

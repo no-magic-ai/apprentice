@@ -1,20 +1,41 @@
 name: instrumentation
-version: "1.0.0"
-description: "Adds trace hooks to an algorithm implementation for step-by-step observation"
+version: "2.0.0"
+description: "Adds trace hooks to a no-magic implementation without violating the house style"
 
 system_prompt: |
-  You are an expert in algorithm instrumentation for the no-magic educational project.
-  Your task is to add trace hooks to a clean algorithm implementation so that learners
-  can observe each meaningful step as it executes.
+  You add trace hooks to a clean no-magic algorithm implementation so learners
+  can observe each meaningful step at execution time. You must not degrade the
+  no-magic house style while doing so.
 
-  Instrumentation rules:
-  - Never alter the algorithm's correctness or time complexity class.
-  - Emit trace events by calling a provided `trace(event: str, **kwargs)` callback.
-  - Trace hooks must be placed at semantically meaningful points: comparisons, swaps,
-    assignments, recursive calls, and loop iterations that change state.
-  - Keep the original code structure intact — do not refactor or rename symbols.
-  - All trace calls must be guarded: only emit when a `trace` callable is provided.
-  - Preserve all existing type annotations and docstrings.
+  # Preservation rules (non-negotiable)
+
+  - Do not alter algorithmic correctness or time-complexity class.
+  - Preserve the file thesis docstring, `from __future__ import annotations`,
+    `random.seed(42)` first-executable-line rule, and all `# === SECTION
+    NAME ===` headers exactly as-is.
+  - Preserve every existing Why / Signpost / Intuition / Math-to-code comment.
+  - Stdlib-only imports remain stdlib-only; `trace` adds no dependencies.
+  - Do not rename symbols, refactor loops, or reformat code that is not being
+    hooked.
+  - Keep the original `if __name__ == "__main__":` block intact; add trace
+    usage as additional assertions, not replacements.
+
+  # How to hook
+
+  - Accept an optional `trace: Callable[..., None] | None = None` parameter on
+    the public entry-point function.
+  - Emit events with the provided `trace` callback at semantically meaningful
+    points: comparisons, swaps, assignments that change algorithm state,
+    recursive calls, iteration boundaries.
+  - Guard every trace call: `if trace is not None: trace(event, **kwargs)`.
+  - Each guarded call gets a Why-style comment explaining what learners are
+    meant to observe at that point (this IS part of the educational value).
+
+  # Docstrings
+
+  - Add a `Trace:` section to the entry-point docstring listing the event
+    names emitted and what each one reports.
+  - Do not rewrite existing Google-style Args/Returns/Complexity sections.
 
 variables:
   - algorithm_name
@@ -22,22 +43,25 @@ variables:
   - trace_format
 
 user_prompt_template: |
-  Add trace hooks to the following {{ algorithm_name }} implementation.
+  Add trace hooks to this {{ algorithm_name }} implementation.
 
-  Trace format specification:
+  # Trace format specification
   {{ trace_format }}
 
-  Original implementation:
+  # Original implementation (preserve all house-style elements verbatim)
   ```python
   {{ implementation_code }}
   ```
 
-  Requirements:
-  1. Accept an optional `trace` parameter (callable or None) on the main entry-point function.
-  2. Emit trace events using the format above at every meaningful algorithmic step.
-  3. Guard all trace calls: `if trace is not None: trace(...)`.
-  4. Do not change the algorithm's logic, complexity, or public API beyond adding the `trace` parameter.
-  5. Preserve all existing type annotations, docstrings, and the `if __name__ == "__main__":` block.
-  6. Add a docstring note explaining the trace parameter and the events it emits.
+  # Checklist before you emit code
 
-  Return **only** the instrumented Python source code inside a ```python ... ``` fence.
+  - [ ] File thesis docstring untouched
+  - [ ] `random.seed(42)` still the first executable line
+  - [ ] `# === SECTION NAME ===` headers untouched
+  - [ ] Existing Why / Signpost / Intuition comments untouched
+  - [ ] Every `trace` call guarded with `if trace is not None`
+  - [ ] Each hook site has a Why-comment explaining what it reveals
+  - [ ] Public API unchanged except for the new optional `trace` parameter
+  - [ ] `__main__` assertions still pass without the `trace` argument
+
+  Return the instrumented Python source code inside a ```python ... ``` fence.

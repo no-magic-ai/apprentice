@@ -20,7 +20,10 @@ class BudgetTracker:
         total_usd: Maximum USD allowed for the entire pipeline run.
         tokens_used: Running total of tokens consumed.
         cost_usd: Running total of USD spent.
-        per_agent: Per-agent token and cost breakdown.
+        per_agent: Per-agent token and cost breakdown, one entry per stage
+            name (e.g. `drafter`, `instrumentation`, `visualization`,
+            `assessment`, `reviewer`, `packaging`, plus gate agents).
+        gate_verdicts: Ordered list of gate results appended in execution order.
     """
 
     total_tokens: int
@@ -28,6 +31,7 @@ class BudgetTracker:
     tokens_used: int = 0
     cost_usd: float = 0.0
     per_agent: dict[str, dict[str, Any]] = field(default_factory=dict)
+    gate_verdicts: list[dict[str, Any]] = field(default_factory=list)
     _agent_start_times: dict[str, float] = field(default_factory=dict)
 
     @property
@@ -75,6 +79,23 @@ class BudgetTracker:
         entry["calls"] += 1
         entry["duration_seconds"] += duration
 
+    def record_gate_verdict(
+        self,
+        gate_name: str,
+        after_stage: str,
+        verdict: str,
+        diagnostics: dict[str, Any] | None = None,
+    ) -> None:
+        """Append a gate verdict in execution order."""
+        self.gate_verdicts.append(
+            {
+                "gate_name": gate_name,
+                "after_stage": after_stage,
+                "verdict": verdict,
+                "diagnostics": diagnostics or {},
+            }
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "total_tokens": self.total_tokens,
@@ -84,20 +105,26 @@ class BudgetTracker:
             "tokens_remaining": self.tokens_remaining,
             "usd_remaining": round(self.usd_remaining, 6),
             "per_agent": self.per_agent,
+            "gate_verdicts": self.gate_verdicts,
         }
+
+
+_OUTPUT_KEY_BY_AGENT: dict[str, str] = {
+    "drafter": "generated_code",
+    "instrumentation": "instrumented_code",
+    "visualization": "manim_scene_code",
+    "assessment": "anki_deck_content",
+    "reviewer": "review_verdict",
+    "review_loop": "review_verdict",
+    "packaging": "pr_urls",
+    "discovery": "discovery_candidates",
+}
 
 
 def make_before_agent_callback(
     tracker: BudgetTracker,
 ) -> Any:
-    """Create an ADK before_agent_callback that checks budget before dispatch.
-
-    Args:
-        tracker: Budget tracker instance.
-
-    Returns:
-        An async callback function compatible with ADK agent callbacks.
-    """
+    """Create an ADK before_agent_callback that checks budget before dispatch."""
 
     async def before_agent_budget_check(callback_context: Any) -> Any:
         agent_name = getattr(callback_context, "agent_name", "unknown")
@@ -132,27 +159,10 @@ def make_after_agent_callback(
 ) -> Any:
     """Create an ADK after_agent_callback that tracks cost after completion.
 
-    Estimates token usage from session state content using tiktoken.
-
-    Args:
-        tracker: Budget tracker instance.
-        model_name: Model identifier for cost estimation.
-
-    Returns:
-        An async callback function compatible with ADK agent callbacks.
+    Attributes the most recent unattributed output key (per `_OUTPUT_KEY_BY_AGENT`)
+    to the agent that just finished, so each stage gets its own token/cost row
+    rather than everything collapsing into the pipeline root.
     """
-    _output_keys = frozenset(
-        {
-            "generated_code",
-            "instrumented_code",
-            "manim_scene_code",
-            "anki_deck_content",
-            "review_feedback",
-            "review_verdict",
-            "discovery_candidates",
-        }
-    )
-
     _seen_keys: set[str] = set()
 
     async def after_agent_track_cost(callback_context: Any) -> Any:
@@ -164,12 +174,11 @@ def make_after_agent_callback(
         tokens = 0
         cost = 0.0
 
-        for key in _output_keys:
-            if key in _seen_keys:
-                continue
-            value = state.get(key, "")
+        expected_key = _OUTPUT_KEY_BY_AGENT.get(agent_name)
+        if expected_key and expected_key not in _seen_keys:
+            value = state.get(expected_key, "")
             if value:
-                _seen_keys.add(key)
+                _seen_keys.add(expected_key)
                 est = estimate_cost("", str(value), model_name)
                 tokens += est["output_tokens"]
                 cost += est["cost_usd"]
@@ -189,17 +198,28 @@ def make_after_agent_callback(
     return after_agent_track_cost
 
 
+def wire_agent_callbacks(agent: Any, tracker: BudgetTracker, model_name: str) -> None:
+    """Attach budget callbacks to an agent and recursively to its sub-agents.
+
+    ADK fires agent-level callbacks only on the specific agent they are
+    attached to; a callback on a parent `SequentialAgent` does not fire per
+    sub-agent. To produce one `per_agent` row per stage we attach the same
+    tracker's callbacks to every node in the tree.
+    """
+    try:
+        agent.before_agent_callback = make_before_agent_callback(tracker)
+        agent.after_agent_callback = make_after_agent_callback(tracker, model_name)
+    except (AttributeError, ValueError):
+        pass
+
+    for sub in getattr(agent, "sub_agents", []) or []:
+        wire_agent_callbacks(sub, tracker, model_name)
+
+
 def make_before_model_callback(
     tracker: BudgetTracker,
 ) -> Any:
-    """Create an ADK before_model_callback for LLM request logging.
-
-    Args:
-        tracker: Budget tracker instance.
-
-    Returns:
-        An async callback function.
-    """
+    """Create an ADK before_model_callback for LLM request logging."""
 
     async def before_model_log(callback_context: Any, llm_request: Any) -> Any:
         _logger.debug(
@@ -214,14 +234,7 @@ def make_before_model_callback(
 def make_after_model_callback(
     tracker: BudgetTracker,
 ) -> Any:
-    """Create an ADK after_model_callback for LLM response token tracking.
-
-    Args:
-        tracker: Budget tracker instance.
-
-    Returns:
-        An async callback function.
-    """
+    """Create an ADK after_model_callback for LLM response token tracking."""
 
     async def after_model_log(callback_context: Any, llm_response: Any) -> Any:
         _logger.debug(
