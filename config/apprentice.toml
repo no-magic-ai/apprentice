@@ -40,9 +40,9 @@ half_open_probe_after_minutes = 60
 max_open_cycles_before_manual_reset = 3
 
 [provider]
-backend = "anthropic"
-model = "anthropic/claude-sonnet-4-20250514"
-fallback_model = "anthropic/claude-haiku-4-5-20251001"
+backend = "openai"
+model = "openai/gpt-5.4"
+fallback_model = "openai/gpt-5.4-mini"
 local_api_base = ""
 
 [observability]
