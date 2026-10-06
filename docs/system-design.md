@@ -26,7 +26,7 @@ no-magic's generated `docs/catalog.json` lists 48 scripts across four tiers (45 
 | `no-magic-ai/no-magic` | Tier README update (add to algorithm table) | `01-foundations/README.md` |
 | `no-magic-ai/no-magic` | Root README update (add GIF preview card) | `README.md` |
 | `no-magic-ai/no-magic` | Learning path update (add to relevant tracks) | `LEARNING_PATH.md` |
-| `no-magic-ai/no-magic` | Catalog records: `SCRIPT_TO_PAPER` (paper slug) and `SCRIPT_CONTRACTS` (teaching kind, data source, adaptation note) in `scripts/generate_catalog.py`, then regenerated `docs/catalog.json` | `scripts/generate_catalog.py` |
+| `no-magic-ai/no-magic` | Catalog record: `SCRIPT_TO_PAPER` (paper slug) in `scripts/generate_catalog.py`, then regenerated `docs/catalog.json` (required from no-magic v3.0). A pending, unmerged catalog change proposes an additional `SCRIPT_CONTRACTS` record (teaching kind, data source, adaptation note); it becomes required only if merged | `scripts/generate_catalog.py` |
 | `no-magic-ai/no-magic-papers` | Paper card whose `implementations[]` references the script (required from no-magic v3.0) | `papers/lstm.md` |
 
 Every new algorithm requires producing artifacts across **3 repositories** (`no-magic`, `no-magic-viz` and, from no-magic v3.0, `no-magic-papers`), maintaining consistency with existing conventions, and validating correctness. The current packaging agent covers `no-magic` and `no-magic-viz` only. This multi-repo coordination is the bottleneck to catalog growth.

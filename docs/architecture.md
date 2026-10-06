@@ -39,7 +39,7 @@ Only runs on `apprentice submit`. Creates coordinated PRs in both `no-magic` and
 
 `submit` requires a human approval recorded with `apprentice approve <run-id>`, which stores SHA-256 hashes of the run's materialized artifacts. `submit` then re-runs the pipeline with packaging, and the human-review gate (`gates/review.py`) blocks packaging unless the regenerated artifact hashes match the approved ones. The approved bytes themselves are not what gets packaged, and artifacts are materialized into a shared temporary directory (`core/gate_agent.py`); binding submission to the exact approved, run-owned bytes is open work.
 
-Packaging does not yet produce what no-magic v3 requires beyond those two repos: a `no-magic-papers` card whose `implementations[]` references the script, and explicit `SCRIPT_TO_PAPER` / `SCRIPT_CONTRACTS` records in `no-magic/scripts/generate_catalog.py`.
+Packaging does not yet produce what released no-magic v3 requires beyond those two repos: a `no-magic-papers` card whose `implementations[]` references the script, and an explicit `SCRIPT_TO_PAPER` entry in `no-magic/scripts/generate_catalog.py`. A pending, unmerged no-magic catalog change proposes an additional `SCRIPT_CONTRACTS` record per script (teaching kind, data source, adaptation note); once merged, packaging must produce it as well.
 
 ## Session State
 
