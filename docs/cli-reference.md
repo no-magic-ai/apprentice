@@ -25,7 +25,7 @@ apprentice build <algorithm> [--tier N] [--description TEXT] [--backend NAME] [-
 - `--backend` — override provider backend (anthropic, openai, gemini, ollama, local)
 - `--model` — override LiteLLM model string (e.g. "ollama_chat/llama3.3")
 
-Persists run state to `~/.apprentice/sessions/` for retry support.
+Rejects algorithm names other than 1-64 lowercase letters, digits and underscores (starting with a letter) and tiers other than 1-4. Persists the run record to `~/.apprentice/sessions/` and, on completion, seals the final artifacts into the run's immutable bundle (see [Architecture: Run-Owned Artifacts](architecture.md#run-owned-artifacts)).
 
 ### submit
 
@@ -81,13 +81,30 @@ apprentice metrics
 
 Reports success rate, per-agent cost/token breakdown, and per-tier statistics.
 
+### approve
+
+Record a human-review approval for a completed run.
+
+```
+apprentice approve <run_id> [--approver NAME]
+```
+
+- `run_id` — exact ID from `apprentice history`
+- `--approver` — approver identity (default: `$GITHUB_USER`, then `$USER`)
+
+Verifies the run's sealed bundle and stores the run ID, algorithm, tier, manifest digest, approver and time on the run record; prints every artifact's role, size, SHA-256 and destination. Fails for a tampered bundle and, for a run without a sealed bundle, asks for a rebuild. The approval is a local operator attestation, not a cryptographic identity.
+
 ### preview
 
-Inspect artifacts from the last build.
+Inspect a completed run's sealed artifact bundle.
 
 ```
-apprentice preview
+apprentice preview [--run-id ID]
 ```
+
+- `--run-id` — run to preview (default: the most recently started completed run)
+
+Verifies the bundle against its manifest and prints the run identity, manifest digest, approval state and, per artifact, its role, size, SHA-256, destination and first 500 characters.
 
 ### status
 
