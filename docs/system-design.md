@@ -5,6 +5,7 @@
 **Repository**: `no-magic-ai/apprentice`
 **Parent ecosystem**: `no-magic-ai/no-magic`
 **Framework**: [Google Agent Development Kit (ADK)](https://github.com/google/adk-python)
+**Status (2026-10-06)**: Design reference for the implemented package (version 0.4.0, assisted mode only). Activation for autonomous operation is deferred by the umbrella strategy until the no-magic catalog reaches at least 60 algorithms and the per-algorithm template is locked, and it additionally needs separate safety, spend and human approvals. Sections below that describe containment, rate limiting, circuit breaking and later roadmap versions are design targets unless marked as current; see [Section 7](#7-containment-system) and the [README status](../README.md#status) for what the code does today.
 
 ---
 
@@ -16,7 +17,7 @@
 
 ## 2. Problem Statement
 
-no-magic currently has 47 algorithms across four tiers, each requiring artifacts across multiple repositories:
+no-magic's generated `docs/catalog.json` lists 48 scripts across four tiers (45 `micro*` programs plus the comparison programs `attention_vs_none`, `rnn_vs_gru_vs_lstm` and `adam_vs_sgd`), each requiring artifacts across multiple repositories:
 
 | Repository | Content | Example |
 |---|---|---|
@@ -25,8 +26,10 @@ no-magic currently has 47 algorithms across four tiers, each requiring artifacts
 | `no-magic-ai/no-magic` | Tier README update (add to algorithm table) | `01-foundations/README.md` |
 | `no-magic-ai/no-magic` | Root README update (add GIF preview card) | `README.md` |
 | `no-magic-ai/no-magic` | Learning path update (add to relevant tracks) | `LEARNING_PATH.md` |
+| `no-magic-ai/no-magic` | Catalog records: `SCRIPT_TO_PAPER` (paper slug) and `SCRIPT_CONTRACTS` (teaching kind, data source, adaptation note) in `scripts/generate_catalog.py`, then regenerated `docs/catalog.json` | `scripts/generate_catalog.py` |
+| `no-magic-ai/no-magic-papers` | Paper card whose `implementations[]` references the script (required from no-magic v3.0) | `papers/lstm.md` |
 
-Every new algorithm requires producing artifacts across at minimum **2 repositories** (`no-magic` + `no-magic-viz`), maintaining consistency with existing conventions, and validating correctness. This multi-repo coordination is the bottleneck to catalog growth.
+Every new algorithm requires producing artifacts across **3 repositories** (`no-magic`, `no-magic-viz` and, from no-magic v3.0, `no-magic-papers`), maintaining consistency with existing conventions, and validating correctness. The current packaging agent covers `no-magic` and `no-magic-viz` only. This multi-repo coordination is the bottleneck to catalog growth.
 
 **apprentice** automates the full artifact pipeline using a multi-agent system where specialist agents handle implementation, visualization, assessment, and review — coordinated by an ADK orchestrator that manages budget, sequencing, quality enforcement, and **cross-repo PR packaging**.
 
@@ -60,7 +63,8 @@ All algorithms follow the `micro{name}` pattern:
 - Implementation: `micro{name}.py` in the tier directory
 - Scene: `scene_micro{name}.py` in `no-magic-viz/scenes/`
 - Preview: `micro{name}.gif` in `no-magic-viz/previews/`
-- The `micro` prefix is mandatory — it's the project's identity
+- The `micro` prefix is mandatory for new scripts — it's the project's identity. The three existing comparison programs predate this rule.
+- Script slugs (file basenames) and paper slugs (`no-magic-papers` card names) are separate namespaces. The script-to-paper link is written out in `SCRIPT_TO_PAPER`; never derive one slug from the other.
 
 ### 2.3 Tier Mapping
 
@@ -109,7 +113,7 @@ Google ADK is an open-source, code-first Python framework for building multi-age
 from google.adk.agents import Agent
 from google.adk.models.lite_llm import LiteLlm
 
-# Anthropic Claude (default)
+# Anthropic Claude
 agent = Agent(model=LiteLlm(model="anthropic/claude-sonnet-4-20250514"), ...)
 
 # OpenAI GPT
@@ -315,10 +319,10 @@ All agents use `LiteLlm` for provider-agnostic model access. The provider is sel
 
 ```toml
 [provider]
-backend = "anthropic"                          # anthropic | openai | gemini | ollama | local
-model = "anthropic/claude-sonnet-4-20250514"   # LiteLlm model string
-fallback_model = "anthropic/claude-haiku-4-5-20251001"
-local_api_base = "http://localhost:11434"       # For ollama/llama.cpp
+backend = "openai"                 # anthropic | openai | gemini | ollama | local | claude_cli
+model = "openai/gpt-5.4"           # LiteLlm model string
+fallback_model = "openai/gpt-5.4-mini"
+local_api_base = ""                # e.g. http://localhost:11434 for ollama/llama.cpp
 ```
 
 **Local model support:**
@@ -504,6 +508,8 @@ lint_tool = FunctionTool(func=lint_validate)
 
 ## 7. Containment System
 
+**Current implementation (0.4.0).** This section is the target design. Today: correctness validation runs generated code with `subprocess.run` and a 5-second timeout, which is not a sandbox; the shared `BudgetTracker` is built from the per-cycle token/cost limits and logs a warning when exhausted but still dispatches agents; the monthly, per-stage, per-agent and allocation budgets, rate limits and circuit breaker are parsed configuration that no code enforces (`core/circuit_breaker.py`, `core/queue.py` and `core/scheduler.py` are empty modules); the enforced cap is a hard-coded ADK `max_llm_calls` per run. None of this is certified containment.
+
 ### 7.1 Budget Manager (via ADK Callbacks)
 
 Budget tracking uses ADK lifecycle callbacks rather than manual accounting:
@@ -563,6 +569,8 @@ stateDiagram-v2
 
 ## 8. User Workflow — Assisted Mode (v1)
 
+Current CLI flow (0.4.0): `build` runs the pipeline through review; `preview` shows the artifacts; `apprentice approve <run-id>` records a human approval with artifact hashes; `submit <algorithm> --run-id <run-id>` re-runs the pipeline with packaging, and the human-review gate blocks packaging unless the regenerated artifact hashes match the approved ones. The diagram below predates the approval step.
+
 ```mermaid
 sequenceDiagram
     actor Dev as Developer
@@ -600,17 +608,20 @@ sequenceDiagram
 ### CLI Commands
 
 ```
-apprentice suggest [--tier N] [--limit N]     # Discovery Agent
-apprentice build <algorithm>                   # Full ADK pipeline
-apprentice build --from-issue <issue-number>   # Build from GitHub issue
-apprentice preview                             # Inspect last build artifacts
-apprentice submit                              # Package and open PR
-apprentice status                              # Budget usage, queue state
-apprentice metrics [--last-7d]                 # Per-agent cost breakdown
-apprentice retry <work-item-id>                # Retry shelved item
-apprentice reset-circuit                       # Manual circuit breaker reset
-apprentice config                              # View/edit apprentice.toml
+apprentice suggest [--tier N] [--limit N]               # Discovery Agent
+apprentice build <algorithm> [--tier N]                 # Full ADK pipeline through review
+apprentice preview                                      # Inspect last build artifacts
+apprentice approve <run-id> [--approver NAME]           # Record human-review approval
+apprentice submit <algorithm> [--tier N] [--run-id ID]  # Re-run with packaging; gated on approval
+apprentice status                                       # Configured budget/limit values
+apprentice metrics                                      # Aggregated run metrics
+apprentice history [--status S] [--limit N]             # Past runs
+apprentice retry <run-id>                               # Re-run a failed pipeline run
+apprentice config                                       # Display apprentice.toml
+apprentice dev [--port N]                               # ADK dev UI
 ```
+
+`build --from-issue` and `reset-circuit` are not implemented.
 
 ---
 
@@ -744,7 +755,7 @@ erDiagram
 | **v0.1** | CLI scaffold, provider interface, single-stage implementation | Assisted only |
 | **v0.2** | Full pipeline (all stages), quality gates | Assisted only |
 | **v0.3** | Agent foundation: custom orchestrator, implementation agent, validators | Assisted only |
-| **v0.4** | ADK migration: replace custom orchestrator with ADK primitives, all agents, local LLM support | Assisted only |
+| **v0.4** | ADK migration: replace custom orchestrator with ADK primitives, all agents, local LLM support — **current package version (0.4.0)** | Assisted only |
 | **v1.0** | Stable assisted mode, ≥95% success rate | **Assisted — release** |
 | **v1.1** | Scheduler, work queue, cycle management | Autonomous foundations |
 | **v1.2** | Circuit breaker, rate limiting, full containment | Autonomous safeguards |
@@ -752,6 +763,8 @@ erDiagram
 | **v1.4** | Observability: agent metrics, cost dashboard, alerting | Autonomous monitoring |
 | **v2.0** | Full autonomous mode. Read-only launch (opens PRs, human merges). | **Autonomous — release** |
 | **v2.1** | Review Agent feedback loop (revises from PR review comments) | Autonomous refinement |
+
+Versions after v0.4 are design targets with no assigned dates. No autonomous row may be activated before the umbrella activation gate (catalog ≥60 algorithms and a locked per-algorithm template) and separate safety, spend and human approvals are met.
 
 ---
 
@@ -766,9 +779,9 @@ no-magic-ai/apprentice/
 │       ├── core/
 │       │   ├── orchestrator.py       # ADK pipeline builder (SequentialAgent)
 │       │   ├── budget.py             # Budget callbacks for ADK agents
-│       │   ├── queue.py              # Work item management
-│       │   ├── circuit_breaker.py    # Failure containment
-│       │   ├── scheduler.py          # Autonomous cycle scheduling
+│       │   ├── queue.py              # Work item management (empty placeholder)
+│       │   ├── circuit_breaker.py    # Failure containment (empty placeholder)
+│       │   ├── scheduler.py          # Autonomous cycle scheduling (empty placeholder)
 │       │   └── observability.py      # Structured logging, metrics
 │       ├── agents/
 │       │   ├── base.py               # Shared agent helpers
