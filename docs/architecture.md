@@ -44,9 +44,11 @@ The CLI runner catches only that error, reads the stored session back from the s
 
 Packaging is not an agent and is not part of the pipeline. `apprentice submit <algorithm> --run-id <run-id>` runs no model, generation graph, drafting or rendering:
 
-1. The human-review gate (`gates/review.py`) requires a completed run with an approval recorded by `apprentice approve <run-id>`, loads the run's sealed bundle once and verifies it (see [Run-Owned Artifacts](#run-owned-artifacts)), and requires the approval, run record, bundle manifest and requested algorithm (and tier, if given) to agree. Any mismatch, tampering, added or removed file, symlink or changed destination fails here, before any clone or other packaging side effect.
+1. The human-review gate (`gates/review.py`) requires a completed run, loads the run's sealed bundle once and verifies it (see [Run-Owned Artifacts](#run-owned-artifacts)), refuses a run whose build recorded a failed blocking gate, then requires an approval recorded by `apprentice approve <run-id>` and requires the approval, run record, bundle manifest and requested algorithm (and tier, if given) to agree. A run without a sealed bundle gets the rebuild instruction, not an approve remediation. Any mismatch, tampering, added or removed file, symlink or changed destination fails here, before any clone or other packaging side effect.
 2. `agents/packaging.py` writes exactly those captured bytes to their manifest destinations (`no-magic/<tier dir>/micro<name>.py`, `no-magic-viz/scenes/scene_micro<name>.py`) in fresh clones of the two fixed repositories inside an exclusive scratch root, refusing existing destinations and symlinked directories. It stages only those paths, commits with the approval time as author and committer date, and checks that each commit contains exactly the approved bytes and paths before anything is pushed.
-3. It pushes branch `apprentice/<run-id>` to both repositories and opens the PRs with `gh`, the viz PR referencing the core PR, then records the PRs on the run. A run already submitted is not published again.
+3. It pushes branch `apprentice/<run-id>` to both repositories and opens the PRs with `gh`, the viz PR referencing the core PR.
+
+Each run gets one submission attempt, recorded on the run record. Before any push the attempt is saved as `pending` with the manifest digest, scratch workspace and branch. It ends as `complete` (both branches pushed, both PRs opened), `partial` (some branch was pushed; the record lists which branches were pushed and which PRs were opened before the error) or `failed` (nothing was pushed), with the error. A run with any recorded attempt, including one left `pending` by an interruption, is refused without touching a repository: `submit` never retries, resumes or reconciles publication. The operator inspects the recorded effects.
 
 Instrumented code and Anki cards are kept in the approved bundle but not promoted.
 
@@ -82,6 +84,10 @@ Budget is configured in `apprentice.toml` under `[budget]`:
 - Agent: percentage allocation (implementation 40%, tool agents 15% each, review 15%)
 
 Only the cycle token/cost limits are consumed: the pipeline's shared `BudgetTracker` is created from them (`core/orchestrator.py`). When the tracker is exhausted, `before_agent_budget_check` logs a warning and still dispatches the agent, so the limit is observed, not enforced. The monthly, per-stage, per-agent-call and percentage-allocation settings, `[rate_limits]` and `[circuit_breaker]` are parsed and shown by `apprentice config` / `status` but not enforced. The enforced cap is the hard-coded ADK `RunConfig(max_llm_calls=...)` per run in `cli.py`.
+
+## Gate Outcomes
+
+`GateAgent` records every gate verdict, with whether the gate is blocking, through `BudgetTracker` into the run record's `budget_summary.gate_verdicts`. `build`, `retry` and the integration script finish a run through `SessionStore.finish_run`: a run with no generated code, or with a FAIL from a blocking gate, is recorded as `failed` with the gate named in its error, keeps its session state, gate diagnostics and work-root files, and is never sealed. `approve` and `submit` also refuse a completed run whose recorded verdicts include a blocking FAIL (runs sealed before this check existed); verdicts recorded without the `blocking` flag come from the four pipeline gates, which are all blocking. WARN verdicts do not block.
 
 ## Session Persistence
 

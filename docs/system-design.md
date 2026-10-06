@@ -29,9 +29,9 @@ no-magic's generated `docs/catalog.json` lists 48 scripts across four tiers (45 
 | `no-magic-ai/no-magic` | Catalog record: `SCRIPT_TO_PAPER` (paper slug) in `scripts/generate_catalog.py`, then regenerated `docs/catalog.json` (required from no-magic v3.0). When the target generator revision defines `SCRIPT_CONTRACTS` (the M1 catalog extension: teaching kind, data source, adaptation note), that record is required too; released v3 does not define it | `scripts/generate_catalog.py` |
 | `no-magic-ai/no-magic-papers` | Paper card whose `implementations[]` references the script (required from no-magic v3.0) | `papers/lstm.md` |
 
-Every new algorithm requires producing artifacts across **3 repositories** (`no-magic`, `no-magic-viz` and, from no-magic v3.0, `no-magic-papers`), maintaining consistency with existing conventions, and validating correctness. The current packaging agent covers `no-magic` and `no-magic-viz` only. This multi-repo coordination is the bottleneck to catalog growth.
+Every new algorithm requires producing artifacts across **3 repositories** (`no-magic`, `no-magic-viz` and, from no-magic v3.0, `no-magic-papers`), maintaining consistency with existing conventions, and validating correctness. The deterministic `submit` packager currently covers `no-magic` and `no-magic-viz` only. This multi-repo coordination is the bottleneck to catalog growth.
 
-**apprentice** automates the full artifact pipeline using a multi-agent system where specialist agents handle implementation, visualization, assessment, and review — coordinated by an ADK orchestrator that manages budget, sequencing, quality enforcement, and **cross-repo PR packaging**.
+**apprentice** automates the full artifact pipeline using a multi-agent system where specialist agents handle implementation, visualization, assessment, and review — coordinated by an ADK orchestrator that tracks budget, sequences stages and runs quality gates. **Cross-repo PR packaging** is a separate, deterministic `submit` step that promotes the human-approved bundle bytes without a model.
 
 ### 2.1 Target Repository Structure
 
@@ -438,13 +438,13 @@ graph LR
 **Current (0.4.0)**: `apprentice submit <algorithm> --run-id <run-id>` promotes the exact bytes a human approved. It runs no model, generation graph, drafting or rendering.
 
 **Execution flow**:
-1. The review gate (`gates/review.py`) loads the run's sealed bundle once, verifies every artifact against its canonical manifest, and requires the approval (run ID, algorithm, tier, manifest digest), the run record, the bundle and the requested algorithm/tier to agree. Failures stop before any clone.
+1. The review gate (`gates/review.py`) loads the run's sealed bundle once, verifies every artifact against its canonical manifest, refuses a run whose build recorded a failed blocking gate, and requires the approval (run ID, algorithm, tier, manifest digest), the run record, the bundle and the requested algorithm/tier to agree. Failures stop before any clone.
 2. Clone `no-magic-ai/no-magic` and `no-magic-ai/no-magic-viz` into an exclusive scratch root and create branch `apprentice/<run-id>` in each.
 3. Write the verified bytes to their manifest destinations, refusing existing files and symlinked directories:
    - implementation → `no-magic/{tier_dir}/micro{name}.py`
    - Manim scene → `no-magic-viz/scenes/scene_micro{name}.py`
 4. Stage only those paths, commit with the approval time as author/committer date, and check that each commit contains exactly the approved bytes and paths.
-5. Push both branches, then open the `no-magic` PR and a `no-magic-viz` PR that references it, with `gh`. The PRs are recorded on the run; a submitted run is not published again.
+5. Push both branches, then open the `no-magic` PR and a `no-magic-viz` PR that references it, with `gh`. The single attempt is recorded on the run as `pending` before the first push and ends `complete`, `partial` (with the branches pushed and PRs opened before the error) or `failed`; any recorded attempt blocks another `submit` of that run, with no retry or resume.
 
 Packaging never merges. It uses the operator's ambient `git` and `gh` credentials; credential scoping is open containment work (see the [README status](../README.md#status)).
 
@@ -772,7 +772,7 @@ no-magic-ai/apprentice/
 │       │   ├── visualization.py      # LlmAgent (tool-agent)
 │       │   ├── assessment.py         # LlmAgent (tool-agent)
 │       │   ├── review.py             # LoopAgent: validator + feedback
-│       │   └── packaging.py         # LlmAgent: multi-repo PR creation
+│       │   └── packaging.py          # Deterministic approved-byte PR creation
 │       ├── validators/
 │       │   ├── base.py               # ValidationResult, ValidationIssue
 │       │   ├── lint.py               # → FunctionTool

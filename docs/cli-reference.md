@@ -39,7 +39,7 @@ apprentice submit <algorithm> --run-id ID [--tier N]
 - `--run-id` — approved run to submit (required)
 - `--tier` — if given, must match the run's tier
 
-Verifies the approval, run identity and sealed bundle before any repository is cloned, then promotes the approved implementation to `no-magic/<tier dir>/micro<name>.py` and the approved scene to `no-magic-viz/scenes/scene_micro<name>.py` on branch `apprentice/<run-id>` and opens a PR in each repository with `gh`. Uses the operator's `git` and `gh` credentials. Refuses a run that was already submitted. See [Architecture: Packaging](architecture.md#packaging).
+Verifies the approval, run identity and sealed bundle before any repository is cloned, then promotes the approved implementation to `no-magic/<tier dir>/micro<name>.py` and the approved scene to `no-magic-viz/scenes/scene_micro<name>.py` on branch `apprentice/<run-id>` and opens a PR in each repository with `gh`. Uses the operator's `git` and `gh` credentials. Before the first push it records the attempt on the run as `pending`; it ends `complete`, `partial` (lists the branches pushed and PRs opened before the error) or `failed` (nothing pushed). A run with any recorded attempt is refused without touching a repository; there is no retry or resume. A run whose build recorded a failed blocking gate is refused, and a run without a sealed bundle gets the rebuild instruction. See [Architecture: Packaging](architecture.md#packaging).
 
 ### suggest
 
@@ -96,7 +96,7 @@ apprentice approve <run_id> [--approver NAME]
 - `run_id` — exact ID from `apprentice history`
 - `--approver` — approver identity (default: `$GITHUB_USER`, then `$USER`)
 
-Verifies the run's sealed bundle and stores the run ID, algorithm, tier, manifest digest, approver and time on the run record; prints every artifact's role, size, SHA-256 and destination. Fails for a tampered bundle and, for a run without a sealed bundle, asks for a rebuild. The approval is a local operator attestation, not a cryptographic identity.
+Verifies the run's sealed bundle and stores the run ID, algorithm, tier, manifest digest, approver and time on the run record; prints every artifact's role, size, SHA-256 and destination. Fails for a tampered bundle, for a run whose build recorded a failed blocking gate and, for a run without a sealed bundle, asks for a rebuild. The approval is a local operator attestation, not a cryptographic identity.
 
 ### preview
 
