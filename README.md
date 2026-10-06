@@ -50,7 +50,7 @@ Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync
-# Put the API key your backend needs (see below) in .env or your environment
+export OPENAI_API_KEY=...  # the default openai backend needs this; see below for other backends
 ```
 
 ### Provider Configuration
@@ -65,7 +65,7 @@ fallback_model = "openai/gpt-5.4-mini"
 local_api_base = ""                # For ollama/local backends
 ```
 
-Required environment variables per backend:
+Required environment variables per backend. Export them in the shell that runs `apprentice`; the CLI reads the process environment and does not load `.env` files:
 - `anthropic` → `ANTHROPIC_API_KEY`
 - `openai` → `OPENAI_API_KEY`
 - `gemini` → `GOOGLE_API_KEY`
