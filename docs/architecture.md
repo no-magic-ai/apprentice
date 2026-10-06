@@ -37,6 +37,10 @@ The reviewer runs consistency and schema compliance validators across all artifa
 
 Only runs on `apprentice submit`. Creates coordinated PRs in both `no-magic` and `no-magic-viz` repos with proper file placement and cross-references.
 
+`submit` requires a human approval recorded with `apprentice approve <run-id>`, which stores SHA-256 hashes of the run's materialized artifacts. `submit` then re-runs the pipeline with packaging, and the human-review gate (`gates/review.py`) blocks packaging unless the regenerated artifact hashes match the approved ones. The approved bytes themselves are not what gets packaged, and artifacts are materialized into a shared temporary directory (`core/gate_agent.py`); binding submission to the exact approved, run-owned bytes is open work.
+
+Packaging does not yet produce what released no-magic v3 requires beyond those two repos: a `no-magic-papers` card whose `implementations[]` references the script, and an explicit `SCRIPT_TO_PAPER` entry in `no-magic/scripts/generate_catalog.py`. The M1 catalog extension to that generator defines an additional per-script `SCRIPT_CONTRACTS` record (teaching kind, data source, adaptation note) that released v3 does not contain; when the target no-magic generator revision defines `SCRIPT_CONTRACTS`, packaging must populate it as well.
+
 ## Session State
 
 ADK agents communicate through session state. Each agent writes to a key specified by `output_key`:
@@ -66,6 +70,8 @@ Budget is configured in `apprentice.toml` under `[budget]`:
 - Global: monthly token/cost ceiling
 - Cycle: per-pipeline-run limits
 - Agent: percentage allocation (implementation 40%, tool agents 15% each, review 15%)
+
+Only the cycle token/cost limits are consumed: the pipeline's shared `BudgetTracker` is created from them (`core/orchestrator.py`). When the tracker is exhausted, `before_agent_budget_check` logs a warning and still dispatches the agent, so the limit is observed, not enforced. The monthly, per-stage, per-agent-call and percentage-allocation settings, `[rate_limits]` and `[circuit_breaker]` are parsed and shown by `apprentice config` / `status` but not enforced. The enforced cap is the hard-coded ADK `RunConfig(max_llm_calls=...)` per run in `cli.py`.
 
 ## Session Persistence
 
