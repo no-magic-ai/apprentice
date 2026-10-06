@@ -6,10 +6,11 @@
 RuntimeError: Backend 'anthropic' requires environment variable ANTHROPIC_API_KEY to be set
 ```
 
-Set the required key in your `.env` file or environment:
+Export the key that the configured backend needs in the shell that runs `apprentice`; the CLI reads the process environment and does not load `.env` files. For the backend in this example:
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
+The default `openai` backend needs `OPENAI_API_KEY`; see the README for the variable each backend requires.
 
 ## Build produces no output
 
