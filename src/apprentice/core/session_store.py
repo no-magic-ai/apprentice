@@ -5,6 +5,7 @@ The store is the single authority for run identity and artifact ownership:
     <store_dir>/<run_id>.json            run record
     <store_dir>/runs/<run_id>/work/      mutable generation root of one run
     <store_dir>/runs/<run_id>/bundle/    sealed bundle + manifest (on completion)
+    <store_dir>/runs/<run_id>.lock       empty coordination file of `record_lock`
     <store_dir>/scratch/<uuid>/          exclusive roots for runs without a record
 """
 
@@ -14,15 +15,17 @@ import json
 import os
 import re
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from apprentice.core.artifacts import (
     ArtifactError,
     BundleSnapshot,
     RunScope,
+    _open_single_link_file,
     load_snapshot,
     require_owned_root,
     seal_bundle,
@@ -30,6 +33,9 @@ from apprentice.core.artifacts import (
     tier_directory,
     validate_algorithm_name,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 _DEFAULT_STORE_DIR = Path.home() / ".apprentice" / "sessions"
 _FAIL = "fail"
@@ -302,6 +308,36 @@ class SessionStore:
         """Persist an updated run record, preserving identity."""
         self._write(record)
         return record
+
+    @contextmanager
+    def record_lock(self, run_id: str) -> Iterator[None]:
+        """Hold the exclusive lock that `approve` and `submit` take on one run.
+
+        The lock is an advisory `flock` on `runs/<run_id>.lock`, a dedicated
+        empty file that is created once and never replaced or removed, so every
+        holder locks the same inode. It serializes reading, checking and saving
+        the run record; it is held only for local work (no network, subprocess
+        or model call). Other readers and writers of the record do not take it.
+
+        Raises:
+            ValueError: If `run_id` is not a supported run ID.
+            FileNotFoundError: If the run has no record (no lock file is created).
+            ArtifactError: If the lock path is a symlink, not a regular file or
+                has more than one link.
+        """
+        import fcntl
+
+        if not self._record_path(run_id).exists():
+            raise FileNotFoundError(f"No run record found: {run_id}")
+        runs = self._dir / "runs"
+        runs.mkdir(parents=True, exist_ok=True)
+        path = require_owned_root(runs) / f"{run_id}.lock"
+        fd = _open_single_link_file(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)
 
     def delete(self, run_id: str) -> bool:
         """Delete a run record. Returns True if deleted, False if not found."""

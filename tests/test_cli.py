@@ -322,8 +322,14 @@ class TestSubmitCommand:
         assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 0
         calls = len(offline_remotes.gh_calls())
 
+        stored = SessionStore(store_dir=store_dir).load(rec.run_id).submission
+        capsys.readouterr()
+
         assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
-        assert "already has a complete submission attempt" in capsys.readouterr().out
+        out = json.loads(_last_json(capsys))
+        assert "already has a submission attempt" in out["error"]
+        assert out["submission"] == stored
+        assert out["submission"]["status"] == "complete"
         assert len(offline_remotes.gh_calls()) == calls
 
     def test_full_submission_is_recorded_complete(
@@ -381,7 +387,9 @@ class TestSubmitCommand:
 
         assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
 
-        assert f"already has a {status} submission attempt" in capsys.readouterr().out
+        out = json.loads(_last_json(capsys))
+        assert "already has a submission attempt" in out["error"]
+        assert out["submission"]["status"] == status
         assert {r: offline_remotes.branches(r) for r in offline_remotes.bare} == branches
         assert len(offline_remotes.gh_calls()) == gh_calls
         assert sorted((store_dir / "scratch").iterdir()) == scratch
@@ -407,7 +415,9 @@ class TestSubmitCommand:
         assert SessionStore(store_dir=store_dir).load(rec.run_id).submission["status"] == "pending"
         capsys.readouterr()
         assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
-        assert "already has a pending submission attempt" in capsys.readouterr().out
+        out = json.loads(_last_json(capsys))
+        assert "already has a submission attempt" in out["error"]
+        assert out["submission"]["status"] == "pending"
         assert offline_remotes.gh_calls() == []
 
     @pytest.mark.parametrize(
@@ -939,3 +949,120 @@ class TestFreshSubmitProcess:
             f"apprentice/{rec.run_id}",
             "main",
         ]
+
+
+class TestApproverSelection:
+    @pytest.mark.parametrize("approver", ["", "   ", "a\nb", "a\rb", "a\x00b"])
+    def test_invalid_explicit_approver_is_refused_without_falling_back(
+        self,
+        store_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        approver: str,
+    ) -> None:
+        rec = _make_completed_run(store_dir)
+        monkeypatch.setenv("GITHUB_USER", "environment-reviewer")
+        record_bytes = (store_dir / f"{rec.run_id}.json").read_bytes()
+
+        assert _cmd_approve(_ApproveArgs(rec.run_id, approver=approver)) == 1
+
+        assert "invalid approver" in json.loads(capsys.readouterr().out)["error"]
+        assert (store_dir / f"{rec.run_id}.json").read_bytes() == record_bytes
+        assert not (store_dir / "runs" / f"{rec.run_id}.lock").exists()
+
+    def test_accepted_approver_is_stored_exactly_as_given(self, store_dir: Path) -> None:
+        rec = _make_completed_run(store_dir)
+
+        assert _cmd_approve(_ApproveArgs(rec.run_id, approver="  Ada Lovelace ")) == 0
+
+        approval = SessionStore(store_dir=store_dir).load(rec.run_id).approval
+        assert approval["approved_by"] == "  Ada Lovelace "
+
+    def test_environment_approver_is_used_when_none_is_given(
+        self, store_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rec = _make_completed_run(store_dir)
+        monkeypatch.setenv("GITHUB_USER", "environment-reviewer")
+
+        assert _cmd_approve(_ApproveArgs(rec.run_id, approver=None)) == 0
+
+        approval = SessionStore(store_dir=store_dir).load(rec.run_id).approval
+        assert approval["approved_by"] == "environment-reviewer"
+
+    def test_invalid_environment_approver_is_refused(
+        self,
+        store_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rec = _make_completed_run(store_dir)
+        monkeypatch.setenv("GITHUB_USER", "line\nbreak")
+        monkeypatch.setenv("USER", "fallback-user")
+
+        assert _cmd_approve(_ApproveArgs(rec.run_id, approver=None)) == 1
+
+        assert "invalid approver" in json.loads(capsys.readouterr().out)["error"]
+        assert SessionStore(store_dir=store_dir).load(rec.run_id).approval == {}
+
+
+def _store_approval_field(store_dir: Path, run_id: str, field: str, value: object) -> None:
+    path = store_dir / f"{run_id}.json"
+    data = json.loads(path.read_bytes())
+    data["approval"][field] = value
+    path.write_text(json.dumps(data))
+
+
+class TestStoredApprovalMetadata:
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("approved_at", ""),
+            ("approved_at", 1759795200),
+            ("approved_at", "yesterday"),
+            ("approved_at", "2026-10-07T08:09:10"),
+            ("approved_at", "2026-10-07 08:09:10+00:00"),
+            ("approved_at", "2026-10-07T08:09:10Z"),
+            ("approved_by", ""),
+            ("approved_by", 7),
+            ("approved_by", "reviewer\nForged-Trailer: yes"),
+        ],
+    )
+    def test_malformed_approval_is_refused_before_any_attempt(
+        self,
+        store_dir: Path,
+        offline_remotes: OfflineRemotes,
+        capsys: pytest.CaptureFixture[str],
+        field: str,
+        value: object,
+    ) -> None:
+        rec = _approved_run(store_dir)
+        _store_approval_field(store_dir, rec.run_id, field, value)
+        record_bytes = (store_dir / f"{rec.run_id}.json").read_bytes()
+        capsys.readouterr()
+
+        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
+
+        out = json.loads(capsys.readouterr().out)
+        assert f"approval of run {rec.run_id} is malformed" in out["error"]
+        assert out["remediation"].endswith(f"apprentice approve {rec.run_id}`")
+        assert (store_dir / f"{rec.run_id}.json").read_bytes() == record_bytes
+        assert not (store_dir / "scratch").exists()
+        assert offline_remotes.gh_calls() == []
+
+    def test_canonical_approval_time_is_the_exact_commit_date(
+        self, store_dir: Path, offline_remotes: OfflineRemotes
+    ) -> None:
+        rec = _approved_run(store_dir)
+        _store_approval_field(store_dir, rec.run_id, "approved_at", "2026-10-07T08:09:10+05:30")
+
+        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 0
+
+        dates = subprocess.run(
+            ["git", "log", "-1", "--format=%aI %cI", f"apprentice/{rec.run_id}"],
+            cwd=offline_remotes.bare["no-magic-ai/no-magic"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split()
+        assert dates == ["2026-10-07T08:09:10+05:30"] * 2
+

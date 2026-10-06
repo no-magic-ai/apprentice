@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from apprentice.core.artifacts import BundleSnapshot
     from apprentice.core.config import ApprenticeConfig
     from apprentice.core.session_store import RunRecord, SessionStore
     from apprentice.models.work_item import BlockingGateError
@@ -259,154 +260,233 @@ def _record_gate_halt(
 
 
 def _cmd_submit(args: Any) -> int:
-    """Promote the exact approved bytes of a run; no model or generation runs."""
+    """Promote the exact approved bytes of a run; no model or generation runs.
+
+    The attempt is reserved under the run's record lock before any clone, push
+    or pull request, so concurrent or repeated submits publish at most once.
+    Its outcome is recorded only if the stored attempt is still the one this
+    process reserved.
+    """
     from datetime import UTC, datetime
 
     from apprentice.agents.packaging import PackagingError, submit_snapshot
-    from apprentice.core.artifacts import ArtifactError
     from apprentice.core.observability import get_logger
     from apprentice.core.session_store import SessionStore
-    from apprentice.gates.review import ApprovalError, require_approved_snapshot
 
     logger = get_logger(__name__)
     store = SessionStore()
+    reservation = _reserve_submission(store, args)
+    if reservation is None:
+        return 1
+    snapshot, approval, reserved = reservation
 
+    logger.info("submit started: run %s manifest %s", snapshot.run_id, snapshot.manifest_sha256)
     try:
-        record = store.load(args.run_id)
-    except (FileNotFoundError, ValueError) as exc:
-        _print_json({"error": str(exc)})
-        return 1
-
-    try:
-        snapshot = require_approved_snapshot(
-            store, record, algorithm=args.algorithm, tier=args.tier
-        )
-    except ApprovalError as exc:
-        _print_json({"error": str(exc), "run_id": record.run_id, "remediation": exc.remediation})
-        return 1
-    except ArtifactError as exc:
-        _print_json({"error": str(exc), "run_id": record.run_id})
-        return 1
-
-    if record.submission:
-        # One attempt per run: a pending, partial, failed or complete attempt is
-        # never retried or resumed, because its remote effects may be incomplete
-        # or unknown. Inspect the recorded effects; approve a fresh run instead.
-        _print_json(
-            {
-                "error": (
-                    f"run {record.run_id} already has a {_submission_status(record.submission)} "
-                    "submission attempt; it is not published again"
-                ),
-                "submission": record.submission,
-            }
-        )
-        return 1
-
-    workspace = store.allocate_work_root()
-    # Reserve the attempt before any publisher effect so an interruption leaves
-    # a pending record that blocks a blind rerun.
-    record.submission = {
-        "status": "pending",
-        "started_at": datetime.now(tz=UTC).isoformat(),
-        "manifest_sha256": snapshot.manifest_sha256,
-        "workspace": str(workspace),
-        "branch": f"apprentice/{record.run_id}",
-        "repositories": [],
-    }
-    store.save(record)
-    logger.info("submit started: run %s manifest %s", record.run_id, snapshot.manifest_sha256)
-    try:
-        submissions = submit_snapshot(snapshot, record.approval, workspace)
+        submissions = submit_snapshot(snapshot, approval, Path(reserved["workspace"]))
     except PackagingError as exc:
         pushed = any(effect["pushed"] for effect in exc.effects)
-        record.submission.update(
-            {
-                "status": "partial" if pushed else "failed",
-                "finished_at": datetime.now(tz=UTC).isoformat(),
-                "error": str(exc),
-                "repositories": exc.effects,
-            }
-        )
-        store.save(record)
-        _print_json({"error": str(exc), "run_id": record.run_id, **record.submission})
+        outcome = {
+            "status": "partial" if pushed else "failed",
+            "finished_at": datetime.now(tz=UTC).isoformat(),
+            "error": str(exc),
+            "repositories": exc.effects,
+        }
+        recorded = _finish_submission(store, snapshot.run_id, reserved, outcome)
+        if recorded is not None:
+            _print_json({"error": str(exc), "run_id": snapshot.run_id, **recorded})
         return 1
 
-    record.submission.update(
-        {
-            "status": "complete",
-            "finished_at": datetime.now(tz=UTC).isoformat(),
-            "repositories": [submission.to_dict() for submission in submissions],
-        }
-    )
-    store.save(record)
-    _print_json({"run_id": record.run_id, **record.submission})
+    outcome = {
+        "status": "complete",
+        "finished_at": datetime.now(tz=UTC).isoformat(),
+        "repositories": [submission.to_dict() for submission in submissions],
+    }
+    recorded = _finish_submission(store, snapshot.run_id, reserved, outcome)
+    if recorded is None:
+        return 1
+    _print_json({"run_id": snapshot.run_id, **recorded})
     return 0
 
 
-def _submission_status(submission: dict[str, Any]) -> str:
-    # Records written before attempts carried a status were only saved on success.
-    return str(submission.get("status", "complete"))
+def _reserve_submission(
+    store: SessionStore, args: Any
+) -> tuple[BundleSnapshot, dict[str, Any], dict[str, Any]] | None:
+    """Under the record lock, verify the approval and save a pending attempt.
+
+    Returns the one captured snapshot, the approval read under the lock and
+    the reserved attempt, or None after printing why nothing was reserved.
+    """
+    from datetime import UTC, datetime
+
+    from apprentice.core.artifacts import ArtifactError
+    from apprentice.gates.review import ApprovalError, require_approved_snapshot
+
+    try:
+        with store.record_lock(args.run_id):
+            record = store.load(args.run_id)
+            try:
+                snapshot = require_approved_snapshot(
+                    store, record, algorithm=args.algorithm, tier=args.tier
+                )
+            except ApprovalError as exc:
+                _print_json(
+                    {"error": str(exc), "run_id": record.run_id, "remediation": exc.remediation}
+                )
+                return None
+            if record.submission:
+                # One attempt per run: an attempt whose effects may be incomplete
+                # or unknown is never retried, resumed or overwritten.
+                _print_json(
+                    {
+                        "error": (
+                            f"run {record.run_id} already has a submission attempt; "
+                            "it is not published again"
+                        ),
+                        "run_id": record.run_id,
+                        "submission": record.submission,
+                    }
+                )
+                return None
+            workspace = store.allocate_work_root()
+            reserved = {
+                "status": "pending",
+                "started_at": datetime.now(tz=UTC).isoformat(),
+                "manifest_sha256": snapshot.manifest_sha256,
+                "workspace": str(workspace),
+                "branch": f"apprentice/{record.run_id}",
+                "repositories": [],
+            }
+            record.submission = dict(reserved)
+            store.save(record)
+            return snapshot, dict(record.approval), reserved
+    except (FileNotFoundError, ValueError) as exc:
+        _print_json({"error": str(exc)})
+        return None
+    except ArtifactError as exc:
+        _print_json({"error": str(exc), "run_id": args.run_id})
+        return None
+
+
+def _finish_submission(
+    store: SessionStore, run_id: str, reserved: dict[str, Any], outcome: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Record the outcome of the reserved attempt and return the stored attempt.
+
+    The record is reloaded under the lock and updated only if its attempt is
+    still exactly `reserved`; otherwise nothing is saved, and the known
+    effects of this process are printed with the discrepancy (returns None).
+    """
+    from apprentice.core.artifacts import ArtifactError
+
+    stored: dict[str, Any] | None
+    try:
+        with store.record_lock(run_id):
+            latest = store.load(run_id)
+            if latest.submission == reserved:
+                latest.submission = {**reserved, **outcome}
+                store.save(latest)
+                return latest.submission
+            stored = latest.submission
+            discrepancy = "the stored submission attempt is not the one this process reserved"
+    except (FileNotFoundError, ValueError, ArtifactError) as exc:
+        stored, discrepancy = None, str(exc)
+    _print_json(
+        {
+            "error": f"submission record of run {run_id} was not updated: {discrepancy}",
+            "run_id": run_id,
+            "reserved": reserved,
+            "stored": stored,
+            "outcome": outcome,
+        }
+    )
+    return None
 
 
 def _cmd_approve(args: Any) -> int:
-    """Record a human-review approval bound to a completed run's sealed bundle."""
+    """Record a human-review approval bound to a completed run's sealed bundle.
+
+    The approval is written under the run's record lock and is refused once
+    the run has a submission attempt, so the approval an attempt publishes
+    can no longer change.
+    """
     import os
     from datetime import UTC, datetime
 
     from apprentice.core.artifacts import ArtifactError
     from apprentice.core.session_store import SessionStore
-    from apprentice.gates.review import ApprovalError, require_reviewable_snapshot
+    from apprentice.gates.review import (
+        ApprovalError,
+        approver_problem,
+        require_reviewable_snapshot,
+    )
+
+    if args.approver is not None:
+        approver = args.approver
+    else:
+        approver = os.environ.get("GITHUB_USER") or os.environ.get("USER") or ""
+        if not approver:
+            _print_json(
+                {
+                    "error": (
+                        "cannot determine approver — pass --approver or set "
+                        "GITHUB_USER/USER environment variable."
+                    )
+                }
+            )
+            return 1
+    problem = approver_problem(approver)
+    if problem:
+        _print_json({"error": f"invalid approver: {problem}"})
+        return 1
 
     store = SessionStore()
-
     try:
-        record = store.load(args.run_id)
+        with store.record_lock(args.run_id):
+            record = store.load(args.run_id)
+            if record.status != "completed":
+                _print_json(
+                    {
+                        "error": (
+                            f"Run {args.run_id} is not completed "
+                            f"(status: {record.status}); nothing to approve."
+                        )
+                    }
+                )
+                return 1
+            if record.submission:
+                _print_json(
+                    {
+                        "error": (
+                            f"run {record.run_id} already has a submission attempt; "
+                            "its approval can no longer change"
+                        ),
+                        "run_id": record.run_id,
+                        "submission": record.submission,
+                    }
+                )
+                return 1
+            try:
+                snapshot = require_reviewable_snapshot(store, record)
+            except ApprovalError as exc:
+                _print_json(
+                    {"error": str(exc), "run_id": args.run_id, "remediation": exc.remediation}
+                )
+                return 1
+            record.approval = {
+                "run_id": snapshot.run_id,
+                "algorithm": snapshot.algorithm,
+                "tier": snapshot.tier,
+                "manifest_sha256": snapshot.manifest_sha256,
+                "approved_by": approver,
+                "approved_at": datetime.now(tz=UTC).isoformat(),
+            }
+            store.save(record)
     except (FileNotFoundError, ValueError) as exc:
         _print_json({"error": str(exc)})
-        return 1
-
-    if record.status != "completed":
-        _print_json(
-            {
-                "error": (
-                    f"Run {args.run_id} is not completed "
-                    f"(status: {record.status}); nothing to approve."
-                )
-            }
-        )
-        return 1
-
-    approver = args.approver or os.environ.get("GITHUB_USER") or os.environ.get("USER") or ""
-    if not approver:
-        _print_json(
-            {
-                "error": (
-                    "cannot determine approver — pass --approver or set "
-                    "GITHUB_USER/USER environment variable."
-                )
-            }
-        )
-        return 1
-
-    try:
-        snapshot = require_reviewable_snapshot(store, record)
-    except ApprovalError as exc:
-        _print_json({"error": str(exc), "run_id": args.run_id, "remediation": exc.remediation})
         return 1
     except ArtifactError as exc:
         _print_json({"error": str(exc), "run_id": args.run_id})
         return 1
-
-    record.approval = {
-        "run_id": snapshot.run_id,
-        "algorithm": snapshot.algorithm,
-        "tier": snapshot.tier,
-        "manifest_sha256": snapshot.manifest_sha256,
-        "approved_by": approver,
-        "approved_at": datetime.now(tz=UTC).isoformat(),
-    }
-    store.save(record)
 
     _print_json(
         {

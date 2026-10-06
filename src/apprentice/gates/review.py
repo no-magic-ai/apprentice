@@ -11,6 +11,7 @@ never reviewable. Packaging then receives exactly the bytes verified here.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from apprentice.core.session_store import blocking_gate_failures, describe_gate_failures
@@ -22,6 +23,37 @@ if TYPE_CHECKING:
 _APPROVAL_FIELDS = frozenset(
     {"run_id", "algorithm", "tier", "manifest_sha256", "approved_by", "approved_at"}
 )
+
+
+_APPROVER_FORBIDDEN = ("\r", "\n", "\0")
+
+
+def approver_problem(approver: object) -> str | None:
+    """Return why `approver` cannot name the human who approved a run, or None.
+
+    An approver is a non-blank string without CR, LF or NUL; it is stored and
+    written into commit trailers and PR bodies exactly as given.
+    """
+    if not isinstance(approver, str) or not approver.strip():
+        return "approver must be a non-blank string"
+    if any(char in approver for char in _APPROVER_FORBIDDEN):
+        return "approver must not contain CR, LF or NUL characters"
+    return None
+
+
+def _approval_time_problem(approved_at: object) -> str | None:
+    """Return why `approved_at` is not a canonical timezone-aware ISO timestamp, or None."""
+    if not isinstance(approved_at, str) or not approved_at.strip():
+        return "approved_at must be a non-blank ISO 8601 timestamp"
+    try:
+        parsed = datetime.fromisoformat(approved_at)
+    except ValueError:
+        return f"approved_at {approved_at!r} is not an ISO 8601 timestamp"
+    if parsed.utcoffset() is None:
+        return f"approved_at {approved_at!r} has no timezone"
+    if parsed.isoformat() != approved_at:
+        return f"approved_at {approved_at!r} is not in canonical ISO 8601 form"
+    return None
 
 
 class ApprovalError(Exception):
@@ -97,6 +129,15 @@ def require_approved_snapshot(
         raise ApprovalError(
             f"approval of run {record.run_id} is not bound to a sealed bundle manifest",
             f"apprentice approve {record.run_id}",
+        )
+    problem = approver_problem(approval["approved_by"]) or _approval_time_problem(
+        approval["approved_at"]
+    )
+    if problem:
+        raise ApprovalError(
+            f"approval of run {record.run_id} is malformed: {problem}",
+            f"review the bundle with `apprentice preview --run-id {record.run_id}` "
+            f"and re-approve with `apprentice approve {record.run_id}`",
         )
     approved = (
         approval["run_id"],
