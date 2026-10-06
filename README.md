@@ -7,9 +7,10 @@ Agentic Algorithm Factory for [no-magic](https://github.com/no-magic-ai/no-magic
 `apprentice` is implemented software: package version 0.4.0 with a Google ADK pipeline and the CLI below. It is **not activated** for autonomous operation. The umbrella strategy keeps activation deferred until the no-magic catalog reaches at least 60 algorithms and the per-algorithm template is locked (48 catalog scripts today). Meeting that threshold would not be enough on its own: live use also needs separate safety, spend and human approvals, and the following gaps are open in the current code:
 
 - **Execution containment.** The correctness check runs generated code with `subprocess.run` and a 5-second timeout. That is a timeout, not a sandbox. Packaging pushes branches and opens pull requests with the operator's ambient `git` and `gh` credentials in the same process environment; there is no publisher-credential isolation.
-- **Approved-byte submission.** Each run writes its artifacts under its own run-owned root and, on completion, seals them into an immutable bundle with a manifest of run identity, artifact hashes and destinations; `approve` and `preview` verify and use that stored bundle. `submit` refuses unless the approval matches that verified bundle and publishes under the bundle's name and tier, but it still re-runs the model pipeline into a fresh root: a regenerated role that differs from the approval, is missing, or was not approved stops the pipeline at the review gate before the publisher, and a full match hands the regenerated files to the model-driven publisher instead of packaging the approved bytes.
 - **Budgets and limits.** Token and cost use are tracked per agent against the per-cycle budget, but exhaustion is only logged, not enforced; the enforced cap is a hard-coded ADK `max_llm_calls` limit per run. The monthly, per-stage, per-agent, rate-limit and circuit-breaker settings are parsed and displayed but not enforced; `core/circuit_breaker.py`, `core/queue.py` and `core/scheduler.py` are empty modules.
 - **Paper-aware packaging.** Packaging targets `no-magic` and `no-magic-viz` only. Released no-magic v3 also requires a `no-magic-papers` card whose `implementations[]` references the script and an explicit `SCRIPT_TO_PAPER` entry in `no-magic/scripts/generate_catalog.py`; packaging produces neither yet. The M1 catalog extension to that generator defines an additional per-script `SCRIPT_CONTRACTS` record (teaching kind, data source, adaptation note) that released v3 does not contain; when the target no-magic generator revision defines `SCRIPT_CONTRACTS`, packaging must populate it as well.
+
+Approved-byte submission is in place: each run writes its artifacts under its own run-owned root and, on completion, seals them into an immutable bundle whose manifest binds the run identity, every artifact hash and each repository destination. `approve` binds a human approval to that manifest, and `submit` re-verifies the bundle and pushes exactly those bytes to their destinations without calling a model or regenerating anything. A run recorded before sealed bundles existed fails with a rebuild instruction. The approval is a local operator attestation, not a cryptographic identity.
 
 `apprentice` is maintainer tooling, not a learner artifact. Its declared dependencies and hosted or local LLM providers are its own; the no-magic learner constraints (single file, standard library, CPU, no services) apply to the scripts it drafts, not to `apprentice` itself.
 
@@ -37,10 +38,11 @@ SequentialAgent("apprentice_pipeline")
 │   ├── LlmAgent("instrumentation")  → adds trace hooks
 │   ├── LlmAgent("visualization")    → generates Manim scene
 │   └── LlmAgent("assessment")       → generates Anki cards
-├── LoopAgent("review_loop", max=2)
-│   └── LlmAgent("reviewer")         → consistency + schema validation
-└── LlmAgent("packaging")            → creates PRs in no-magic + no-magic-viz
+└── LoopAgent("review_loop", max=2)
+    └── LlmAgent("reviewer")         → consistency + schema validation
 ```
+
+`submit` does not run this pipeline: deterministic packaging promotes the approved bundle into PRs in no-magic + no-magic-viz.
 
 Session state flows data between agents via `output_key`. Token and cost use is tracked per agent via ADK callbacks; see [Status](#status) for what is not enforced.
 
@@ -85,7 +87,7 @@ apprentice build "quicksort" --backend ollama --model ollama_chat/llama3.3
 # Record a human-review approval for a build run (required before submit)
 apprentice approve <run-id>
 
-# Submit artifacts as PRs to no-magic repos (re-runs the pipeline; see Status)
+# Open PRs in the no-magic repos with the exact approved bytes (no model call)
 apprentice submit "quicksort" --tier 2 --run-id <run-id>
 
 # Suggest candidate algorithms for a tier

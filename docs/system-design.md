@@ -140,7 +140,6 @@ graph TB
         ImplLoop["LoopAgent: Implementation<br/>(generate → validate → retry)"]
         Parallel["ParallelAgent: Artifact Generation<br/>(instrumentation ∥ visualization ∥ assessment)"]
         ReviewLoop["LoopAgent: Review<br/>(validate → feedback → retry)"]
-        Packaging["LlmAgent: Packaging<br/>(multi-repo PR creation)"]
     end
 
     subgraph "Implementation LoopAgent"
@@ -173,7 +172,7 @@ graph TB
 | Implementation with self-correction | `LoopAgent(max_iterations=3)` | Drafter + self-reviewer iterate until pass or exhaustion |
 | Parallel artifact generation | `ParallelAgent` | Instrumentation, visualization, assessment are independent |
 | Review with validation | `LoopAgent(max_iterations=2)` | Review agent validates, provides feedback, may retry |
-| Multi-repo packaging | `LlmAgent` with GitHub tools | Creates coordinated PRs across `no-magic` + `no-magic-viz` |
+| Multi-repo packaging | Deterministic Python, not an agent | Promotes the approved bundle bytes into coordinated PRs across `no-magic` + `no-magic-viz` |
 | Validators (lint, correctness, etc.) | `FunctionTool` | Pure functions called as agent tools |
 | Discovery (standalone) | `LlmAgent` with catalog tools | Multi-step reasoning with dedup tools |
 | Budget tracking | `before_agent_callback` / `after_agent_callback` | Hooks track tokens and cost per agent |
@@ -212,8 +211,8 @@ graph TB
         Local[Ollama / llama.cpp]
     end
 
-    subgraph "Packaging"
-        PkgAgent["LlmAgent: Packaging<br/>Multi-repo PR creation"]
+    subgraph "Packaging (submit, no model)"
+        Packager["Deterministic packager<br/>Approved-byte PR creation"]
     end
 
     subgraph "Target Repositories"
@@ -230,7 +229,7 @@ graph TB
     Pipeline --> ImplLoop
     Pipeline --> ParAgent
     Pipeline --> RevLoop
-    Pipeline --> PkgAgent
+    CLI --> Packager
 
     ImplLoop --> LintVal
     ImplLoop --> CorrectVal
@@ -243,9 +242,9 @@ graph TB
     RevLoop --> Claude
     DiscAgent --> Claude
 
-    PkgAgent --> GitHub
-    PkgAgent --> NoMagic
-    PkgAgent --> NoMagicViz
+    Packager --> GitHub
+    Packager --> NoMagic
+    Packager --> NoMagicViz
 ```
 
 ### 4.4 Agent Execution Flow
@@ -298,19 +297,6 @@ sequenceDiagram
         end
     end
     Rev-->>Pipe: Review verdict
-
-    Pipe->>Pkg: Package artifacts
-    participant Pkg as LlmAgent (Packaging)
-    participant GH as GitHub API
-
-    Pkg->>Pkg: Place implementation in no-magic/{tier_dir}/
-    Pkg->>Pkg: Place scene in no-magic-viz/scenes/
-    Pkg->>Pkg: Render preview GIF to no-magic-viz/previews/
-    Pkg->>Pkg: Update tier README + root README + LEARNING_PATH
-    Pkg->>GH: Create branch + PR on no-magic
-    Pkg->>GH: Create branch + PR on no-magic-viz
-    Pkg->>GH: Cross-reference PRs in descriptions
-    Pkg-->>Pipe: PR URLs
 ```
 
 ### 4.5 Provider Configuration
@@ -360,7 +346,7 @@ graph LR
         B --> B4[visualization.py<br/>LlmAgent: Manim scene generation]
         B --> B5[assessment.py<br/>LlmAgent: Anki card generation]
         B --> B6[review.py<br/>LoopAgent: validator + feedback]
-        B --> B7[packaging.py<br/>LlmAgent: multi-repo PR creation]
+        B --> B7[packaging.py<br/>Deterministic approved-byte PR creation]
 
         C[validators/] --> C1[lint.py → FunctionTool]
         C --> C2[correctness.py → FunctionTool]
@@ -447,38 +433,22 @@ graph LR
 
 **Session state output**: `review_verdict` — pass/fail with per-artifact diagnostics
 
-### 5.7 Packaging Agent — `LlmAgent`
+### 5.7 Packaging — deterministic, not an agent
 
-**ADK type**: Single `LlmAgent` with file management and GitHub `FunctionTool`s
-
-**Goal**: Create coordinated PRs across `no-magic` and `no-magic-viz` repositories.
+**Current (0.4.0)**: `apprentice submit <algorithm> --run-id <run-id>` promotes the exact bytes a human approved. It runs no model, generation graph, drafting or rendering.
 
 **Execution flow**:
-1. Read all artifact paths from session state (`implementation_path`, `manim_scene_path`, `anki_deck_path`, etc.)
-2. Clone/checkout both target repos (or use existing local clones)
-3. Create a feature branch with the same name in both repos (`feat/micro{algorithm}`)
-4. Place artifacts in correct locations:
-   - `micro{name}.py` → `no-magic/{tier_dir}/`
-   - `scene_micro{name}.py` → `no-magic-viz/scenes/`
-   - `micro{name}.gif` (rendered preview) → `no-magic-viz/previews/`
-5. Update documentation files in `no-magic`:
-   - `{tier_dir}/README.md` — add row to algorithm table
-   - `README.md` (root) — add GIF preview card to the tier section
-   - `LEARNING_PATH.md` — add to relevant learning tracks
-6. Open PR on `no-magic` with algorithm description and artifact checklist
-7. Open PR on `no-magic-viz` with scene description
-8. Cross-reference PRs in descriptions: "Companion PR: no-magic-ai/no-magic-viz#N"
+1. The review gate (`gates/review.py`) loads the run's sealed bundle once, verifies every artifact against its canonical manifest, and requires the approval (run ID, algorithm, tier, manifest digest), the run record, the bundle and the requested algorithm/tier to agree. Failures stop before any clone.
+2. Clone `no-magic-ai/no-magic` and `no-magic-ai/no-magic-viz` into an exclusive scratch root and create branch `apprentice/<run-id>` in each.
+3. Write the verified bytes to their manifest destinations, refusing existing files and symlinked directories:
+   - implementation → `no-magic/{tier_dir}/micro{name}.py`
+   - Manim scene → `no-magic-viz/scenes/scene_micro{name}.py`
+4. Stage only those paths, commit with the approval time as author/committer date, and check that each commit contains exactly the approved bytes and paths.
+5. Push both branches, then open the `no-magic` PR and a `no-magic-viz` PR that references it, with `gh`. The PRs are recorded on the run; a submitted run is not published again.
 
-**Tools**:
-- `clone_repo(org, repo)` → `FunctionTool` that clones a GitHub repo
-- `create_branch(repo_path, branch_name)` → `FunctionTool` for git branch operations
-- `place_file(source, dest)` → `FunctionTool` to copy artifact to repo
-- `open_pr(repo, branch, title, body)` → `FunctionTool` wrapping `gh pr create`
-- `render_preview(scene_path)` → `FunctionTool` for headless Manim render to GIF
+Packaging never merges. It uses the operator's ambient `git` and `gh` credentials; credential scoping is open containment work (see the [README status](../README.md#status)).
 
-**Session state output**: `pr_urls` — dict with `{"no-magic": url, "no-magic-viz": url}`
-
-**Human review gate**: Both PRs require human approval. The agent **cannot merge** — tokens are scoped to `pull_request: write` only.
+**Design targets, not implemented**: rendering `micro{name}.gif` into `no-magic-viz/previews/`; updating `{tier_dir}/README.md`, the root `README.md` and `LEARNING_PATH.md`; and the paper-aware records released no-magic v3 requires (a `no-magic-papers` card and `SCRIPT_TO_PAPER`, plus `SCRIPT_CONTRACTS` where the target generator defines it).
 
 ---
 
@@ -572,7 +542,7 @@ stateDiagram-v2
 
 ## 8. User Workflow — Assisted Mode (v1)
 
-Current CLI flow (0.4.0): `build` runs the pipeline through review and seals the run's artifacts into an immutable run-owned bundle; `preview` verifies and shows that bundle; `apprentice approve <run-id>` binds a human approval to the run identity and bundle manifest digest; `submit <algorithm> --run-id <run-id>` checks the approval against the verified bundle, takes the name and tier from it, re-runs the pipeline with packaging into a fresh run-owned root, and the human-review gate stops the pipeline before packaging unless every regenerated artifact hash matches the approved ones (`submit` then exits 1 with the gate's diagnostics). The diagram below predates the approval step.
+Current CLI flow (0.4.0): `build` runs the pipeline through review and seals the run's artifacts into an immutable run-owned bundle; `preview` verifies and shows that bundle; `apprentice approve <run-id>` binds a human approval to the run identity and bundle manifest digest; `submit <algorithm> --run-id <run-id>` re-verifies the approval and bundle and promotes exactly the approved bytes into PRs without calling a model (see [5.7](#57-packaging--deterministic-not-an-agent)).
 
 ```mermaid
 sequenceDiagram
@@ -591,21 +561,20 @@ sequenceDiagram
     ADK->>ADK: LoopAgent: Implementation (generate → validate → retry)
     ADK->>ADK: ParallelAgent: Instrument ∥ Visualize ∥ Assess
     ADK->>ADK: LoopAgent: Review (validate → feedback)
-    ADK-->>CLI: Artifacts ready for packaging
-    CLI-->>Dev: JSON result with agent metrics
+    ADK-->>CLI: Final artifacts in session state
+    CLI->>CLI: Seal run-owned bundle and manifest
+    CLI-->>Dev: Run ID and agent metrics
 
-    Dev->>CLI: apprentice submit
-    CLI->>ADK: Run Packaging Agent
-    ADK->>ADK: Create PRs on no-magic + no-magic-viz
-    ADK-->>CLI: PR URLs
-    CLI-->>Dev: PR links for both repos
+    Dev->>CLI: apprentice preview --run-id RUN
+    CLI-->>Dev: Verified hashes, destinations and previews
 
-    Dev->>CLI: apprentice preview
-    CLI-->>Dev: Artifact content previews
+    Dev->>CLI: apprentice approve RUN
+    CLI-->>Dev: Approval bound to run and manifest digest
 
-    Dev->>CLI: apprentice submit
-    ADK->>GH: Open PR
-    GH-->>Dev: PR notification
+    Dev->>CLI: apprentice submit quickselect --run-id RUN
+    CLI->>CLI: Verify approval, identity and bundle bytes
+    CLI->>GH: Push approved bytes and open PRs (no model call)
+    GH-->>Dev: PR links for both repos
 ```
 
 ### CLI Commands
@@ -615,7 +584,7 @@ apprentice suggest [--tier N] [--limit N]               # Discovery Agent
 apprentice build <algorithm> [--tier N]                 # Full ADK pipeline through review
 apprentice preview [--run-id ID]                        # Verify and inspect a sealed bundle
 apprentice approve <run-id> [--approver NAME]           # Record human-review approval
-apprentice submit <algorithm> [--tier N] [--run-id ID]  # Re-run with packaging; gated on approval
+apprentice submit <algorithm> --run-id ID [--tier N]    # Promote approved bytes; no model call
 apprentice status                                       # Configured budget/limit values
 apprentice metrics                                      # Aggregated run metrics
 apprentice history [--status S] [--limit N]             # Past runs
