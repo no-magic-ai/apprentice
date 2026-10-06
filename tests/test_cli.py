@@ -1066,3 +1066,71 @@ class TestStoredApprovalMetadata:
         ).stdout.split()
         assert dates == ["2026-10-07T08:09:10+05:30"] * 2
 
+
+class TestSubmitUsesTheCapturedSnapshot:
+    def test_bundle_swapped_after_the_approval_check_is_not_published(
+        self,
+        store_dir: Path,
+        offline_remotes: OfflineRemotes,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import apprentice.gates.review as review
+
+        rec = _approved_run(store_dir)
+        bundle = SessionStore(store_dir=store_dir).bundle_dir(rec.run_id)
+        approved = {
+            name: (bundle / name).read_bytes() for name in ("implementation.py", "scene.py")
+        }
+        real_check = review.require_approved_snapshot
+
+        def check_then_swap(*args: Any, **kwargs: Any) -> Any:
+            snapshot = real_check(*args, **kwargs)
+            for name, data in approved.items():
+                path = bundle / name
+                path.chmod(0o644)
+                path.write_bytes(data.replace(b"i", b"j").replace(b"c", b"d"))
+            return snapshot
+
+        monkeypatch.setattr(review, "require_approved_snapshot", check_then_swap)
+
+        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 0
+
+        branch = f"apprentice/{rec.run_id}"
+        assert (
+            offline_remotes.blob("no-magic-ai/no-magic", branch, "02-alignment/microselection.py")
+            == approved["implementation.py"]
+        )
+        assert (
+            offline_remotes.blob(
+                "no-magic-ai/no-magic-viz", branch, "scenes/scene_microselection.py"
+            )
+            == approved["scene.py"]
+        )
+
+
+class TestReviewGateRemediation:
+    def test_run_that_did_not_complete_is_routed_to_a_rebuild(
+        self, store_dir: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        store = SessionStore(store_dir=store_dir)
+        rec = store.create_run("selection", tier=2)
+        store.fail_run(rec, {}, {}, 1.0, "provider down")
+
+        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
+
+        assert json.loads(capsys.readouterr().out)["remediation"] == (
+            "apprentice build selection --tier 2"
+        )
+
+    def test_approval_of_another_bundle_is_routed_to_preview_and_reapproval(
+        self, store_dir: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        rec = _approved_run(store_dir)
+        _store_approval_field(store_dir, rec.run_id, "manifest_sha256", "0" * 64)
+        capsys.readouterr()
+
+        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
+
+        remediation = json.loads(capsys.readouterr().out)["remediation"]
+        assert f"apprentice preview --run-id {rec.run_id}" in remediation
+        assert f"apprentice approve {rec.run_id}" in remediation

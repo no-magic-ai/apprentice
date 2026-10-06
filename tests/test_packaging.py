@@ -218,3 +218,25 @@ def test_commit_whose_stored_blob_differs_is_never_pushed(
     assert offline_remotes.branches(_CORE) == ["main"]
     assert offline_remotes.branches(_VIZ) == ["main"]
     assert offline_remotes.gh_calls() == []
+
+
+def test_extra_path_staged_by_native_git_is_never_committed_or_pushed(
+    store: SessionStore, offline_remotes: OfflineRemotes, tmp_path: Path
+) -> None:
+    # A post-checkout hook in the isolated global config stages an extra file
+    # in every clone, so `git add` of the approved paths leaves more staged.
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    hook = hooks / "post-checkout"
+    hook.write_text("#!/bin/sh\necho extra > EXTRA.txt\ngit add EXTRA.txt\n")
+    hook.chmod(0o755)
+    with open(os.environ["GIT_CONFIG_GLOBAL"], "a", encoding="utf-8") as config:
+        config.write(f"[core]\n\thooksPath = {hooks}\n")
+
+    with pytest.raises(PackagingError, match=r"EXTRA\.txt") as excinfo:
+        submit_snapshot(_snapshot(store), _APPROVAL, store.allocate_work_root())
+
+    assert excinfo.value.effects == []
+    assert offline_remotes.branches(_CORE) == ["main"]
+    assert offline_remotes.branches(_VIZ) == ["main"]
+    assert offline_remotes.gh_calls() == []
