@@ -109,8 +109,8 @@ def _run_single(
     else:
         llm_model = create_model(cfg.provider)
 
-    pipeline = build_pipeline(llm_model, cfg, include_packaging=False)
     record = store.create_run(algorithm, tier)
+    pipeline = build_pipeline(llm_model, cfg, store.run_scope(record), include_packaging=False)
 
     logger.info("starting: %s (tier %d) [%s]", algorithm, tier, record.run_id)
     start = time.monotonic()

@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from apprentice.core.config import ApprenticeConfig
+    from apprentice.core.session_store import SessionStore
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -85,7 +86,15 @@ def main(argv: list[str] | None = None) -> int:
 
     subparsers.add_parser("metrics", help="Show aggregated pipeline metrics")
 
-    subparsers.add_parser("preview", help="Inspect last build artifacts")
+    preview_parser = subparsers.add_parser(
+        "preview", help="Inspect the sealed artifact bundle of a completed run"
+    )
+    preview_parser.add_argument(
+        "--run-id",
+        type=str,
+        default=None,
+        help="Run ID to preview (default: most recently started completed run)",
+    )
     subparsers.add_parser("status", help="Show budget usage and queue state")
     subparsers.add_parser("config", help="Display current configuration")
 
@@ -115,7 +124,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "metrics":
         return _cmd_metrics()
     if args.command == "preview":
-        return _cmd_preview()
+        return _cmd_preview(args)
     if args.command == "status":
         return _cmd_status(cfg)
     if args.command == "config":
@@ -170,6 +179,7 @@ def _resolve_model(cfg: ApprenticeConfig, args: Any) -> Any:
 
 
 def _cmd_build(cfg: ApprenticeConfig, args: Any) -> int:
+    from apprentice.core.artifacts import ArtifactError
     from apprentice.core.orchestrator import build_pipeline, get_budget_tracker_from_pipeline
     from apprentice.core.progress import PipelineProgress, suppress_noisy_loggers
     from apprentice.core.session_store import SessionStore
@@ -177,10 +187,14 @@ def _cmd_build(cfg: ApprenticeConfig, args: Any) -> int:
     suppress_noisy_loggers()
 
     store = SessionStore()
-    record = store.create_run(args.algorithm, args.tier)
+    try:
+        record = store.create_run(args.algorithm, args.tier)
+    except ArtifactError as exc:
+        _print_json({"error": str(exc)})
+        return 1
 
     model = _resolve_model(cfg, args)
-    pipeline = build_pipeline(model, cfg, include_packaging=False)
+    pipeline = build_pipeline(model, cfg, store.run_scope(record), include_packaging=False)
 
     progress = PipelineProgress(args.algorithm, args.tier)
     start = time.monotonic()
@@ -215,6 +229,7 @@ def _cmd_build(cfg: ApprenticeConfig, args: Any) -> int:
 
 
 def _cmd_submit(cfg: ApprenticeConfig, args: Any) -> int:
+    from apprentice.core.artifacts import RunScope
     from apprentice.core.observability import get_logger
     from apprentice.core.orchestrator import build_pipeline
     from apprentice.core.session_store import SessionStore
@@ -236,11 +251,11 @@ def _cmd_submit(cfg: ApprenticeConfig, args: Any) -> int:
 
     try:
         record = store.load(run_id)
-    except FileNotFoundError:
-        _print_json({"error": f"Run not found: {run_id}"})
+    except (FileNotFoundError, ValueError) as exc:
+        _print_json({"error": str(exc)})
         return 1
 
-    approval = record.session_state.get("review_approval") if record.session_state else None
+    approval = record.approval
     if not approval:
         _print_json(
             {
@@ -254,7 +269,16 @@ def _cmd_submit(cfg: ApprenticeConfig, args: Any) -> int:
     logger.info("submit started: %s (tier %d, run %s)", args.algorithm, args.tier, run_id)
 
     model = _resolve_model(cfg, args)
-    pipeline = build_pipeline(model, cfg, include_packaging=True, approval=approval)
+    # Regeneration runs in a distinct fresh root so the sealed approved bundle
+    # is never rewritten; the review gate compares every regenerated role
+    # against the approved hashes before packaging may run.
+    scope = RunScope(
+        run_id=record.run_id,
+        algorithm=args.algorithm,
+        tier=args.tier,
+        work_root=store.allocate_work_root(),
+    )
+    pipeline = build_pipeline(model, cfg, scope, include_packaging=True, approval=approval)
 
     start = time.monotonic()
     session_state = asyncio.run(_run_pipeline(pipeline, args.algorithm, args.tier, ""))
@@ -265,20 +289,19 @@ def _cmd_submit(cfg: ApprenticeConfig, args: Any) -> int:
 
 
 def _cmd_approve(args: Any) -> int:
-    """Record a human-review approval for a completed build run."""
+    """Record a human-review approval bound to a completed run's sealed bundle."""
     import os
     from datetime import UTC, datetime
 
-    from apprentice.core.gate_agent import materialize_artifacts
+    from apprentice.core.artifacts import ArtifactError
     from apprentice.core.session_store import SessionStore
-    from apprentice.gates.review import compute_artifact_hashes
 
     store = SessionStore()
 
     try:
         record = store.load(args.run_id)
-    except FileNotFoundError:
-        _print_json({"error": f"Run not found: {args.run_id}"})
+    except (FileNotFoundError, ValueError) as exc:
+        _print_json({"error": str(exc)})
         return 1
 
     if record.status != "completed":
@@ -304,44 +327,38 @@ def _cmd_approve(args: Any) -> int:
         )
         return 1
 
-    bundle = materialize_artifacts(record.session_state or {})
-    hashes = compute_artifact_hashes(bundle)
-    if not hashes:
-        _print_json(
-            {
-                "error": (
-                    "no artifacts could be materialized from run state; "
-                    "rebuild before approving."
-                ),
-                "run_id": args.run_id,
-            }
-        )
+    try:
+        snapshot = store.load_bundle(record)
+    except ArtifactError as exc:
+        _print_json({"error": str(exc), "run_id": args.run_id})
         return 1
 
-    approval = {
+    record.approval = {
+        "run_id": snapshot.run_id,
+        "algorithm": snapshot.algorithm,
+        "tier": snapshot.tier,
+        "manifest_sha256": snapshot.manifest_sha256,
         "approved_by": approver,
         "approved_at": datetime.now(tz=UTC).isoformat(),
-        "run_id": args.run_id,
-        "artifact_hashes": hashes,
+        "artifact_hashes": {artifact.role: artifact.sha256 for artifact in snapshot.artifacts},
     }
-
-    state = dict(record.session_state) if record.session_state else {}
-    state["review_approval"] = approval
-    record.session_state = state
     store.save(record)
 
     _print_json(
         {
             "approved": True,
-            "run_id": args.run_id,
+            "run_id": snapshot.run_id,
+            "algorithm": snapshot.algorithm,
+            "tier": snapshot.tier,
+            "manifest_sha256": snapshot.manifest_sha256,
             "approved_by": approver,
-            "artifact_hashes": hashes,
+            "artifacts": snapshot.describe(),
         }
     )
     return 0
 
 
-def _latest_completed_run_id(store: Any, algorithm: str) -> str | None:
+def _latest_completed_run_id(store: SessionStore, algorithm: str) -> str | None:
     """Return the most recent completed run_id for `algorithm`, or None."""
     for record in store.list_runs(status="completed", limit=50):
         if record.algorithm_name == algorithm:
@@ -498,27 +515,42 @@ async def _run_agent(agent: Any, prompt: str) -> dict[str, Any]:
     return dict(updated_session.state) if updated_session else {}
 
 
-def _cmd_preview() -> int:
-    import tempfile
+def _cmd_preview(args: Any) -> int:
+    from apprentice.core.artifacts import ArtifactError
+    from apprentice.core.session_store import SessionStore
 
-    artifacts_dir = Path(tempfile.gettempdir()) / "apprentice_artifacts"
-    if not artifacts_dir.exists():
-        _print_json({"error": "No artifacts found. Run 'apprentice build' first."})
+    store = SessionStore()
+    run_id = args.run_id
+    if run_id is None:
+        completed = store.list_runs(status="completed", limit=1)
+        if not completed:
+            _print_json({"error": "No completed run found. Run 'apprentice build' first."})
+            return 1
+        run_id = completed[0].run_id
+
+    try:
+        record = store.load(run_id)
+        snapshot = store.load_bundle(record)
+    except (FileNotFoundError, ValueError, ArtifactError) as exc:
+        _print_json({"error": str(exc), "run_id": run_id})
         return 1
 
-    files = sorted(artifacts_dir.iterdir())
-    artifacts: dict[str, dict[str, Any]] = {}
-    for f in files:
-        if f.is_file():
-            content = f.read_text(encoding="utf-8")
-            preview = content[:500] + ("..." if len(content) > 500 else "")
-            artifacts[f.name] = {
-                "path": str(f),
-                "size_bytes": f.stat().st_size,
-                "preview": preview,
-            }
+    artifacts = snapshot.describe()
+    for entry, artifact in zip(artifacts, snapshot.artifacts, strict=True):
+        content = artifact.data.decode("utf-8")
+        entry["preview"] = content[:500] + ("..." if len(content) > 500 else "")
 
-    _print_json({"artifacts_dir": str(artifacts_dir), "files": artifacts})
+    _print_json(
+        {
+            "run_id": snapshot.run_id,
+            "algorithm": snapshot.algorithm,
+            "tier": snapshot.tier,
+            "manifest_sha256": snapshot.manifest_sha256,
+            "bundle_dir": str(store.bundle_dir(snapshot.run_id)),
+            "approved": bool(record.approval),
+            "artifacts": artifacts,
+        }
+    )
     return 0
 
 
@@ -571,6 +603,7 @@ def _cmd_dev(cfg: ApprenticeConfig, args: Any) -> int:
 
 
 def _cmd_retry(cfg: ApprenticeConfig, args: Any) -> int:
+    from apprentice.core.artifacts import ArtifactError
     from apprentice.core.observability import get_logger
     from apprentice.core.orchestrator import build_pipeline, get_budget_tracker_from_pipeline
     from apprentice.core.session_store import SessionStore
@@ -580,8 +613,8 @@ def _cmd_retry(cfg: ApprenticeConfig, args: Any) -> int:
 
     try:
         old_record = store.load(args.run_id)
-    except FileNotFoundError:
-        _print_json({"error": f"Run not found: {args.run_id}"})
+    except (FileNotFoundError, ValueError) as exc:
+        _print_json({"error": str(exc)})
         return 1
 
     if old_record.status != "failed":
@@ -592,10 +625,15 @@ def _cmd_retry(cfg: ApprenticeConfig, args: Any) -> int:
     tier = old_record.tier
     logger.info("retrying: %s (tier %d) from run %s", algorithm, tier, args.run_id)
 
-    model = _resolve_model(cfg, args)
-    pipeline = build_pipeline(model, cfg, include_packaging=False)
+    try:
+        new_record = store.create_run(algorithm, tier)
+    except ArtifactError as exc:
+        _print_json({"error": str(exc)})
+        return 1
 
-    new_record = store.create_run(algorithm, tier)
+    model = _resolve_model(cfg, args)
+    pipeline = build_pipeline(model, cfg, store.run_scope(new_record), include_packaging=False)
+
     start = time.monotonic()
 
     try:

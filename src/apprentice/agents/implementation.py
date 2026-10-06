@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-import tempfile
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from google.adk.agents import LlmAgent, LoopAgent
 
+from apprentice.core.artifacts import write_role
+
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from google.adk.models.lite_llm import LiteLlm
 
 _DRAFTER_INSTRUCTION = """\
@@ -51,15 +53,11 @@ Return only the Python source code. No markdown fences, no prose.
 """
 
 
-def _run_validators(code: str, algorithm_name: str) -> dict[str, Any]:
-    """Run all validators on code and return combined results."""
+def _run_validators(code: str, work_root: Path) -> dict[str, Any]:
+    """Write code into the run's work root, run all validators and combine results."""
     from apprentice.validators.tools import correctness_validate, lint_validate, stdlib_check
 
-    tmp_dir = Path(tempfile.gettempdir()) / "apprentice_artifacts"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    dest = tmp_dir / f"{algorithm_name}.py"
-    dest.write_text(code, encoding="utf-8")
-    file_path = str(dest)
+    file_path = str(write_role(work_root, "implementation", code))
 
     stdlib_result = stdlib_check(file_path)
     lint_result = lint_validate(file_path)
@@ -87,7 +85,7 @@ def _run_validators(code: str, algorithm_name: str) -> dict[str, Any]:
     }
 
 
-def _make_after_drafter_callback() -> Any:
+def _make_after_drafter_callback(work_root: Path) -> Any:
     """Create a callback that validates the drafter's output after each generation.
 
     If validation passes, sets _implementation_passed=True in state so the
@@ -98,7 +96,6 @@ def _make_after_drafter_callback() -> Any:
     async def after_drafter(callback_context: Any) -> Any:
         state = callback_context.state
         code = state.get("generated_code", "")
-        algorithm_name = state.get("algorithm_name", "algorithm")
 
         if not code:
             state["validation_feedback"] = (
@@ -106,7 +103,7 @@ def _make_after_drafter_callback() -> Any:
             )
             return None
 
-        result = _run_validators(code, algorithm_name)
+        result = _run_validators(code, work_root)
 
         if result["all_passed"]:
             state["validation_feedback"] = ""
@@ -154,6 +151,7 @@ def _make_exit_condition() -> Any:
 
 def build_implementation_agent(
     model: LiteLlm,
+    work_root: Path,
     max_retries: int = 3,
 ) -> LoopAgent:
     """Build an ADK LoopAgent for algorithm implementation with programmatic validation.
@@ -169,6 +167,7 @@ def build_implementation_agent(
 
     Args:
         model: LiteLlm model instance.
+        work_root: The run's exclusive work root the drafter output is validated in.
         max_retries: Maximum loop iterations before giving up.
 
     Returns:
@@ -179,7 +178,7 @@ def build_implementation_agent(
         model=model,
         instruction=_DRAFTER_INSTRUCTION,
         output_key="generated_code",
-        after_agent_callback=_make_after_drafter_callback(),
+        after_agent_callback=_make_after_drafter_callback(work_root),
     )
 
     return LoopAgent(

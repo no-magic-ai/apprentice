@@ -54,7 +54,7 @@ def correctness_validate(code_path: str) -> dict[str, Any]:
     return result.to_dict()
 
 
-def consistency_validate(artifacts_json: str) -> dict[str, Any]:
+def consistency_validate(artifacts_json: str, algorithm_name: str) -> dict[str, Any]:
     """Run cross-artifact consistency validation.
 
     Checks structural integrity (files exist, valid Python, CSV columns)
@@ -63,6 +63,7 @@ def consistency_validate(artifacts_json: str) -> dict[str, Any]:
     Args:
         artifacts_json: JSON string mapping artifact types to file paths,
             e.g. '{"implementation": "/path/to/algo.py", "anki_deck": "/path/to/cards.csv"}'.
+        algorithm_name: Algorithm the artifacts must consistently describe.
 
     Returns:
         Validation result with passed status and list of issues.
@@ -70,7 +71,6 @@ def consistency_validate(artifacts_json: str) -> dict[str, Any]:
     from apprentice.models.work_item import WorkItem
 
     artifacts: dict[str, str] = json.loads(artifacts_json)
-    algorithm_name = Path(artifacts.get("implementation", "unknown")).stem
     work_item = WorkItem(id="tool-call", algorithm_name=algorithm_name, tier=0)
     validator = ConsistencyValidator()
     result = validator.validate(artifacts, work_item)

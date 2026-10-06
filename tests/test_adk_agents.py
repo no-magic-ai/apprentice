@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from google.adk.agents import LlmAgent, LoopAgent
 from google.adk.models.lite_llm import LiteLlm
 
@@ -22,6 +24,9 @@ from apprentice.agents.packaging import (
 from apprentice.agents.review import build_review_agent
 from apprentice.agents.visualization import build_visualization_agent
 
+if TYPE_CHECKING:
+    from apprentice.core.artifacts import RunScope
+
 
 def _model() -> LiteLlm:
     """Create a LiteLlm instance for testing agent construction."""
@@ -29,24 +34,24 @@ def _model() -> LiteLlm:
 
 
 class TestImplementationAgentBuilder:
-    def test_returns_loop_agent(self) -> None:
-        agent = build_implementation_agent(_model())
+    def test_returns_loop_agent(self, scope: RunScope) -> None:
+        agent = build_implementation_agent(_model(), scope.work_root)
         assert isinstance(agent, LoopAgent)
 
-    def test_name(self) -> None:
-        agent = build_implementation_agent(_model())
+    def test_name(self, scope: RunScope) -> None:
+        agent = build_implementation_agent(_model(), scope.work_root)
         assert agent.name == "implementation_loop"
 
-    def test_max_iterations(self) -> None:
-        agent = build_implementation_agent(_model(), max_retries=5)
+    def test_max_iterations(self, scope: RunScope) -> None:
+        agent = build_implementation_agent(_model(), scope.work_root, max_retries=5)
         assert agent.max_iterations == 5
 
-    def test_single_sub_agent(self) -> None:
-        agent = build_implementation_agent(_model())
+    def test_single_sub_agent(self, scope: RunScope) -> None:
+        agent = build_implementation_agent(_model(), scope.work_root)
         assert len(agent.sub_agents) == 1
 
-    def test_drafter_name(self) -> None:
-        agent = build_implementation_agent(_model())
+    def test_drafter_name(self, scope: RunScope) -> None:
+        agent = build_implementation_agent(_model(), scope.work_root)
         assert agent.sub_agents[0].name == "drafter"
 
 
@@ -134,16 +139,16 @@ class TestDiscoveryTools:
 
 
 class TestReviewAgentBuilder:
-    def test_returns_loop_agent(self) -> None:
-        agent = build_review_agent(_model())
+    def test_returns_loop_agent(self, scope: RunScope) -> None:
+        agent = build_review_agent(_model(), scope.work_root, scope.algorithm)
         assert isinstance(agent, LoopAgent)
 
-    def test_name(self) -> None:
-        agent = build_review_agent(_model())
+    def test_name(self, scope: RunScope) -> None:
+        agent = build_review_agent(_model(), scope.work_root, scope.algorithm)
         assert agent.name == "review_loop"
 
-    def test_max_iterations(self) -> None:
-        agent = build_review_agent(_model(), max_iterations=3)
+    def test_max_iterations(self, scope: RunScope) -> None:
+        agent = build_review_agent(_model(), scope.work_root, scope.algorithm, max_iterations=3)
         assert agent.max_iterations == 3
 
 
