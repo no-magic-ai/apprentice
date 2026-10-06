@@ -3,7 +3,8 @@
 Each contender runs `_cmd_submit` or `_cmd_approve` in its own interpreter
 against the same store and offline remotes. A contender stops at a named
 point by writing to one pipe and blocking on another until it is released or
-killed, so every interleaving below is forced rather than timed.
+killed, so every interleaving below is forced rather than timed. A contender
+stopped at "lock-wait" has found the run's lock held by another process.
 """
 
 from __future__ import annotations
@@ -66,6 +67,19 @@ def wrap(owner, name, pause_after):
 
 if point == "lock":  # before taking the run's record lock
     wrap(session_store.SessionStore, "record_lock", pause_after=False)
+elif point == "lock-wait":  # only once the record lock is found held by another process
+    import fcntl
+
+    original_flock = fcntl.flock
+
+    def flock(fd, operation):
+        try:
+            original_flock(fd, operation | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pause()
+            original_flock(fd, operation)
+
+    fcntl.flock = flock
 elif point == "claim":  # holding the lock with fresh scratch, before the pending save
     wrap(session_store.SessionStore, "allocate_work_root", pause_after=True)
 elif point == "effects":  # pending saved and lock released, before any clone
@@ -310,7 +324,7 @@ class TestConcurrentSubmit:
         record = _approved_run(store_dir)
         first = _Contender(store_dir, "claim", "submit", record.run_id)
         first.reached()
-        second = _Contender(store_dir, "lock", "submit", record.run_id)
+        second = _Contender(store_dir, "lock-wait", "submit", record.run_id)
         second.reached()
         second.release()
         first.release()
@@ -355,9 +369,8 @@ class TestConcurrentSubmit:
         record = _approved_run(store_dir)
         first = _Contender(store_dir, "claim", "submit", record.run_id)
         first.reached()
-        second = _Contender(store_dir, "lock", "submit", record.run_id)
+        second = _Contender(store_dir, "lock-wait", "submit", record.run_id)
         second.reached()
-        second.release()
         second.kill()
         first.release()
 
@@ -465,7 +478,7 @@ class TestApproveAgainstSubmit:
         record = _approved_run(store_dir, approver="first-reviewer")
         submitter = _Contender(store_dir, "claim", "submit", record.run_id)
         submitter.reached()
-        approver = _Contender(store_dir, "lock", "approve", record.run_id, "late-reviewer")
+        approver = _Contender(store_dir, "lock-wait", "approve", record.run_id, "late-reviewer")
         approver.reached()
         approver.release()
         submitter.release()
