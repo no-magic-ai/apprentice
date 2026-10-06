@@ -216,8 +216,8 @@ graph TB
     end
 
     subgraph "Target Repositories"
-        NoMagic["no-magic-ai/no-magic<br/>(implementation + README)"]
-        NoMagicViz["no-magic-ai/no-magic-viz<br/>(scene + preview GIF)"]
+        NoMagic["no-magic-ai/no-magic<br/>(implementation)"]
+        NoMagicViz["no-magic-ai/no-magic-viz<br/>(scene)"]
         GitHub[GitHub API]
     end
 
@@ -438,13 +438,13 @@ graph LR
 **Current (0.4.0)**: `apprentice submit <algorithm> --run-id <run-id>` promotes the exact bytes a human approved. It runs no model, generation graph, drafting or rendering.
 
 **Execution flow**:
-1. The review gate (`gates/review.py`) loads the run's sealed bundle once, verifies every artifact against its canonical manifest, refuses a run whose build recorded a failed blocking gate, and requires the approval (run ID, algorithm, tier, manifest digest), the run record, the bundle and the requested algorithm/tier to agree. Failures stop before any clone.
+1. Under a short exclusive lock on the run (`runs/<run-id>.lock`), the record is reloaded and the review gate (`gates/review.py`) loads the run's sealed bundle once, verifies every artifact against its canonical manifest, refuses a run whose build recorded a failed blocking gate, requires the approval (run ID, algorithm, tier, manifest digest), the run record, the bundle and the requested algorithm/tier to agree, and requires a well-formed approver and canonical timezone-aware approval time. A run with any recorded attempt is refused; otherwise a fresh scratch root is allocated and the attempt is saved as `pending` before the lock is released. Failures stop before any clone.
 2. Clone `no-magic-ai/no-magic` and `no-magic-ai/no-magic-viz` into an exclusive scratch root and create branch `apprentice/<run-id>` in each.
 3. Write the verified bytes to their manifest destinations, refusing existing files and symlinked directories:
    - implementation → `no-magic/{tier_dir}/micro{name}.py`
    - Manim scene → `no-magic-viz/scenes/scene_micro{name}.py`
 4. Stage only those paths, commit with the approval time as author/committer date, and check that each commit contains exactly the approved bytes and paths.
-5. Push both branches, then open the `no-magic` PR and a `no-magic-viz` PR that references it, with `gh`. The single attempt is recorded on the run as `pending` before the first push and ends `complete`, `partial` (with the branches pushed and PRs opened before the error) or `failed`; any recorded attempt blocks another `submit` of that run, with no retry or resume.
+5. Push both branches, then open the `no-magic` PR and a `no-magic-viz` PR that references it, with `gh`. Under the lock again, the attempt ends `complete`, `partial` (with the branches pushed and PRs opened before the error) or `failed`, but only if the stored attempt is still the one reserved in step 1; otherwise nothing is saved and the known effects are printed. Any recorded attempt blocks another `submit` and any re-approval of that run, with no retry or resume.
 
 Packaging never merges. It uses the operator's ambient `git` and `gh` credentials; credential scoping is open containment work (see the [README status](../README.md#status)).
 
