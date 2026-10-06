@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import anyio
 import pytest
@@ -25,6 +25,8 @@ from apprentice.models.work_item import BlockingGateError
 from tests.conftest import OfflineFixtureLlm, fixture_outputs
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from apprentice.core.artifacts import RunScope
 
 
@@ -66,9 +68,9 @@ class _PreviewArgs:
 
 
 class _SubmitArgs:
-    def __init__(self, algorithm: str, run_id: str | None) -> None:
+    def __init__(self, algorithm: str, run_id: str | None, tier: int | None = None) -> None:
         self.algorithm = algorithm
-        self.tier = 2
+        self.tier = tier
         self.backend = None
         self.model = None
         self.run_id = run_id
@@ -362,10 +364,10 @@ class TestRunnerStateCarrier:
 
 
 def _seal_from_build(
-    store_dir: Path, monkeypatch: pytest.MonkeyPatch, outputs: dict[str, str]
+    store_dir: Path, monkeypatch: pytest.MonkeyPatch, outputs: dict[str, str], tier: int = 2
 ) -> RunRecord:
     _use_model(monkeypatch, outputs)
-    assert _cmd_build(load_config(None), _BuildArgs()) == 0
+    assert _cmd_build(load_config(None), _BuildArgs(tier=tier)) == 0
     record = _only_record(store_dir)
     assert _cmd_approve(_ApproveArgs(record.run_id)) == 0
     return SessionStore(store_dir=store_dir).load(record.run_id)
@@ -428,3 +430,163 @@ class TestRootSubmitRegeneration:
         assert "no-magic-viz/scenes/scene_microselection.py" in instruction
         assert str(store.bundle_dir(approved.run_id)) not in instruction
         assert "{" not in instruction
+
+
+def _tree(root: Path) -> dict[str, tuple[bytes | None, int]]:
+    """Every path under `root` with its bytes (files) and mode."""
+    return {
+        str(path.relative_to(root)): (
+            path.read_bytes() if path.is_file() else None,
+            path.lstat().st_mode,
+        )
+        for path in sorted(root.rglob("*"))
+    }
+
+
+def _damage_record(store_dir: Path, run_id: str, mutate: Callable[[dict[str, Any]], None]) -> None:
+    path = store_dir / f"{run_id}.json"
+    data = json.loads(path.read_text())
+    mutate(data)
+    path.write_text(json.dumps(data))
+
+
+class TestRootSubmitIdentity:
+    """Root submit publishes only the identity of the verified sealed bundle it was approved for."""
+
+    @pytest.mark.parametrize(
+        ("algorithm", "tier", "refusal"),
+        [
+            ("insertion", None, "requested algorithm/tier does not match the approved run"),
+            ("selection", 3, "requested algorithm/tier does not match the approved run"),
+        ],
+    )
+    def test_conflicting_request_is_refused_before_any_work(
+        self,
+        store_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        algorithm: str,
+        tier: int | None,
+        refusal: str,
+    ) -> None:
+        approved = _seal_from_build(store_dir, monkeypatch, fixture_outputs("A"))
+        self._assert_refused_before_any_work(
+            store_dir, monkeypatch, capsys, _SubmitArgs(algorithm, approved.run_id, tier), refusal
+        )
+
+    @pytest.mark.parametrize(
+        ("mutate", "refusal"),
+        [
+            (
+                lambda r: r["approval"].update(run_id="0" * 32),
+                "approval does not match the run's sealed bundle",
+            ),
+            (
+                lambda r: r["approval"].update(algorithm="insertion"),
+                "approval does not match the run's sealed bundle",
+            ),
+            (
+                lambda r: r["approval"].update(tier=3),
+                "approval does not match the run's sealed bundle",
+            ),
+            (
+                lambda r: r["approval"].update(tier="2"),
+                "approval does not match the run's sealed bundle",
+            ),
+            (
+                lambda r: r["approval"].update(manifest_sha256="0" * 64),
+                "approval does not match the run's sealed bundle",
+            ),
+            (
+                lambda r: r["approval"].pop("tier"),
+                "approval does not match the run's sealed bundle",
+            ),
+            (lambda r: r.update(algorithm_name="insertion"), "bundle identity does not match"),
+            (lambda r: r.update(tier=3), "bundle identity does not match"),
+            (lambda r: r.update(run_id="0" * 32), "carries a different run ID"),
+        ],
+    )
+    def test_damaged_stored_approval_or_record_is_refused_before_any_work(
+        self,
+        store_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        mutate: Callable[[dict[str, Any]], None],
+        refusal: str,
+    ) -> None:
+        approved = _seal_from_build(store_dir, monkeypatch, fixture_outputs("A"))
+        _damage_record(store_dir, approved.run_id, mutate)
+        self._assert_refused_before_any_work(
+            store_dir, monkeypatch, capsys, _SubmitArgs("selection", approved.run_id), refusal
+        )
+
+    @staticmethod
+    def _assert_refused_before_any_work(
+        store_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        args: _SubmitArgs,
+        refusal: str,
+    ) -> None:
+        resolved: list[object] = []
+        monkeypatch.setattr("apprentice.cli._resolve_model", lambda cfg, a: resolved.append(a))
+        before = _tree(store_dir)
+        capsys.readouterr()
+
+        assert _cmd_submit(load_config(None), args) == 1
+
+        assert refusal in json.loads(_last_json(capsys))["error"]
+        assert resolved == []
+        assert _tree(store_dir) == before
+
+    @pytest.mark.parametrize(
+        ("built_tier", "asserted_tier", "tier_dir"),
+        [(1, None, "01-foundations"), (3, None, "03-systems"), (3, 3, "03-systems")],
+    )
+    def test_publisher_receives_the_sealed_name_and_tier(
+        self,
+        store_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        built_tier: int,
+        asserted_tier: int | None,
+        tier_dir: str,
+    ) -> None:
+        approved = _seal_from_build(store_dir, monkeypatch, fixture_outputs("A"), tier=built_tier)
+        sealed = _bundle_bytes(store_dir, approved.run_id)
+        llm = _use_model(monkeypatch, fixture_outputs("A"))
+        capsys.readouterr()
+
+        args = _SubmitArgs("selection", approved.run_id, asserted_tier)
+        assert _cmd_submit(load_config(None), args) == 0
+
+        out = json.loads(_last_json(capsys))
+        assert (out["run_id"], out["algorithm"], out["tier"]) == (
+            approved.run_id,
+            "selection",
+            built_tier,
+        )
+        (instruction,) = [text for role, text in llm.requests if role == "packaging"]
+        assert f"- Tier: {built_tier}\n" in instruction
+        assert f"no-magic/{tier_dir}/microselection.py" in instruction
+        assert "no-magic-viz/scenes/scene_microselection.py" in instruction
+        assert "{" not in instruction
+        tier_prompts = [text for text in llm.user_texts if "(tier " in text]
+        assert tier_prompts
+        assert all(f"selection algorithm (tier {built_tier})" in text for text in tier_prompts)
+        assert _bundle_bytes(store_dir, approved.run_id) == sealed
+
+    def test_role_absent_from_the_approval_gives_the_publisher_an_empty_path(
+        self, store_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        outputs = fixture_outputs("A", omit=("assessment",))
+        approved = _seal_from_build(store_dir, monkeypatch, outputs)
+        llm = _use_model(monkeypatch, outputs)
+
+        assert _cmd_submit(load_config(None), _SubmitArgs("selection", approved.run_id)) == 0
+
+        (instruction,) = [text for role, text in llm.requests if role == "packaging"]
+        (fresh,) = list((store_dir / "scratch").iterdir())
+        assert "- Anki deck: " in instruction.splitlines()
+        assert f"Implementation: {fresh / 'implementation.py'}" in instruction
+        assert not (fresh / "cards.csv").exists()

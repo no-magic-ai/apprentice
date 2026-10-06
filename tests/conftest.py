@@ -177,6 +177,7 @@ class OfflineFixtureLlm(BaseLlm):
 
     outputs: dict[str, str] = Field(default_factory=dict)
     requests: list[tuple[str, str]] = Field(default_factory=list)
+    user_texts: list[str] = Field(default_factory=list)
 
     async def generate_content_async(
         self, llm_request: LlmRequest, stream: bool = False
@@ -184,6 +185,13 @@ class OfflineFixtureLlm(BaseLlm):
         instruction = str(llm_request.config.system_instruction or "")
         role = next((r for marker, r in _ROLE_MARKERS.items() if marker in instruction), "unknown")
         self.requests.append((role, instruction))
+        self.user_texts.extend(
+            part.text
+            for content in llm_request.contents
+            if content.role == "user"
+            for part in content.parts or []
+            if part.text
+        )
         yield LlmResponse(
             content=types.Content(role="model", parts=[types.Part(text=self.outputs[role])])
         )

@@ -48,7 +48,12 @@ def main(argv: list[str] | None = None) -> int:
 
     submit_parser = subparsers.add_parser("submit", help="Package last build into PRs")
     submit_parser.add_argument("algorithm", help="Algorithm name to package")
-    submit_parser.add_argument("--tier", type=int, default=2, help="Algorithm tier (default: 2)")
+    submit_parser.add_argument(
+        "--tier",
+        type=int,
+        default=None,
+        help="Assert the approved run's tier (the sealed bundle's tier is always used)",
+    )
     submit_parser.add_argument("--backend", type=str, default=None, help="Override backend")
     submit_parser.add_argument("--model", type=str, default=None, help="Override model")
     submit_parser.add_argument(
@@ -284,6 +289,12 @@ def _cmd_submit(cfg: ApprenticeConfig, args: Any) -> int:
         _print_json({"error": str(exc)})
         return 1
 
+    try:
+        snapshot = store.load_bundle(record)
+    except ArtifactError as exc:
+        _print_json({"error": str(exc), "run_id": run_id})
+        return 1
+
     approval = record.approval
     if not approval:
         _print_json(
@@ -295,7 +306,40 @@ def _cmd_submit(cfg: ApprenticeConfig, args: Any) -> int:
         )
         return 1
 
-    logger.info("submit started: %s (tier %d, run %s)", args.algorithm, args.tier, run_id)
+    # The approval must name exactly the sealed bundle that was verified above;
+    # the bundle, not the command line, fixes the name and tier published.
+    sealed_identity = {
+        "run_id": snapshot.run_id,
+        "algorithm": snapshot.algorithm,
+        "tier": snapshot.tier,
+        "manifest_sha256": snapshot.manifest_sha256,
+    }
+    approved_identity = {key: approval.get(key) for key in sealed_identity}
+    if approved_identity != sealed_identity:
+        _print_json(
+            {
+                "error": "approval does not match the run's sealed bundle",
+                "run_id": run_id,
+                "approved": approved_identity,
+                "sealed": sealed_identity,
+                "remediation": f"apprentice approve {run_id}",
+            }
+        )
+        return 1
+
+    if args.algorithm != snapshot.algorithm or args.tier not in (None, snapshot.tier):
+        _print_json(
+            {
+                "error": "requested algorithm/tier does not match the approved run",
+                "run_id": run_id,
+                "requested": {"algorithm": args.algorithm, "tier": args.tier},
+                "approved": {"algorithm": snapshot.algorithm, "tier": snapshot.tier},
+            }
+        )
+        return 1
+    algorithm, tier = snapshot.algorithm, snapshot.tier
+
+    logger.info("submit started: %s (tier %d, run %s)", algorithm, tier, run_id)
 
     model = _resolve_model(cfg, args)
     # Regeneration runs in a distinct fresh root so the sealed approved bundle
@@ -303,8 +347,8 @@ def _cmd_submit(cfg: ApprenticeConfig, args: Any) -> int:
     # against the approved hashes before packaging may run.
     scope = RunScope(
         run_id=record.run_id,
-        algorithm=args.algorithm,
-        tier=args.tier,
+        algorithm=algorithm,
+        tier=tier,
         work_root=store.allocate_work_root(),
     )
     try:
@@ -315,7 +359,7 @@ def _cmd_submit(cfg: ApprenticeConfig, args: Any) -> int:
 
     start = time.monotonic()
     try:
-        session_state = asyncio.run(_run_pipeline(pipeline, args.algorithm, args.tier, ""))
+        session_state = asyncio.run(_run_pipeline(pipeline, algorithm, tier, ""))
     except BlockingGateError as failure:
         # The approved run and its sealed bundle are left exactly as they were.
         _print_json(
@@ -329,7 +373,7 @@ def _cmd_submit(cfg: ApprenticeConfig, args: Any) -> int:
         return 1
     elapsed = time.monotonic() - start
 
-    _print_build_result(args.algorithm, args.tier, session_state, elapsed, run_id)
+    _print_build_result(algorithm, tier, session_state, elapsed, run_id)
     return 0
 
 
