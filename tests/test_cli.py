@@ -3,15 +3,35 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any
+import logging
+from pathlib import Path
+from typing import TYPE_CHECKING
 
+import anyio
 import pytest
 
-from apprentice.cli import _cmd_approve, _cmd_preview, _cmd_submit, main
+from apprentice.cli import (
+    _cmd_approve,
+    _cmd_build,
+    _cmd_preview,
+    _cmd_retry,
+    _cmd_submit,
+    _run_pipeline,
+    main,
+)
+from apprentice.core.config import load_config
 from apprentice.core.session_store import RunRecord, SessionStore
+from apprentice.models.work_item import BlockingGateError
+from tests.conftest import OfflineFixtureLlm, fixture_outputs
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from apprentice.core.artifacts import RunScope
+
+
+def _last_json(capsys: pytest.CaptureFixture[str]) -> str:
+    """Return the last JSON object the command printed to stdout."""
+    out = capsys.readouterr().out
+    return out[out.rfind("\n{") + 1 :] if "\n{" in out else out
 
 
 class TestCLI:
@@ -201,41 +221,141 @@ class TestSubmitGuard:
         out = json.loads(capsys.readouterr().out)
         assert "No completed build" in out["error"]
 
-    def test_submit_regenerates_into_fresh_root_never_the_sealed_bundle(
+
+class _BuildArgs:
+    def __init__(self, algorithm: str = "selection", tier: int = 2) -> None:
+        self.algorithm = algorithm
+        self.tier = tier
+        self.description = ""
+        self.backend = None
+        self.model = None
+
+
+class _RetryArgs:
+    def __init__(self, run_id: str) -> None:
+        self.run_id = run_id
+        self.backend = None
+        self.model = None
+
+
+def _use_model(monkeypatch: pytest.MonkeyPatch, outputs: dict[str, str]) -> OfflineFixtureLlm:
+    llm = OfflineFixtureLlm(model="offline-fixture", outputs=outputs)
+    monkeypatch.setattr("apprentice.cli._resolve_model", lambda cfg, args: llm)
+    return llm
+
+
+def _only_record(store_dir: Path, exclude: set[str] | None = None) -> RunRecord:
+    store = SessionStore(store_dir=store_dir)
+    (record,) = [r for r in store.list_runs(limit=100) if r.run_id not in (exclude or set())]
+    return record
+
+
+def _assert_halted_with_diagnostics(store_dir: Path, record: RunRecord, gate: str) -> None:
+    store = SessionStore(store_dir=store_dir)
+    assert record.status == "failed"
+    assert record.error == f"blocking gate failed: {gate}"
+    stored_verdict = record.session_state["gate_verdicts"][-1]
+    tracked_verdict = record.budget_summary["gate_verdicts"][-1]
+    assert stored_verdict == tracked_verdict
+    assert (stored_verdict["verdict"], stored_verdict["blocking"]) == ("fail", True)
+    assert stored_verdict["diagnostics"]
+    assert record.session_state["generated_code"]
+    assert record.budget_summary["per_agent"]
+    assert (store.run_scope(record).work_root / "implementation.py").is_file()
+    assert record.manifest_sha256 == ""
+    assert not store.bundle_dir(record.run_id).exists()
+
+
+class TestGateHaltRecording:
+    def test_build_halted_by_gate_keeps_state_diagnostics_budget_and_work_files(
+        self, store_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        llm = _use_model(monkeypatch, fixture_outputs(failing_implementation=True))
+
+        assert _cmd_build(load_config(None), _BuildArgs()) == 1
+
+        out = json.loads(_last_json(capsys))
+        record = _only_record(store_dir)
+        _assert_halted_with_diagnostics(store_dir, record, "correctness after implementation")
+        assert out["gate"]["gate_name"] == "correctness"
+        assert "assessment" not in llm.roles()
+
+    def test_build_with_empty_draft_fails_at_the_correctness_gate(
         self, store_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from google.adk.models.lite_llm import LiteLlm
+        _use_model(monkeypatch, fixture_outputs(omit=("drafter",)))
 
-        from apprentice.core.config import load_config
-        from apprentice.core.gate_agent import GateAgent
-        from apprentice.gates.review import ReviewGate
+        assert _cmd_build(load_config(None), _BuildArgs()) == 1
 
-        rec = _make_completed_run(store_dir)
-        assert _cmd_approve(_ApproveArgs(rec.run_id)) == 0
-        store = SessionStore(store_dir=store_dir)
-        sealed = store.load_bundle(store.load(rec.run_id))
-        captured: list[Any] = []
-
-        async def _record_pipeline(pipeline: Any, *args: Any) -> dict[str, Any]:
-            captured.append(pipeline)
-            return {}
-
-        monkeypatch.setattr(
-            "apprentice.cli._resolve_model", lambda cfg, args: LiteLlm(model="openai/fixture")
-        )
-        monkeypatch.setattr("apprentice.cli._run_pipeline", _record_pipeline)
-
-        assert _cmd_submit(load_config(None), _SubmitArgs("selection", rec.run_id)) == 0
-
-        gates = [a for a in captured[0].sub_agents if isinstance(a, GateAgent)]
-        roots = {g.scope.work_root for g in gates}
-        assert len(roots) == 1
-        regen_root = roots.pop()
-        assert regen_root not in {
-            store.bundle_dir(rec.run_id),
-            store.run_scope(store.load(rec.run_id)).work_root,
+        record = _only_record(store_dir)
+        assert record.status == "failed"
+        assert record.session_state["gate_verdicts"][-1]["diagnostics"] == {
+            "error": "implementation_path is empty"
         }
-        assert list(regen_root.iterdir()) == []
-        review = next(g.gate for g in gates if isinstance(g.gate, ReviewGate))
-        assert review._approval == store.load(rec.run_id).approval
-        assert store.load_bundle(store.load(rec.run_id)) == sealed
+        assert not SessionStore(store_dir=store_dir).bundle_dir(record.run_id).exists()
+
+    def test_passing_build_completes_and_seals(
+        self, store_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _use_model(monkeypatch, fixture_outputs())
+
+        assert _cmd_build(load_config(None), _BuildArgs()) == 0
+
+        record = _only_record(store_dir)
+        assert record.status == "completed"
+        assert [v["verdict"] for v in record.session_state["gate_verdicts"]] == ["pass"] * 4
+        assert SessionStore(store_dir=store_dir).load_bundle(record).artifacts
+
+    def test_retry_halted_by_gate_records_its_state_once(
+        self, store_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = SessionStore(store_dir=store_dir)
+        previous = store.fail_run(store.create_run("selection", 2), {}, {}, 1.0, "earlier failure")
+        _use_model(monkeypatch, fixture_outputs(failing_implementation=True))
+
+        assert _cmd_retry(load_config(None), _RetryArgs(previous.run_id)) == 1
+
+        record = _only_record(store_dir, exclude={previous.run_id})
+        _assert_halted_with_diagnostics(store_dir, record, "correctness after implementation")
+
+    def test_integration_runner_records_gate_halt_with_state(
+        self, store_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "integration_test", Path(__file__).parent.parent / "scripts" / "integration_test.py"
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        llm = OfflineFixtureLlm(
+            model="offline-fixture", outputs=fixture_outputs(failing_implementation=True)
+        )
+        monkeypatch.setattr("apprentice.providers.factory.create_model", lambda provider: llm)
+        store = SessionStore(store_dir=store_dir)
+
+        record = module._run_single(
+            "selection", 2, load_config(None), None, None, store, logging.getLogger("t")
+        )
+
+        _assert_halted_with_diagnostics(
+            store_dir, store.load(record.run_id), "correctness after implementation"
+        )
+
+
+class TestRunnerStateCarrier:
+    def test_halt_carries_the_stored_session_state(self, scope: RunScope) -> None:
+        from apprentice.core.orchestrator import build_pipeline
+
+        llm = OfflineFixtureLlm(
+            model="offline-fixture", outputs=fixture_outputs(failing_implementation=True)
+        )
+        pipeline = build_pipeline(llm, load_config(None), scope)
+
+        with pytest.raises(BlockingGateError) as excinfo:
+            anyio.run(_run_pipeline, pipeline, "selection", 2, "")
+
+        state = excinfo.value.persisted_state()
+        assert state["generated_code"] == fixture_outputs(failing_implementation=True)["drafter"]
+        assert state["gate_verdicts"][-1] == excinfo.value.verdict

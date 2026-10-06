@@ -13,7 +13,8 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from apprentice.core.config import ApprenticeConfig
-    from apprentice.core.session_store import SessionStore
+    from apprentice.core.session_store import RunRecord, SessionStore
+    from apprentice.models.work_item import BlockingGateError
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -183,6 +184,7 @@ def _cmd_build(cfg: ApprenticeConfig, args: Any) -> int:
     from apprentice.core.orchestrator import build_pipeline, get_budget_tracker_from_pipeline
     from apprentice.core.progress import PipelineProgress, suppress_noisy_loggers
     from apprentice.core.session_store import SessionStore
+    from apprentice.models.work_item import BlockingGateError
 
     suppress_noisy_loggers()
 
@@ -217,6 +219,12 @@ def _cmd_build(cfg: ApprenticeConfig, args: Any) -> int:
             store.fail_run(record, session_state, budget_summary, elapsed, "no output generated")
             progress.finish(False, elapsed)
 
+    except BlockingGateError as failure:
+        elapsed = time.monotonic() - start
+        _record_gate_halt(store, record, pipeline, failure, elapsed)
+        progress.finish(False, elapsed)
+        _print_json({"error": str(failure), "run_id": record.run_id, "gate": failure.verdict})
+        return 1
     except Exception as exc:
         elapsed = time.monotonic() - start
         store.fail_run(record, {}, {}, elapsed, str(exc))
@@ -228,11 +236,32 @@ def _cmd_build(cfg: ApprenticeConfig, args: Any) -> int:
     return 0
 
 
+def _record_gate_halt(
+    store: SessionStore,
+    record: RunRecord,
+    pipeline: Any,
+    failure: BlockingGateError,
+    elapsed: float,
+) -> RunRecord:
+    """Record a run halted by a blocking gate once, with its persisted state and real budget."""
+    from apprentice.core.orchestrator import get_budget_tracker_from_pipeline
+
+    tracker = get_budget_tracker_from_pipeline(pipeline)
+    return store.fail_run(
+        record,
+        failure.persisted_state(),
+        tracker.to_dict() if tracker else {},
+        elapsed,
+        str(failure),
+    )
+
+
 def _cmd_submit(cfg: ApprenticeConfig, args: Any) -> int:
-    from apprentice.core.artifacts import RunScope
+    from apprentice.core.artifacts import ArtifactError, RunScope
     from apprentice.core.observability import get_logger
     from apprentice.core.orchestrator import build_pipeline
     from apprentice.core.session_store import SessionStore
+    from apprentice.models.work_item import BlockingGateError
 
     logger = get_logger(__name__)
     store = SessionStore()
@@ -278,10 +307,26 @@ def _cmd_submit(cfg: ApprenticeConfig, args: Any) -> int:
         tier=args.tier,
         work_root=store.allocate_work_root(),
     )
-    pipeline = build_pipeline(model, cfg, scope, include_packaging=True, approval=approval)
+    try:
+        pipeline = build_pipeline(model, cfg, scope, include_packaging=True, approval=approval)
+    except ArtifactError as exc:
+        _print_json({"error": str(exc), "run_id": run_id})
+        return 1
 
     start = time.monotonic()
-    session_state = asyncio.run(_run_pipeline(pipeline, args.algorithm, args.tier, ""))
+    try:
+        session_state = asyncio.run(_run_pipeline(pipeline, args.algorithm, args.tier, ""))
+    except BlockingGateError as failure:
+        # The approved run and its sealed bundle are left exactly as they were.
+        _print_json(
+            {
+                "error": str(failure),
+                "run_id": run_id,
+                "gate": failure.verdict,
+                "regeneration_root": str(scope.work_root),
+            }
+        )
+        return 1
     elapsed = time.monotonic() - start
 
     _print_build_result(args.algorithm, args.tier, session_state, elapsed, run_id)
@@ -413,6 +458,8 @@ async def _run_pipeline_with_progress(
     from google.adk.sessions import InMemorySessionService
     from google.genai import types
 
+    from apprentice.models.work_item import BlockingGateError
+
     session_service = InMemorySessionService()  # type: ignore[no-untyped-call]
     artifact_service = InMemoryArtifactService()
 
@@ -448,23 +495,34 @@ async def _run_pipeline_with_progress(
 
     run_config = RunConfig(max_llm_calls=50)
 
-    if progress is not None:
-        with progress.start():
-            async for event in runner.run_async(
+    try:
+        if progress is not None:
+            with progress.start():
+                async for event in runner.run_async(
+                    user_id=user_id,
+                    session_id=session.id,
+                    new_message=user_message,
+                    run_config=run_config,
+                ):
+                    progress.on_event(event)
+        else:
+            async for _event in runner.run_async(
                 user_id=user_id,
                 session_id=session.id,
                 new_message=user_message,
                 run_config=run_config,
             ):
-                progress.on_event(event)
-    else:
-        async for _event in runner.run_async(
-            user_id=user_id,
-            session_id=session.id,
-            new_message=user_message,
-            run_config=run_config,
-        ):
-            pass
+                pass
+    except BlockingGateError as failure:
+        # The gate's verdict delta is already stored; read the session back
+        # from this same service so the halted run keeps its outputs.
+        stored = await session_service.get_session(
+            app_name="apprentice", user_id=user_id, session_id=session.id
+        )
+        if stored is None:
+            raise RuntimeError(f"session {session.id} vanished after {failure}") from failure
+        failure.session_state = dict(stored.state)
+        raise
 
     updated_session = await session_service.get_session(
         app_name="apprentice", user_id=user_id, session_id=session.id
@@ -607,6 +665,7 @@ def _cmd_retry(cfg: ApprenticeConfig, args: Any) -> int:
     from apprentice.core.observability import get_logger
     from apprentice.core.orchestrator import build_pipeline, get_budget_tracker_from_pipeline
     from apprentice.core.session_store import SessionStore
+    from apprentice.models.work_item import BlockingGateError
 
     logger = get_logger(__name__)
     store = SessionStore()
@@ -651,6 +710,12 @@ def _cmd_retry(cfg: ApprenticeConfig, args: Any) -> int:
                 new_record, session_state, budget_summary, elapsed, "no output generated"
             )
 
+    except BlockingGateError as failure:
+        elapsed = time.monotonic() - start
+        _record_gate_halt(store, new_record, pipeline, failure, elapsed)
+        logger.error("retry failed: %s", failure)
+        _print_json({"error": str(failure), "run_id": new_record.run_id, "gate": failure.verdict})
+        return 1
     except Exception as exc:
         elapsed = time.monotonic() - start
         store.fail_run(new_record, {}, {}, elapsed, str(exc))

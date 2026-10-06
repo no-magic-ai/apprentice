@@ -35,6 +35,34 @@ class GateVerdict(StrEnum):
     WARN = "warn"
 
 
+class BlockingGateError(Exception):
+    """A blocking gate failed during generation; the pipeline stops here.
+
+    Raised by `GateAgent` after its verdict has been yielded as a persisted
+    session-state delta. The runner that drove the pipeline reads the stored
+    session back and attaches it, so callers can record the halted run with
+    its actual outputs and diagnostics.
+
+    Attributes:
+        verdict: The gate verdict entry (gate_name, after_stage, verdict,
+            blocking, diagnostics) exactly as recorded.
+        session_state: Persisted session state, attached by the runner.
+    """
+
+    def __init__(self, verdict: dict[str, Any]) -> None:
+        super().__init__(
+            f"blocking gate failed: {verdict['gate_name']} after {verdict['after_stage']}"
+        )
+        self.verdict = verdict
+        self.session_state: dict[str, Any] | None = None
+
+    def persisted_state(self) -> dict[str, Any]:
+        """Return the attached persisted session state, failing loudly if absent."""
+        if self.session_state is None:
+            raise RuntimeError(f"{self}: persisted session state was not attached")
+        return self.session_state
+
+
 @dataclass
 class WorkItem:
     """A single algorithm to be processed through the pipeline."""
