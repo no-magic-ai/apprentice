@@ -29,13 +29,20 @@ Rejects algorithm names other than 1-64 lowercase letters, digits and underscore
 
 ### submit
 
-Run the full pipeline including packaging (PR creation).
+Regenerate an approved run and hand the regenerated files to the model-driven publisher, which opens PRs in `no-magic` and `no-magic-viz`.
 
 ```
-apprentice submit <algorithm> [--tier N] [--backend NAME] [--model STRING]
+apprentice submit <algorithm> [--run-id ID] [--tier N] [--backend NAME] [--model STRING]
 ```
 
-Same options as `build`. Creates PRs in both `no-magic` and `no-magic-viz` repos.
+- `algorithm` — must equal the approved run's algorithm
+- `--run-id` — run to submit (from `apprentice history`); defaults to the most recently started completed run of `algorithm` among the 50 most recent completed runs
+- `--tier` — optional assertion; when given it must equal the approved run's tier
+- `--backend`, `--model` — as for `build`; they select the model that regenerates the artifacts and drives the publisher
+
+Before resolving a model or allocating any work root, `submit` verifies the run's sealed bundle (see [Architecture: Run-Owned Artifacts](architecture.md#run-owned-artifacts)) and requires an approval recorded with `apprentice approve` whose run ID, algorithm, tier and manifest digest equal that bundle. A run without a sealed bundle (it must be rebuilt), a bundle that fails verification, a missing or mismatched approval, or a conflicting algorithm or `--tier` prints a JSON error and exits 1 without changing the run. The approved name and tier, never a default, then drive the regeneration, the prompts and the publisher destinations `no-magic/<tier dir>/micro<name>.py` and `no-magic-viz/scenes/scene_micro<name>.py`.
+
+`submit` re-runs the model pipeline into a fresh root under `~/.apprentice/sessions/scratch/`. The review gate compares every regenerated role with the approved hashes; a changed, missing or added role stops the run with a JSON `gate` error before the publisher. When every role matches, the publisher receives the regenerated files' paths (not the sealed bundle) and uses its clone, branch, place-file and PR tools with the operator's ambient `git` and `gh` credentials. The publisher is model-driven, so `submit` does not guarantee that exactly the approved bytes are published, and it does not record a submission on the run.
 
 ### suggest
 
