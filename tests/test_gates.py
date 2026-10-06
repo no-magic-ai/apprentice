@@ -277,3 +277,21 @@ class TestReviewGateAgainstSealedApproval:
         result = ReviewGate(approval=approval).evaluate(_make_item(), bundle)
         assert result.verdict == GateVerdict.FAIL
         assert set(result.diagnostics["diffs"]) == {"manim_scene"}
+
+    def test_changed_instrumented_role_fails(self, store: SessionStore) -> None:
+        record = store.create_run("selection", 2)
+        store.complete_run(
+            record, {"generated_code": "impl = 1\n", "instrumented_code": "trace = 1\n"}, {}, 1.0
+        )
+        snapshot = store.load_bundle(record)
+        approval = {
+            "approved_by": "tester",
+            "approved_at": "2026-10-06T00:00:00+00:00",
+            "artifact_hashes": {a.role: a.sha256 for a in snapshot.artifacts},
+        }
+        bundle = self._regenerate(
+            store, {"generated_code": "impl = 1\n", "instrumented_code": "trace = 2\n"}
+        )
+        result = ReviewGate(approval=approval).evaluate(_make_item(), bundle)
+        assert result.verdict == GateVerdict.FAIL
+        assert set(result.diagnostics["diffs"]) == {"instrumented"}
