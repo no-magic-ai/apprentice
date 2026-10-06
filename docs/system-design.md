@@ -257,7 +257,7 @@ sequenceDiagram
     participant Draft as LlmAgent (Drafter)
     participant Lint as FunctionTool (lint)
     participant Correct as FunctionTool (correctness)
-    participant Par as ParallelAgent
+    participant ToolStage as ParallelAgent
     participant Instr as LlmAgent (Instrumentation)
     participant Viz as LlmAgent (Visualization)
     participant Assess as LlmAgent (Assessment)
@@ -280,13 +280,13 @@ sequenceDiagram
 
     Impl-->>Pipe: Implementation artifact
 
-    Pipe->>Par: Fan-out artifact generation
+    Pipe->>ToolStage: Fan-out artifact generation
     par Concurrent
-        Par->>Instr: Add trace hooks
-        Par->>Viz: Generate Manim scene
-        Par->>Assess: Generate Anki cards
+        ToolStage->>Instr: Add trace hooks
+        ToolStage->>Viz: Generate Manim scene
+        ToolStage->>Assess: Generate Anki cards
     end
-    Par-->>Pipe: All artifacts
+    ToolStage-->>Pipe: All artifacts
 
     Pipe->>Rev: Review all artifacts
     loop max_iterations=2
