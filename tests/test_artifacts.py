@@ -21,6 +21,7 @@ from apprentice.core.artifacts import (
     load_snapshot,
     manifest_digest,
     require_owned_root,
+    seal_bundle,
     write_role,
 )
 from tests.conftest import OfflineFixtureLlm, fixture_outputs
@@ -83,6 +84,26 @@ class TestOwnedRoots:
         with pytest.raises(ArtifactError, match="already exists"):
             store.allocate_work_root()
         assert (first / "implementation.py").read_text() == "kept = 1\n"
+
+    def test_run_scope_refuses_a_symlinked_work_root(
+        self, store: SessionStore, tmp_path: Path
+    ) -> None:
+        record = store.create_run("selection", 2)
+        work_root = store.run_scope(record).work_root
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        work_root.rmdir()
+        work_root.symlink_to(elsewhere)
+
+        with pytest.raises(ArtifactError, match="artifact root is a symlink"):
+            store.run_scope(record)
+
+    def test_run_scope_refuses_a_missing_work_root(self, store: SessionStore) -> None:
+        record = store.create_run("selection", 2)
+        store.run_scope(record).work_root.rmdir()
+
+        with pytest.raises(ArtifactError, match="artifact root does not exist"):
+            store.run_scope(record)
 
 
 class TestRoleWriter:
@@ -187,6 +208,81 @@ class TestSealedBundleVerification:
         _rewrite_manifest(bundle, lambda m: _entry(m, "manim_scene").update(path="other.py"))
         with pytest.raises(ArtifactError, match="unsupported path for manim_scene"):
             load_snapshot(bundle)
+
+    def test_same_size_bytes_with_a_different_digest_are_refused(self, store: SessionStore) -> None:
+        bundle = _sealed(store)
+        path = _writable(bundle / "implementation.py")
+        original = path.read_bytes()
+        path.write_bytes(original.replace(b"1", b"2"))
+        assert len(path.read_bytes()) == len(original)
+
+        with pytest.raises(ArtifactError, match="implementation bytes differ from its manifest"):
+            load_snapshot(bundle)
+
+    @pytest.mark.parametrize(
+        ("mutate", "refusal"),
+        [
+            (lambda m: m.update(extra=1), "does not have the supported field set"),
+            (lambda m: m.update(version=2), "unsupported manifest version 2"),
+            (
+                lambda m: _entry(m, "anki_deck").update(role="slides"),
+                "lists unsupported role 'slides'",
+            ),
+            (lambda m: m["artifacts"].reverse(), "roles are duplicated or unsorted"),
+            (
+                lambda m: m["artifacts"].append(dict(_entry(m, "manim_scene"))),
+                "roles are duplicated or unsorted",
+            ),
+            (
+                lambda m: _entry(m, "implementation").update(mode=420),
+                "has a malformed artifact entry",
+            ),
+            (
+                lambda m: _entry(m, "implementation").update(size="9"),
+                "invalid size for implementation",
+            ),
+            (
+                lambda m: _entry(m, "implementation").update(size=-1),
+                "invalid size for implementation",
+            ),
+        ],
+    )
+    def test_re_signed_manifest_with_an_unsupported_shape_is_refused(
+        self, store: SessionStore, mutate: Callable[[dict[str, Any]], None], refusal: str
+    ) -> None:
+        bundle = _sealed(store)
+        _rewrite_manifest(bundle, mutate)
+        with pytest.raises(ArtifactError, match=refusal):
+            load_snapshot(bundle)
+
+    def test_re_signed_manifest_without_an_implementation_is_refused(
+        self, store: SessionStore
+    ) -> None:
+        bundle = _sealed(store)
+        _writable(bundle / "implementation.py").unlink()
+        _rewrite_manifest(
+            bundle,
+            lambda m: m.update(
+                artifacts=[e for e in m["artifacts"] if e["role"] != "implementation"]
+            ),
+        )
+        with pytest.raises(ArtifactError, match="has no implementation artifact"):
+            load_snapshot(bundle)
+
+    def test_sealing_an_unsupported_role_leaves_nothing_behind(self, store: SessionStore) -> None:
+        record = store.create_run("selection", 2)
+        bundle_dir = store.bundle_dir(record.run_id)
+        before = sorted(p.name for p in bundle_dir.parent.iterdir())
+
+        with pytest.raises(ArtifactError, match=r"cannot seal unsupported roles: \['slides'\]"):
+            seal_bundle(
+                bundle_dir,
+                run_id=record.run_id,
+                algorithm="selection",
+                tier=2,
+                contents={"implementation": "impl = 1\n", "slides": "deck\n"},
+            )
+        assert sorted(p.name for p in bundle_dir.parent.iterdir()) == before
 
 
 class _CallbackContext:
