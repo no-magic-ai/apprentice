@@ -17,7 +17,7 @@
 
 ## 2. Problem Statement
 
-no-magic's generated `docs/catalog.json` lists 48 scripts across four tiers (45 `micro*` programs plus the comparison programs `attention_vs_none`, `rnn_vs_gru_vs_lstm` and `adam_vs_sgd`), each requiring artifacts across multiple repositories:
+no-magic's generated `docs/catalog.json` lists 48 scripts across four tiers (45 `micro*` programs plus three programs without the prefix: `attention_vs_none`, `rnn_vs_gru_vs_lstm` and `adam_vs_sgd`), each requiring artifacts across multiple repositories:
 
 | Repository | Content | Example |
 |---|---|---|
@@ -63,7 +63,7 @@ All algorithms follow the `micro{name}` pattern:
 - Implementation: `micro{name}.py` in the tier directory
 - Scene: `scene_micro{name}.py` in `no-magic-viz/scenes/`
 - Preview: `micro{name}.gif` in `no-magic-viz/previews/`
-- The `micro` prefix is mandatory for new scripts — it's the project's identity. The three existing comparison programs predate this rule.
+- The `micro` prefix is mandatory for new scripts — it's the project's identity. The three existing programs without the prefix (`attention_vs_none`, `rnn_vs_gru_vs_lstm`, `adam_vs_sgd`) predate this rule; the prefix says nothing about a script's teaching kind.
 - Script slugs (file basenames) and paper slugs (`no-magic-papers` card names) are separate namespaces. The script-to-paper link is written out in `SCRIPT_TO_PAPER`; never derive one slug from the other.
 
 ### 2.3 Tier Mapping
