@@ -289,38 +289,64 @@ def _cmd_submit(args: Any) -> int:
         return 1
 
     if record.submission:
+        # One attempt per run: a pending, partial, failed or complete attempt is
+        # never retried or resumed, because its remote effects may be incomplete
+        # or unknown. Inspect the recorded effects; approve a fresh run instead.
         _print_json(
             {
-                "error": f"run {record.run_id} was already submitted",
+                "error": (
+                    f"run {record.run_id} already has a {_submission_status(record.submission)} "
+                    "submission attempt; it is not published again"
+                ),
                 "submission": record.submission,
             }
         )
         return 1
 
     workspace = store.allocate_work_root()
+    # Reserve the attempt before any publisher effect so an interruption leaves
+    # a pending record that blocks a blind rerun.
+    record.submission = {
+        "status": "pending",
+        "started_at": datetime.now(tz=UTC).isoformat(),
+        "manifest_sha256": snapshot.manifest_sha256,
+        "workspace": str(workspace),
+        "branch": f"apprentice/{record.run_id}",
+        "repositories": [],
+    }
+    store.save(record)
     logger.info("submit started: run %s manifest %s", record.run_id, snapshot.manifest_sha256)
     try:
         submissions = submit_snapshot(snapshot, record.approval, workspace)
     except PackagingError as exc:
-        _print_json(
+        pushed = any(effect["pushed"] for effect in exc.effects)
+        record.submission.update(
             {
+                "status": "partial" if pushed else "failed",
+                "finished_at": datetime.now(tz=UTC).isoformat(),
                 "error": str(exc),
-                "run_id": record.run_id,
-                "workspace": str(workspace),
-                "published": exc.published,
+                "repositories": exc.effects,
             }
         )
+        store.save(record)
+        _print_json({"error": str(exc), "run_id": record.run_id, **record.submission})
         return 1
 
-    record.submission = {
-        "submitted_at": datetime.now(tz=UTC).isoformat(),
-        "manifest_sha256": snapshot.manifest_sha256,
-        "workspace": str(workspace),
-        "repositories": [submission.to_dict() for submission in submissions],
-    }
+    record.submission.update(
+        {
+            "status": "complete",
+            "finished_at": datetime.now(tz=UTC).isoformat(),
+            "repositories": [submission.to_dict() for submission in submissions],
+        }
+    )
     store.save(record)
     _print_json({"run_id": record.run_id, **record.submission})
     return 0
+
+
+def _submission_status(submission: dict[str, Any]) -> str:
+    # Records written before attempts carried a status were only saved on success.
+    return str(submission.get("status", "complete"))
 
 
 def _cmd_approve(args: Any) -> int:

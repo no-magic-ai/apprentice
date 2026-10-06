@@ -200,8 +200,9 @@ class OfflineRemotes:
     """Local bare repositories standing in for the supported GitHub repositories.
 
     `https://github.com/no-magic-ai/<repo>.git` is rewritten to these bare
-    repositories through an isolated GIT_CONFIG_GLOBAL, and `gh` on PATH is a
-    recording stand-in, so packaging runs real git without any remote effect.
+    repositories through an isolated GIT_CONFIG_GLOBAL, git may only use the
+    file transport (GIT_ALLOW_PROTOCOL=file), and `gh` on PATH is a recording
+    stand-in, so packaging runs real git without any remote effect.
     """
 
     bare: dict[str, Path]
@@ -222,6 +223,11 @@ class OfflineRemotes:
         ).stdout
         return sorted(out.split())
 
+    def reject_pushes(self, repository: str) -> None:
+        hook = self.bare[repository] / "hooks" / "pre-receive"
+        hook.write_text("#!/bin/sh\necho 'offline fixture: push rejected' >&2\nexit 1\n")
+        hook.chmod(0o755)
+
     def blob(self, repository: str, ref: str, path: str) -> bytes:
         return subprocess.run(
             ["git", "cat-file", "blob", f"{ref}:{path}"],
@@ -235,12 +241,12 @@ _FAKE_GH = """#!{python}
 import json, os, sys
 with open({log!r}, "a", encoding="utf-8") as handle:
     handle.write(json.dumps(sys.argv[1:]) + "\\n")
-if os.environ.get("OFFLINE_GH_FAIL"):
+with open({log!r}, encoding="utf-8") as handle:
+    number = sum(1 for _ in handle)
+if os.environ.get("OFFLINE_GH_FAIL_ON") == str(number):
     sys.stderr.write("offline gh stand-in: configured failure\\n")
     sys.exit(1)
 repo = sys.argv[sys.argv.index("--repo") + 1]
-with open({log!r}, encoding="utf-8") as handle:
-    number = sum(1 for _ in handle)
 print(f"https://github.com/{{repo}}/pull/offline-{{number}}")
 """
 
@@ -262,7 +268,8 @@ def offline_remotes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> OfflineR
     gitconfig.write_text("\n".join(lines) + "\n")
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(gitconfig))
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-    monkeypatch.delenv("OFFLINE_GH_FAIL", raising=False)
+    monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file")
+    monkeypatch.delenv("OFFLINE_GH_FAIL_ON", raising=False)
 
     for repository, path in bare.items():
         subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(path)], check=True)

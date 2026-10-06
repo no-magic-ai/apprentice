@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
@@ -32,23 +32,26 @@ class PackagingError(Exception):
     """Raised when packaging cannot promote the approved bytes exactly.
 
     Attributes:
-        published: Pull requests already opened before the failure.
+        effects: Every prepared repository with whether its branch was pushed
+            and the pull request opened for it, as known at the failure. Empty
+            when the failure happened before any push.
     """
 
-    def __init__(self, message: str, published: list[dict[str, Any]] | None = None) -> None:
+    def __init__(self, message: str, effects: list[dict[str, Any]] | None = None) -> None:
         super().__init__(message)
-        self.published = published or []
+        self.effects = effects or []
 
 
 @dataclass(frozen=True)
 class RepositorySubmission:
-    """One repository's promoted branch, verified commit and opened pull request."""
+    """One repository's promoted branch, verified commit, push state and pull request."""
 
     repository: str
     base: str
     branch: str
     commit: str
     paths: tuple[str, ...]
+    pushed: bool = False
     pr_url: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -58,6 +61,7 @@ class RepositorySubmission:
             "branch": self.branch,
             "commit": self.commit,
             "paths": list(self.paths),
+            "pushed": self.pushed,
             "pr_url": self.pr_url,
         }
 
@@ -208,19 +212,24 @@ def submit_snapshot(
 
     Raises:
         PackagingError: If any clone, placement, commit check, push or pull
-            request fails; `published` lists pull requests opened before it.
+            request fails; `effects` records which branches were pushed and
+            which pull requests were opened before the failure.
     """
     prepared = [
         _prepare(repository, files, snapshot, approval, workspace)
         for repository, files in _group_by_repository(snapshot).items()
     ]
-    for submission in prepared:
+    state = list(prepared)
+    for index, submission in enumerate(state):
         clone = workspace / submission.repository.split("/")[1]
-        _git(clone, "push", "origin", f"HEAD:refs/heads/{submission.branch}", timeout=120)
+        try:
+            _git(clone, "push", "origin", f"HEAD:refs/heads/{submission.branch}", timeout=120)
+        except PackagingError as exc:
+            raise PackagingError(str(exc), [item.to_dict() for item in state]) from exc
+        state[index] = replace(submission, pushed=True)
 
-    published: list[RepositorySubmission] = []
     companion = ""
-    for submission in prepared:
+    for index, submission in enumerate(state):
         clone = workspace / submission.repository.split("/")[1]
         try:
             pr_url = (
@@ -247,15 +256,7 @@ def submit_snapshot(
                 .strip()
             )
         except PackagingError as exc:
-            raise PackagingError(str(exc), [p.to_dict() for p in published]) from exc
-        opened = RepositorySubmission(
-            submission.repository,
-            submission.base,
-            submission.branch,
-            submission.commit,
-            submission.paths,
-            pr_url,
-        )
-        published.append(opened)
+            raise PackagingError(str(exc), [item.to_dict() for item in state]) from exc
+        state[index] = replace(submission, pr_url=pr_url)
         companion = companion or pr_url
-    return published
+    return state

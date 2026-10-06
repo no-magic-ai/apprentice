@@ -325,8 +325,92 @@ class TestSubmitCommand:
         calls = len(offline_remotes.gh_calls())
 
         assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
-        assert "already submitted" in capsys.readouterr().out
+        assert "already has a complete submission attempt" in capsys.readouterr().out
         assert len(offline_remotes.gh_calls()) == calls
+
+    def test_full_submission_is_recorded_complete(
+        self, store_dir: Path, offline_remotes: OfflineRemotes
+    ) -> None:
+        rec = _approved_run(store_dir)
+        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 0
+
+        submission = SessionStore(store_dir=store_dir).load(rec.run_id).submission
+        assert submission["status"] == "complete"
+        assert [(r["pushed"], bool(r["pr_url"])) for r in submission["repositories"]] == [
+            (True, True),
+            (True, True),
+        ]
+
+    @pytest.mark.parametrize(
+        ("fail", "status", "effects"),
+        [
+            ("second_pr", "partial", [(True, True), (True, False)]),
+            ("second_push", "partial", [(True, False), (False, False)]),
+            ("first_push", "failed", [(False, False), (False, False)]),
+        ],
+    )
+    def test_failed_attempt_is_recorded_and_rerun_after_restart_is_refused(
+        self,
+        store_dir: Path,
+        offline_remotes: OfflineRemotes,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        fail: str,
+        status: str,
+        effects: list[tuple[bool, bool]],
+    ) -> None:
+        rec = _approved_run(store_dir)
+        if fail == "second_pr":
+            monkeypatch.setenv("OFFLINE_GH_FAIL_ON", "2")
+        elif fail == "second_push":
+            offline_remotes.reject_pushes("no-magic-ai/no-magic-viz")
+        else:
+            offline_remotes.reject_pushes("no-magic-ai/no-magic")
+        capsys.readouterr()
+
+        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
+
+        printed = json.loads(capsys.readouterr().out)
+        stored = SessionStore(store_dir=store_dir).load(rec.run_id).submission
+        assert printed["status"] == stored["status"] == status
+        assert [(r["pushed"], bool(r["pr_url"])) for r in stored["repositories"]] == effects
+        assert stored["error"] and stored["manifest_sha256"] == rec.manifest_sha256
+
+        monkeypatch.delenv("OFFLINE_GH_FAIL_ON", raising=False)
+        branches = {r: offline_remotes.branches(r) for r in offline_remotes.bare}
+        gh_calls = len(offline_remotes.gh_calls())
+        scratch = sorted((store_dir / "scratch").iterdir())
+
+        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
+
+        assert f"already has a {status} submission attempt" in capsys.readouterr().out
+        assert {r: offline_remotes.branches(r) for r in offline_remotes.bare} == branches
+        assert len(offline_remotes.gh_calls()) == gh_calls
+        assert sorted((store_dir / "scratch").iterdir()) == scratch
+        assert SessionStore(store_dir=store_dir).load(rec.run_id).submission == stored
+
+    def test_interrupted_attempt_stays_pending_and_blocks_rerun(
+        self,
+        store_dir: Path,
+        offline_remotes: OfflineRemotes,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rec = _approved_run(store_dir)
+
+        def _interrupted(*args: Any) -> Any:
+            raise KeyboardInterrupt
+
+        with monkeypatch.context() as patch:
+            patch.setattr("apprentice.agents.packaging.submit_snapshot", _interrupted)
+            with pytest.raises(KeyboardInterrupt):
+                _cmd_submit(_SubmitArgs("selection", rec.run_id))
+
+        assert SessionStore(store_dir=store_dir).load(rec.run_id).submission["status"] == "pending"
+        capsys.readouterr()
+        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
+        assert "already has a pending submission attempt" in capsys.readouterr().out
+        assert offline_remotes.gh_calls() == []
 
     @pytest.mark.parametrize(
         ("mutate", "args", "message"),

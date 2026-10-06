@@ -136,13 +136,47 @@ def test_symlinked_destination_parent_fails_before_any_push(
     assert offline_remotes.gh_calls() == []
 
 
-def test_failed_pull_request_reports_what_was_published(
+def _effects(excinfo: pytest.ExceptionInfo[PackagingError]) -> list[tuple[str, bool, bool]]:
+    return [(e["repository"], e["pushed"], bool(e["pr_url"])) for e in excinfo.value.effects]
+
+
+def test_failure_before_any_push_reports_no_effects(
+    store: SessionStore, offline_remotes: OfflineRemotes, tmp_path: Path
+) -> None:
+    seed = tmp_path / "collide-core"
+    subprocess.run(["git", "clone", "-q", str(offline_remotes.bare[_CORE]), str(seed)], check=True)
+    (seed / "02-alignment" / "microselection.py").write_text("upstream = 1\n")
+    subprocess.run(["git", "add", "-A"], cwd=seed, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "upstream"], cwd=seed, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "main"], cwd=seed, check=True)
+
+    with pytest.raises(PackagingError) as excinfo:
+        submit_snapshot(_snapshot(store), _APPROVAL, store.allocate_work_root())
+
+    assert excinfo.value.effects == []
+
+
+def test_second_push_failure_reports_the_pushed_core_branch(
+    store: SessionStore, offline_remotes: OfflineRemotes
+) -> None:
+    offline_remotes.reject_pushes(_VIZ)
+    snapshot = _snapshot(store)
+
+    with pytest.raises(PackagingError, match="push rejected") as excinfo:
+        submit_snapshot(snapshot, _APPROVAL, store.allocate_work_root())
+
+    assert _effects(excinfo) == [(_CORE, True, False), (_VIZ, False, False)]
+    assert f"apprentice/{snapshot.run_id}" in offline_remotes.branches(_CORE)
+    assert offline_remotes.gh_calls() == []
+
+
+def test_second_pull_request_failure_reports_the_opened_core_pr(
     store: SessionStore, offline_remotes: OfflineRemotes, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("OFFLINE_GH_FAIL", "1")
+    monkeypatch.setenv("OFFLINE_GH_FAIL_ON", "2")
 
     with pytest.raises(PackagingError, match="configured failure") as excinfo:
         submit_snapshot(_snapshot(store), _APPROVAL, store.allocate_work_root())
 
-    assert excinfo.value.published == []
-    assert len(offline_remotes.gh_calls()) == 1
+    assert _effects(excinfo) == [(_CORE, True, True), (_VIZ, True, False)]
+    assert excinfo.value.effects[0]["pr_url"].endswith("/pull/offline-1")

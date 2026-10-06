@@ -57,7 +57,9 @@ class RunRecord:
         elapsed_seconds: Wall-clock duration.
         manifest_sha256: Digest of the sealed bundle manifest (completed runs only).
         approval: Human-review approval bound to the sealed manifest.
-        submission: Pull requests opened by `submit` for the approved bundle.
+        submission: The run's single submit attempt: status (pending, partial,
+            failed or complete), manifest digest, workspace, branch, error and
+            the repository effects known so far (pushed branches, opened PRs).
     """
 
     run_id: str
