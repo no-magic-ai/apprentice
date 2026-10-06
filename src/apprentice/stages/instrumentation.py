@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from apprentice.core.artifacts import require_owned_root, write_role
 
 if TYPE_CHECKING:
     from apprentice.models.budget import CostEstimate
@@ -67,6 +68,7 @@ class InstrumentationStage:
         """
         from apprentice.models.work_item import StageResult
 
+        root = require_owned_root(context.artifact_root)
         implementation_path = context.config.get("artifacts", {}).get("implementation", "")
         source_code = _read_implementation(implementation_path)
 
@@ -85,7 +87,7 @@ class InstrumentationStage:
             )
             instrumented_code = completion.text
 
-        artifact_path = _write_artifact(work_item.algorithm_name, instrumented_code)
+        artifact_path = _write_artifact(root, instrumented_code)
         total_tokens = completion.input_tokens + completion.output_tokens
         cost = (
             completion.input_tokens * _INPUT_RATE_USD + completion.output_tokens * _OUTPUT_RATE_USD
@@ -230,18 +232,10 @@ def _extract_code_block(response: str) -> str:
     return response[code_start:end].strip()
 
 
-def _write_artifact(algorithm_name: str, code: str) -> str:
-    """Write instrumented code to a temp file and return its path string.
-
-    Args:
-        algorithm_name: Used as the filename stem.
-        code: Python source to persist.
+def _write_artifact(root: Path, code: str) -> str:
+    """Write the instrumented artifact into the invocation's owned root.
 
     Returns:
         Absolute path to the written file as a string.
     """
-    tmp_dir = Path(tempfile.gettempdir()) / "apprentice_artifacts"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    dest = tmp_dir / f"{algorithm_name}_instrumented.py"
-    dest.write_text(code, encoding="utf-8")
-    return str(dest)
+    return str(write_role(root, "instrumented", code))

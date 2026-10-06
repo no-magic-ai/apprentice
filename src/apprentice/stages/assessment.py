@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import csv
 import io
-import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from apprentice.core.artifacts import require_owned_root, write_role
 
 if TYPE_CHECKING:
     from apprentice.models.budget import CostEstimate
@@ -74,6 +75,7 @@ class AssessmentStage:
         """
         from apprentice.models.work_item import StageResult
 
+        root = require_owned_root(context.artifact_root)
         implementation_path = context.config.get("artifacts", {}).get("implementation", "")
         source_code = _read_implementation(implementation_path)
 
@@ -89,7 +91,7 @@ class AssessmentStage:
                 {"level": "warning", "message": issue} for issue in validation_issues
             )
 
-        artifact_path = _write_artifact(work_item.algorithm_name, csv_content)
+        artifact_path = _write_artifact(root, csv_content)
         total_tokens = completion.input_tokens + completion.output_tokens
         cost = (
             completion.input_tokens * _INPUT_RATE_USD + completion.output_tokens * _OUTPUT_RATE_USD
@@ -278,18 +280,10 @@ def _validate_csv(content: str) -> list[str]:
     return issues
 
 
-def _write_artifact(algorithm_name: str, content: str) -> str:
-    """Write CSV content to a temp file and return its path string.
-
-    Args:
-        algorithm_name: Used as the filename stem.
-        content: CSV source to persist.
+def _write_artifact(root: Path, content: str) -> str:
+    """Write the anki_deck artifact into the invocation's owned root.
 
     Returns:
         Absolute path to the written file as a string.
     """
-    tmp_dir = Path(tempfile.gettempdir()) / "apprentice_artifacts"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    dest = tmp_dir / f"{algorithm_name}_cards.csv"
-    dest.write_text(content, encoding="utf-8")
-    return str(dest)
+    return str(write_role(root, "anki_deck", content))

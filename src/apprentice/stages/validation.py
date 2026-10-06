@@ -8,9 +8,10 @@ import json
 import re
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from apprentice.core.artifacts import require_owned_root, write_role
 
 if TYPE_CHECKING:
     from apprentice.models.budget import CostEstimate
@@ -88,6 +89,7 @@ class ValidationStage:
         """
         from apprentice.models.work_item import StageResult
 
+        root = require_owned_root(context.artifact_root)
         artifacts_cfg: dict[str, str] = {}
         raw = context.config.get("artifacts", {})
         if isinstance(raw, dict):
@@ -106,7 +108,7 @@ class ValidationStage:
             _check_trace_format(instrumented_path),
         ]
 
-        report_path = _write_report(work_item.algorithm_name, diagnostics)
+        report_path = _write_report(root, diagnostics)
 
         return StageResult(
             stage_name=self.name,
@@ -402,24 +404,15 @@ def _check_trace_format(path: str | None) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _write_report(algorithm_name: str, diagnostics: list[dict[str, Any]]) -> str:
-    """Serialize diagnostics to a JSON file in the temp artifacts directory.
-
-    Args:
-        algorithm_name: Used as the report filename stem.
-        diagnostics: List of check result dicts.
+def _write_report(root: Path, diagnostics: list[dict[str, Any]]) -> str:
+    """Write the validation_report artifact into the invocation's owned root.
 
     Returns:
-        Absolute path to the written JSON report as a string.
+        Absolute path to the written file as a string.
     """
-    tmp_dir = Path(tempfile.gettempdir()) / "apprentice_artifacts"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    dest = tmp_dir / f"{algorithm_name}_validation_report.json"
-    dest.write_text(
-        json.dumps({"diagnostics": diagnostics}, indent=2),
-        encoding="utf-8",
+    return str(
+        write_role(root, "validation_report", json.dumps({"diagnostics": diagnostics}, indent=2))
     )
-    return str(dest)
 
 
 # ---------------------------------------------------------------------------

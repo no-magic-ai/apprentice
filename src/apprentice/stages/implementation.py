@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import ast
 import sys
-import tempfile
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from apprentice.core.artifacts import require_owned_root, write_role
+
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from apprentice.models.budget import CostEstimate
     from apprentice.models.work_item import PipelineContext, StageResult, WorkItem
 
@@ -71,6 +73,7 @@ class ImplementationStage:
         """
         from apprentice.models.work_item import StageResult
 
+        root = require_owned_root(context.artifact_root)
         references = self._load_references(context)
         prompt = self._build_prompt(work_item, references)
         completion = self._generate(prompt, context)
@@ -88,7 +91,7 @@ class ImplementationStage:
                 }
             )
 
-        artifact_path = self._write_artifact(work_item.algorithm_name, code)
+        artifact_path = self._write_artifact(root, code)
         total_tokens = completion.input_tokens + completion.output_tokens
         cost = (
             completion.input_tokens * _INPUT_RATE_USD + completion.output_tokens * _OUTPUT_RATE_USD
@@ -175,21 +178,13 @@ class ImplementationStage:
             "No provider configured. Set context.config['provider'] to a ProviderInterface instance."
         )
 
-    def _write_artifact(self, algorithm_name: str, code: str) -> str:
-        """Write generated code to a temp file and return its path string.
-
-        Args:
-            algorithm_name: Used as the filename stem.
-            code: Python source to persist.
+    def _write_artifact(self, root: Path, code: str) -> str:
+        """Write the implementation artifact into the invocation's owned root.
 
         Returns:
             Absolute path to the written file as a string.
         """
-        tmp_dir = Path(tempfile.gettempdir()) / "apprentice_artifacts"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        dest = tmp_dir / f"{algorithm_name}.py"
-        dest.write_text(code, encoding="utf-8")
-        return str(dest)
+        return str(write_role(root, "implementation", code))
 
 
 # ---------------------------------------------------------------------------

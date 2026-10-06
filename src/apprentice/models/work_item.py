@@ -149,13 +149,20 @@ class GateResult:
 
 @dataclass
 class PipelineContext:
-    """Carries configuration and state through the pipeline."""
+    """Carries configuration and state through the pipeline.
+
+    `artifact_root` is the exclusive directory one pipeline invocation writes
+    its artifacts into, allocated by `SessionStore.allocate_work_root()`.
+    Stages refuse to run without it; it is storage isolation only, not
+    execution containment or an approval record.
+    """
 
     config: dict[str, Any] = field(default_factory=dict)
     budget_remaining_tokens: int = 0
     budget_remaining_usd: float = 0.0
     prompt_registry_path: str = ""
     convention_schema_path: str = ""
+    artifact_root: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -164,6 +171,7 @@ class PipelineContext:
             "budget_remaining_usd": self.budget_remaining_usd,
             "prompt_registry_path": self.prompt_registry_path,
             "convention_schema_path": self.convention_schema_path,
+            "artifact_root": self.artifact_root,
         }
 
     @classmethod
@@ -174,4 +182,5 @@ class PipelineContext:
             budget_remaining_usd=data.get("budget_remaining_usd", 0.0),
             prompt_registry_path=data.get("prompt_registry_path", ""),
             convention_schema_path=data.get("convention_schema_path", ""),
+            artifact_root=data.get("artifact_root", ""),
         )

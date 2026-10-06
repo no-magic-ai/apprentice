@@ -147,7 +147,9 @@ class TestPipelineContextSerialization:
         ctx = PipelineContext(
             config={"key": "value"},
             budget_remaining_tokens=10000,
+            artifact_root="/owned/root",
         )
         data = ctx.to_dict()
         restored = PipelineContext.from_dict(data)
         assert restored.budget_remaining_tokens == 10000
+        assert restored.artifact_root == "/owned/root"

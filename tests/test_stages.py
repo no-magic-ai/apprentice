@@ -16,6 +16,8 @@ from apprentice.stages.visualization import VisualizationStage, _to_pascal_case
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from apprentice.core.session_store import SessionStore
+
 
 class TestInstrumentationStage:
     def test_name(self) -> None:
@@ -27,11 +29,14 @@ class TestInstrumentationStage:
         est = stage.estimate_cost(item)
         assert est.estimated_input_tokens > 0
 
-    def test_execute_requires_provider(self) -> None:
+    def test_execute_requires_provider(self, store: SessionStore) -> None:
         stage = InstrumentationStage()
         item = WorkItem(id="t", algorithm_name="test", tier=1)
-        ctx = PipelineContext(config={"artifacts": {"implementation": "/nonexistent"}})
-        with pytest.raises(RuntimeError, match="[Nn]o provider"):
+        ctx = PipelineContext(
+            config={"artifacts": {"implementation": "/nonexistent"}},
+            artifact_root=str(store.allocate_work_root()),
+        )
+        with pytest.raises(RuntimeError, match=r"[Nn]o provider"):
             stage.execute(item, ctx)
 
 
@@ -45,11 +50,14 @@ class TestAssessmentStage:
         est = stage.estimate_cost(item)
         assert est.estimated_input_tokens > 0
 
-    def test_execute_requires_provider(self) -> None:
+    def test_execute_requires_provider(self, store: SessionStore) -> None:
         stage = AssessmentStage()
         item = WorkItem(id="t", algorithm_name="test", tier=1)
-        ctx = PipelineContext(config={"artifacts": {"implementation": "/nonexistent"}})
-        with pytest.raises(RuntimeError, match="[Nn]o provider"):
+        ctx = PipelineContext(
+            config={"artifacts": {"implementation": "/nonexistent"}},
+            artifact_root=str(store.allocate_work_root()),
+        )
+        with pytest.raises(RuntimeError, match=r"[Nn]o provider"):
             stage.execute(item, ctx)
 
 
@@ -85,11 +93,14 @@ class TestVisualizationStage:
         est = stage.estimate_cost(item)
         assert est.estimated_input_tokens > 0
 
-    def test_execute_requires_provider(self) -> None:
+    def test_execute_requires_provider(self, store: SessionStore) -> None:
         stage = VisualizationStage()
         item = WorkItem(id="t", algorithm_name="test", tier=1)
-        ctx = PipelineContext(config={"artifacts": {"implementation": "/nonexistent"}})
-        with pytest.raises(RuntimeError, match="[Nn]o provider"):
+        ctx = PipelineContext(
+            config={"artifacts": {"implementation": "/nonexistent"}},
+            artifact_root=str(store.allocate_work_root()),
+        )
+        with pytest.raises(RuntimeError, match=r"[Nn]o provider"):
             stage.execute(item, ctx)
 
 
@@ -114,7 +125,7 @@ class TestValidationStage:
         est = stage.estimate_cost(item)
         assert est.estimated_cost_usd == 0.0
 
-    def test_validates_good_implementation(self, tmp_path: Path) -> None:
+    def test_validates_good_implementation(self, store: SessionStore, tmp_path: Path) -> None:
         impl = tmp_path / "quicksort.py"
         impl.write_text(
             textwrap.dedent('''\
@@ -142,7 +153,10 @@ class TestValidationStage:
 
         stage = ValidationStage()
         item = WorkItem(id="t", algorithm_name="quicksort", tier=2)
-        ctx = PipelineContext(config={"artifacts": {"implementation": str(impl)}})
+        ctx = PipelineContext(
+            config={"artifacts": {"implementation": str(impl)}},
+            artifact_root=str(store.allocate_work_root()),
+        )
         result = stage.execute(item, ctx)
         assert result.tokens_used == 0
         # At least correctness and complexity checks should pass
