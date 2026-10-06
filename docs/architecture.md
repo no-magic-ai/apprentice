@@ -38,6 +38,8 @@ Each `GateAgent` computes one verdict entry (gate, stage, verdict, whether the g
 
 The CLI runner catches only that error, reads the stored session back from the same session service and attaches it. `build`, `retry` and `scripts/integration_test.py` then record the run once as `failed` with that state, the tracker's budget summary, the elapsed time and an error naming the gate; the work-root files stay and nothing is sealed, so the run cannot be approved or submitted. Other exceptions are recorded as before. With an empty draft the correctness gate fails first, so such a run also ends `failed` with the gate's diagnostics.
 
+The same recorded verdicts decide whether a run can be sealed and published. `complete_run` refuses to seal a budget summary that holds a blocking FAIL, and `approve` and `submit` refuse a completed run whose `budget_summary.gate_verdicts` include one (runs sealed before the halt existed). Verdicts recorded without the `blocking` flag come from the four pipeline gates, which all block; WARN and non-blocking FAIL verdicts do not.
+
 `wire_agent_callbacks` replaces `before_agent_callback`/`after_agent_callback` on every agent of the assembled pipeline, so the drafter's validation callback, the implementation loop's exit check and the review loop's validation callback do not run there. Those callbacks are exercised directly in tests.
 
 ### Packaging
@@ -84,10 +86,6 @@ Budget is configured in `apprentice.toml` under `[budget]`:
 - Agent: percentage allocation (implementation 40%, tool agents 15% each, review 15%)
 
 Only the cycle token/cost limits are consumed: the pipeline's shared `BudgetTracker` is created from them (`core/orchestrator.py`). When the tracker is exhausted, `before_agent_budget_check` logs a warning and still dispatches the agent, so the limit is observed, not enforced. The monthly, per-stage, per-agent-call and percentage-allocation settings, `[rate_limits]` and `[circuit_breaker]` are parsed and shown by `apprentice config` / `status` but not enforced. The enforced cap is the hard-coded ADK `RunConfig(max_llm_calls=...)` per run in `cli.py`.
-
-## Gate Outcomes
-
-`GateAgent` records every gate verdict, with whether the gate is blocking, through `BudgetTracker` into the run record's `budget_summary.gate_verdicts`. `build`, `retry` and the integration script finish a run through `SessionStore.finish_run`: a run with no generated code, or with a FAIL from a blocking gate, is recorded as `failed` with the gate named in its error, keeps its session state, gate diagnostics and work-root files, and is never sealed. `approve` and `submit` also refuse a completed run whose recorded verdicts include a blocking FAIL (runs sealed before this check existed); verdicts recorded without the `blocking` flag come from the four pipeline gates, which are all blocking. WARN verdicts do not block.
 
 ## Session Persistence
 
