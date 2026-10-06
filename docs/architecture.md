@@ -33,11 +33,19 @@ Three agents run concurrently:
 
 The reviewer runs consistency and schema compliance validators across all artifacts. Exits on pass or after `max_iterations` (default 2) rounds.
 
+### Gate Verdicts
+
+Each `GateAgent` computes one verdict entry (gate, stage, verdict, whether the gate blocks, diagnostics). It records the entry in the pipeline's `BudgetTracker` and yields it as an `EventActions.state_delta` appended to `gate_verdicts`, so the session service stores it. PASS, WARN and a FAIL from a non-blocking gate continue. A FAIL from a blocking gate, including a gate that raised, then raises `BlockingGateError`; the error propagates through `SequentialAgent` and the Runner, so no later agent runs. (ADK copies each child's invocation context, so setting a flag on it would not stop the parent.)
+
+The CLI runner catches only that error, reads the stored session back from the same session service and attaches it. `build`, `retry` and `scripts/integration_test.py` then record the run once as `failed` with that state, the tracker's budget summary, the elapsed time and an error naming the gate; the work-root files stay and nothing is sealed. Other exceptions are recorded as before. With an empty draft the correctness gate fails first, so such a run also ends `failed` with the gate's diagnostics.
+
+`wire_agent_callbacks` replaces `before_agent_callback`/`after_agent_callback` on every agent of the assembled pipeline, so the drafter's validation callback, the implementation loop's exit check and the review loop's validation callback do not run there; only the publisher's context callback is composed after that wiring. Those callbacks are exercised directly in tests.
+
 ### Packaging
 
 Only runs on `apprentice submit`. Creates coordinated PRs in both `no-magic` and `no-magic-viz` repos with proper file placement and cross-references.
 
-`submit` requires a human approval recorded with `apprentice approve <run-id>`, which verifies the run's sealed bundle (see [Run-Owned Artifacts](#run-owned-artifacts)) and binds the run identity and manifest digest. `submit` then re-runs the pipeline with packaging into a fresh run-owned root, and the human-review gate (`gates/review.py`) blocks packaging unless every regenerated artifact hash matches the approved ones. The approved bytes themselves are not what gets packaged; binding submission to the exact approved bytes is open work.
+`submit` requires a human approval recorded with `apprentice approve <run-id>`, which verifies the run's sealed bundle (see [Run-Owned Artifacts](#run-owned-artifacts)) and binds the run identity and manifest digest. `submit` then re-runs the pipeline with packaging into a fresh run-owned root. The human-review gate (`gates/review.py`) compares every regenerated role with the approved hashes; a changed, added or missing role is a blocking FAIL, which stops the pipeline before the packaging agent (see [Gate Verdicts](#gate-verdicts)), and `submit` exits 1 with the gate's diagnostics while the approved run record and sealed bundle stay unchanged. When every role matches, the model-driven packaging agent runs with the regenerated role paths and the destination name and tier directory seeded from the fresh root (roles that were not regenerated are empty). That agent holds clone, place, push and PR tools and uses the operator's ambient `git`/`gh` credentials. The approved bytes themselves are not what gets packaged; binding submission to the exact approved bytes is open work.
 
 Packaging does not yet produce what released no-magic v3 requires beyond those two repos: a `no-magic-papers` card whose `implementations[]` references the script, and an explicit `SCRIPT_TO_PAPER` entry in `no-magic/scripts/generate_catalog.py`. The M1 catalog extension to that generator defines an additional per-script `SCRIPT_CONTRACTS` record (teaching kind, data source, adaptation note) that released v3 does not contain; when the target no-magic generator revision defines `SCRIPT_CONTRACTS`, packaging must populate it as well.
 
@@ -94,7 +102,7 @@ Run IDs are `<algorithm>-<UTC second>-<uuid>`, created exclusively, so two runs 
 ~/.apprentice/sessions/scratch/<uuid>/         exclusive roots for work without a run record
 ```
 
-Every writer (`GateAgent`, the drafter and review callbacks, and the legacy `stages/*`) uses the shared fixed role filenames in `core/artifacts.py` (`implementation.py`, `instrumented.py`, `scene.py`, `cards.csv`, `validation_report.json`, `discovery.json`) and refuses a missing or symlinked root and symlinked or multiply-linked files. No path is derived from the algorithm name, the current directory or a temporary directory.
+Every writer (`GateAgent`, the drafter and review callbacks — which do not run in the assembled pipeline, see [Gate Verdicts](#gate-verdicts) — and the legacy `stages/*`) uses the shared fixed role filenames in `core/artifacts.py` (`implementation.py`, `instrumented.py`, `scene.py`, `cards.csv`, `validation_report.json`, `discovery.json`) and refuses a missing or symlinked root and symlinked or multiply-linked files. No path is derived from the algorithm name, the current directory or a temporary directory.
 
 Completing a run seals its final artifacts into `bundle/` with a `manifest.json`: canonical UTF-8 JSON (sorted keys, fixed separators) with the run ID, algorithm, tier and, per artifact, its role, file name, size, SHA-256 and repository destination (`null` when the role is kept but not promoted). The manifest digest is the SHA-256 of that JSON without its own `manifest_sha256` field. `preview` and `approve` reload the bundle and reject a malformed or non-canonical manifest, changed identity or destinations, added or removed files, symlinks and any byte change. A run recorded before sealed bundles existed has no bundle; it fails with an instruction to rebuild rather than being regenerated.
 

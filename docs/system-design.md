@@ -572,7 +572,7 @@ stateDiagram-v2
 
 ## 8. User Workflow — Assisted Mode (v1)
 
-Current CLI flow (0.4.0): `build` runs the pipeline through review and seals the run's artifacts into an immutable run-owned bundle; `preview` verifies and shows that bundle; `apprentice approve <run-id>` binds a human approval to the run identity and bundle manifest digest; `submit <algorithm> --run-id <run-id>` re-runs the pipeline with packaging into a fresh run-owned root, and the human-review gate blocks packaging unless every regenerated artifact hash matches the approved ones. The diagram below predates the approval step.
+Current CLI flow (0.4.0): `build` runs the pipeline through review and seals the run's artifacts into an immutable run-owned bundle; `preview` verifies and shows that bundle; `apprentice approve <run-id>` binds a human approval to the run identity and bundle manifest digest; `submit <algorithm> --run-id <run-id>` re-runs the pipeline with packaging into a fresh run-owned root, and the human-review gate stops the pipeline before packaging unless every regenerated artifact hash matches the approved ones (`submit` then exits 1 with the gate's diagnostics). The diagram below predates the approval step.
 
 ```mermaid
 sequenceDiagram
