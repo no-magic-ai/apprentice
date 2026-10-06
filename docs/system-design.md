@@ -26,7 +26,7 @@ no-magic's generated `docs/catalog.json` lists 48 scripts across four tiers (45 
 | `no-magic-ai/no-magic` | Tier README update (add to algorithm table) | `01-foundations/README.md` |
 | `no-magic-ai/no-magic` | Root README update (add GIF preview card) | `README.md` |
 | `no-magic-ai/no-magic` | Learning path update (add to relevant tracks) | `LEARNING_PATH.md` |
-| `no-magic-ai/no-magic` | Catalog record: `SCRIPT_TO_PAPER` (paper slug) in `scripts/generate_catalog.py`, then regenerated `docs/catalog.json` (required from no-magic v3.0). A pending, unmerged catalog change proposes an additional `SCRIPT_CONTRACTS` record (teaching kind, data source, adaptation note); it becomes required only if merged | `scripts/generate_catalog.py` |
+| `no-magic-ai/no-magic` | Catalog record: `SCRIPT_TO_PAPER` (paper slug) in `scripts/generate_catalog.py`, then regenerated `docs/catalog.json` (required from no-magic v3.0). When the target generator revision defines `SCRIPT_CONTRACTS` (the M1 catalog extension: teaching kind, data source, adaptation note), that record is required too; released v3 does not define it | `scripts/generate_catalog.py` |
 | `no-magic-ai/no-magic-papers` | Paper card whose `implementations[]` references the script (required from no-magic v3.0) | `papers/lstm.md` |
 
 Every new algorithm requires producing artifacts across **3 repositories** (`no-magic`, `no-magic-viz` and, from no-magic v3.0, `no-magic-papers`), maintaining consistency with existing conventions, and validating correctness. The current packaging agent covers `no-magic` and `no-magic-viz` only. This multi-repo coordination is the bottleneck to catalog growth.
@@ -627,14 +627,9 @@ apprentice dev [--port N]                               # ADK dev UI
 
 ## 9. Configuration — `apprentice.toml`
 
-```toml
-[provider]
-backend = "anthropic"
-model = "anthropic/claude-sonnet-4-20250514"
-fallback_model = "anthropic/claude-haiku-4-5-20251001"
-fallback_trigger = "budget_warning"
-local_api_base = ""                            # Set for ollama/llama.cpp
+The shipped `config/apprentice.toml`, which `core/config.py` parses; every section below is required. `fallback_model` is parsed and stored but no fallback switching is implemented. Section 7 lists which budget, rate-limit and circuit-breaker settings are enforced today.
 
+```toml
 [budget.global]
 monthly_token_ceiling = 2_000_000
 monthly_cost_ceiling_usd = 50.0
@@ -644,16 +639,8 @@ max_tokens_per_cycle = 100_000
 max_cost_per_cycle_usd = 5.0
 max_algorithms_per_cycle = 3
 
-[budget.agent]
-max_tokens_per_agent_call = 20_000
-implementation_budget_pct = 40
-tool_agent_budget_pct = 15
-review_budget_pct = 15
-
-[agents]
-max_implementation_retries = 3
-max_review_rounds = 2
-max_tool_agent_retries = 1
+[budget.stage]
+max_tokens_per_stage = 20_000
 
 [rate_limits]
 max_prs_per_day = 2
@@ -663,10 +650,32 @@ cooldown_hours = 4
 max_files_per_pr = 10
 max_lines_per_pr = 2000
 
+[budget.agent]
+max_tokens_per_agent_call = 20_000
+implementation_budget_pct = 40
+tool_agent_budget_pct = 15
+review_budget_pct = 15
+
+[gates]
+max_lint_retries = 2
+max_correctness_retries = 1
+max_review_rounds = 2
+
+[agents]
+max_implementation_retries = 3
+max_review_rounds = 2
+max_tool_agent_retries = 1
+
 [circuit_breaker]
 failure_threshold = 3
 half_open_probe_after_minutes = 60
 max_open_cycles_before_manual_reset = 3
+
+[provider]
+backend = "openai"
+model = "openai/gpt-5.4"
+fallback_model = "openai/gpt-5.4-mini"
+local_api_base = ""
 
 [observability]
 log_level = "INFO"
