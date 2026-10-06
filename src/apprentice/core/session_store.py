@@ -32,6 +32,7 @@ from apprentice.core.artifacts import (
 )
 
 _DEFAULT_STORE_DIR = Path.home() / ".apprentice" / "sessions"
+_FAIL = "fail"
 
 _RUN_ID = re.compile(r"[a-z][a-z0-9_]{0,63}-\d{8}T\d{6}Z-[0-9a-f]{32}")
 # Records written before run IDs carried a UUID: "<algorithm>-<UTC second>".
@@ -112,6 +113,30 @@ class RunRecord:
         )
 
 
+def blocking_gate_failures(budget_summary: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the recorded gate verdicts that failed a blocking gate.
+
+    Verdicts are those `GateAgent` records through `BudgetTracker`. Entries
+    written before the `blocking` flag was recorded came from the four
+    pipeline gates, which are all blocking, so a missing flag counts as
+    blocking — the same default `GateAgent` applies to a gate without one.
+    WARN and PASS verdicts never block. A live blocking FAIL already halts
+    generation with `BlockingGateError`; this check keeps such a summary from
+    being sealed and refuses completed records sealed before that halt existed.
+    """
+    return [
+        verdict
+        for verdict in budget_summary.get("gate_verdicts", [])
+        if verdict.get("verdict") == _FAIL and verdict.get("blocking", True)
+    ]
+
+
+def describe_gate_failures(failures: list[dict[str, Any]]) -> str:
+    """Return a one-line description of blocking gate failures."""
+    names = ", ".join(f"{f['gate_name']} after {f['after_stage']}" for f in failures)
+    return f"blocking gate failed: {names}"
+
+
 class SessionStore:
     """Persists run records and allocates the artifact roots each run owns."""
 
@@ -165,7 +190,16 @@ class SessionStore:
         budget_summary: dict[str, Any],
         elapsed: float,
     ) -> RunRecord:
-        """Seal the run's final artifacts into its bundle and mark it completed."""
+        """Seal the run's final artifacts into its bundle and mark it completed.
+
+        Raises:
+            ArtifactError: If a blocking gate failed; such a run is never sealed.
+        """
+        failures = blocking_gate_failures(budget_summary)
+        if failures:
+            raise ArtifactError(
+                f"run {record.run_id} cannot be sealed: {describe_gate_failures(failures)}"
+            )
         record.manifest_sha256 = seal_bundle(
             self.bundle_dir(record.run_id),
             run_id=record.run_id,

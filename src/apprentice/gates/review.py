@@ -5,12 +5,15 @@ and the digest of the run's sealed bundle manifest. Before packaging touches
 any repository, `submit` passes through this gate, which loads the sealed
 bundle once, verifies every byte against its manifest, and requires the
 approval, the run record, the bundle and the operator's requested algorithm
-and tier to agree. Packaging then receives exactly the bytes verified here.
+and tier to agree. A run whose build recorded a failed blocking gate is
+never reviewable. Packaging then receives exactly the bytes verified here.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+
+from apprentice.core.session_store import blocking_gate_failures, describe_gate_failures
 
 if TYPE_CHECKING:
     from apprentice.core.artifacts import BundleSnapshot
@@ -29,6 +32,33 @@ class ApprovalError(Exception):
         self.remediation = remediation
 
 
+def require_reviewable_snapshot(store: SessionStore, record: RunRecord) -> BundleSnapshot:
+    """Return the verified sealed bundle of a run that may be approved or submitted.
+
+    Checked in this order so each failure names the step that can fix it: the
+    run must be completed; its sealed bundle must exist and verify (a run from
+    before sealed bundles gets the rebuild instruction); and no blocking gate
+    may have failed during its build (runs sealed before that refusal existed
+    are caught here).
+
+    Raises:
+        ApprovalError: If the run is not completed or a blocking gate failed.
+        ArtifactError: If the sealed bundle is missing or fails verification.
+    """
+    rebuild = f"apprentice build {record.algorithm_name} --tier {record.tier}"
+    if record.status != "completed":
+        raise ApprovalError(f"run {record.run_id} is {record.status}, not completed", rebuild)
+    snapshot = store.load_bundle(record)
+    failures = blocking_gate_failures(record.budget_summary)
+    if failures:
+        raise ApprovalError(
+            f"run {record.run_id} cannot be approved or submitted: "
+            f"{describe_gate_failures(failures)}",
+            rebuild,
+        )
+    return snapshot
+
+
 def require_approved_snapshot(
     store: SessionStore, record: RunRecord, *, algorithm: str, tier: int | None
 ) -> BundleSnapshot:
@@ -41,13 +71,22 @@ def require_approved_snapshot(
         tier: Tier the operator asked to submit, or None to accept the approved tier.
 
     Raises:
-        ApprovalError: If the run is not completed, has no well-formed
-            approval, or the approval, run, bundle and requested identity disagree.
+        ApprovalError: If the run is not reviewable (see
+            `require_reviewable_snapshot`), has no well-formed approval, or the
+            approval, run, bundle and requested identity disagree.
         ArtifactError: If the sealed bundle is missing or fails verification.
     """
-    rebuild = f"apprentice build {record.algorithm_name} --tier {record.tier}"
-    if record.status != "completed":
-        raise ApprovalError(f"run {record.run_id} is {record.status}, not completed", rebuild)
+    snapshot = require_reviewable_snapshot(store, record)
+    if algorithm != record.algorithm_name:
+        raise ApprovalError(
+            f"run {record.run_id} built {record.algorithm_name!r}, not {algorithm!r}",
+            f"apprentice submit {record.algorithm_name} --run-id {record.run_id}",
+        )
+    if tier is not None and tier != record.tier:
+        raise ApprovalError(
+            f"run {record.run_id} is tier {record.tier}, not tier {tier}",
+            f"apprentice submit {record.algorithm_name} --run-id {record.run_id}",
+        )
     approval = record.approval
     if not approval:
         raise ApprovalError(
@@ -59,18 +98,6 @@ def require_approved_snapshot(
             f"approval of run {record.run_id} is not bound to a sealed bundle manifest",
             f"apprentice approve {record.run_id}",
         )
-    if algorithm != record.algorithm_name:
-        raise ApprovalError(
-            f"run {record.run_id} built {record.algorithm_name!r}, not {algorithm!r}",
-            f"apprentice submit {record.algorithm_name} --run-id {record.run_id}",
-        )
-    if tier is not None and tier != record.tier:
-        raise ApprovalError(
-            f"run {record.run_id} is tier {record.tier}, not tier {tier}",
-            f"apprentice submit {record.algorithm_name} --run-id {record.run_id}",
-        )
-
-    snapshot = store.load_bundle(record)
     approved = (
         approval["run_id"],
         approval["algorithm"],

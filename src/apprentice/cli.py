@@ -330,6 +330,7 @@ def _cmd_approve(args: Any) -> int:
 
     from apprentice.core.artifacts import ArtifactError
     from apprentice.core.session_store import SessionStore
+    from apprentice.gates.review import ApprovalError, require_reviewable_snapshot
 
     store = SessionStore()
 
@@ -363,7 +364,10 @@ def _cmd_approve(args: Any) -> int:
         return 1
 
     try:
-        snapshot = store.load_bundle(record)
+        snapshot = require_reviewable_snapshot(store, record)
+    except ApprovalError as exc:
+        _print_json({"error": str(exc), "run_id": args.run_id, "remediation": exc.remediation})
+        return 1
     except ArtifactError as exc:
         _print_json({"error": str(exc), "run_id": args.run_id})
         return 1

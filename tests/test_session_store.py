@@ -443,3 +443,43 @@ class TestStoredRecordShape:
         with pytest.raises(ValueError, match="corrupt run record") as excinfo:
             store.list_runs()
         assert str(path) in str(excinfo.value)
+
+
+_CORRECTNESS_FAIL = {
+    "gate_name": "correctness",
+    "after_stage": "implementation",
+    "verdict": "fail",
+    "blocking": True,
+    "diagnostics": {"return_code": 1},
+}
+
+
+class TestSealRefusal:
+    def test_seal_boundary_refuses_blocking_gate_failure(self, tmp_path: Path) -> None:
+        store = SessionStore(store_dir=tmp_path)
+        record = store.create_run("selection", 2)
+        with pytest.raises(ArtifactError, match="cannot be sealed: blocking gate failed"):
+            store.complete_run(
+                record,
+                {"generated_code": "impl = 1\n"},
+                {"gate_verdicts": [_CORRECTNESS_FAIL]},
+                1.0,
+            )
+        assert not store.bundle_dir(record.run_id).exists()
+        assert store.load(record.run_id).status == "in_progress"
+
+    def test_warn_pass_and_non_blocking_failures_seal(self, tmp_path: Path) -> None:
+        store = SessionStore(store_dir=tmp_path)
+        record = store.create_run("selection", 2)
+        verdicts = [
+            {"gate_name": "lint", "after_stage": "implementation", "verdict": "warn", "blocking": True},
+            {**_CORRECTNESS_FAIL, "verdict": "pass"},
+            {**_CORRECTNESS_FAIL, "blocking": False},
+        ]
+
+        completed = store.complete_run(
+            record, {"generated_code": "impl = 1\n"}, {"gate_verdicts": verdicts}, 1.0
+        )
+
+        assert completed.status == "completed"
+        assert store.load_bundle(completed).artifacts[0].data == b"impl = 1\n"

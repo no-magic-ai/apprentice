@@ -625,3 +625,116 @@ class TestApprovalRepair:
         approval = SessionStore(store_dir=store_dir).load(rec.run_id).approval
         assert approval["run_id"] == rec.run_id
         assert approval["approved_by"] == "tester"
+
+
+def _legacy_record(store_dir: Path, run_id: str, approval: dict[str, Any]) -> RunRecord:
+    record = RunRecord(
+        run_id=run_id,
+        algorithm_name="selection",
+        tier=2,
+        status="completed",
+        session_state=dict(_STATE),
+        started_at="2025-01-01T00:00:00+00:00",
+        approval=approval,
+    )
+    return SessionStore(store_dir=store_dir).save(record)
+
+
+class TestSubmitRemediation:
+    @pytest.mark.parametrize(
+        "approval",
+        [
+            {
+                "approved_by": "tester",
+                "approved_at": "2025-01-01T00:00:00+00:00",
+                "run_id": "selection-20250101T000000Z",
+                "artifact_hashes": {"implementation": "0" * 64},
+            },
+            {},
+        ],
+    )
+    def test_run_without_sealed_bundle_gets_rebuild_instruction(
+        self,
+        store_dir: Path,
+        offline_remotes: OfflineRemotes,
+        capsys: pytest.CaptureFixture[str],
+        approval: dict[str, Any],
+    ) -> None:
+        record = _legacy_record(store_dir, "selection-20250101T000000Z", approval)
+
+        assert _cmd_submit(_SubmitArgs("selection", record.run_id)) == 1
+
+        out = json.loads(capsys.readouterr().out)
+        assert "apprentice build selection --tier 2" in out["error"]
+        assert "remediation" not in out
+        assert not (store_dir / "runs" / record.run_id).exists()
+        assert offline_remotes.gh_calls() == []
+
+    def test_sealed_unapproved_run_gets_approve_remediation(
+        self, store_dir: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        rec = _make_completed_run(store_dir)
+
+        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
+
+        assert (
+            json.loads(capsys.readouterr().out)["remediation"] == f"apprentice approve {rec.run_id}"
+        )
+
+
+def _sealed_with_verdicts(store_dir: Path, verdicts: list[dict[str, Any]]) -> RunRecord:
+    """A completed, sealed run whose build recorded these gate verdicts (pre-fix shape)."""
+    rec = _make_completed_run(store_dir)
+    rec.budget_summary = {"gate_verdicts": verdicts}
+    return SessionStore(store_dir=store_dir).save(rec)
+
+
+_FAIL = {"gate_name": "correctness", "after_stage": "implementation", "verdict": "fail"}
+
+
+class TestBlockingGateFailures:
+    @pytest.mark.parametrize("verdict", [dict(_FAIL), {**_FAIL, "blocking": True}])
+    def test_sealed_run_with_failed_blocking_gate_cannot_be_approved(
+        self, store_dir: Path, capsys: pytest.CaptureFixture[str], verdict: dict[str, Any]
+    ) -> None:
+        rec = _sealed_with_verdicts(store_dir, [verdict])
+
+        assert _cmd_approve(_ApproveArgs(rec.run_id)) == 1
+
+        out = json.loads(capsys.readouterr().out)
+        assert "blocking gate failed: correctness after implementation" in out["error"]
+        assert out["remediation"] == "apprentice build selection --tier 2"
+        assert SessionStore(store_dir=store_dir).load(rec.run_id).approval == {}
+
+    def test_previously_approved_failed_gate_run_is_not_submitted(
+        self,
+        store_dir: Path,
+        offline_remotes: OfflineRemotes,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rec = _approved_run(store_dir)
+        store = SessionStore(store_dir=store_dir)
+        record = store.load(rec.run_id)
+        record.budget_summary = {"gate_verdicts": [dict(_FAIL)]}
+        store.save(record)
+        capsys.readouterr()
+
+        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
+
+        assert "blocking gate failed" in json.loads(capsys.readouterr().out)["error"]
+        assert offline_remotes.branches("no-magic-ai/no-magic") == ["main"]
+        assert offline_remotes.gh_calls() == []
+        assert store.load(rec.run_id).submission == {}
+
+    @pytest.mark.parametrize(
+        "verdicts",
+        [
+            [{"gate_name": "lint", "after_stage": "implementation", "verdict": "warn"}],
+            [{**_FAIL, "blocking": False}],
+        ],
+    )
+    def test_warn_and_nonblocking_failures_do_not_block_approval(
+        self, store_dir: Path, verdicts: list[dict[str, Any]]
+    ) -> None:
+        rec = _sealed_with_verdicts(store_dir, verdicts)
+        assert _cmd_approve(_ApproveArgs(rec.run_id)) == 0
