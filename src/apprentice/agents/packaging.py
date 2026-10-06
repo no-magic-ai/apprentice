@@ -1,259 +1,261 @@
-"""Packaging Agent — ADK LlmAgent that creates coordinated PRs in multiple repos."""
+"""Deterministic packaging — promotes an approved bundle's exact bytes into pull requests.
+
+Nothing here resolves a model, runs the generation graph, drafts text or
+renders media. The input is a `BundleSnapshot` already verified against the
+approval; its captured bytes are written to their manifest destinations in
+fresh clones of the fixed supported repositories, committed with only those
+paths, checked against the commit tree, then pushed and opened as pull
+requests. Every repository is prepared and verified before anything is pushed.
+"""
 
 from __future__ import annotations
 
-import shutil
+import os
 import subprocess
-from pathlib import Path
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
-from google.adk.agents import LlmAgent
+from apprentice.core.artifacts import CORE_REPOSITORY, VIZ_REPOSITORY
 
 if TYPE_CHECKING:
-    from google.adk.models.lite_llm import LiteLlm
+    from apprentice.core.artifacts import BundleSnapshot
 
-_TIER_DIRS: dict[int, str] = {
-    1: "01-foundations",
-    2: "02-alignment",
-    3: "03-systems",
-    4: "04-agents",
+# Supported repositories in publication order; the core PR is referenced by the viz PR.
+_REPOSITORY_URLS: dict[str, str] = {
+    CORE_REPOSITORY: "https://github.com/no-magic-ai/no-magic.git",
+    VIZ_REPOSITORY: "https://github.com/no-magic-ai/no-magic-viz.git",
 }
 
-_INSTRUCTION = """\
-You are a release engineer for the no-magic educational project.
-Your task is to package algorithm artifacts into coordinated pull requests
-across the no-magic and no-magic-viz repositories.
 
-Artifact paths are available in session state:
-- Implementation: {implementation_path}
-- Instrumented: {instrumented_path}
-- Manim scene: {manim_scene_path}
-- Anki deck: {anki_deck_path}
-- Algorithm name: {algorithm_name}
-- Tier: {algorithm_tier}
+class PackagingError(Exception):
+    """Raised when packaging cannot promote the approved bytes exactly.
 
-Steps:
-1. Use place_file to copy the implementation to no-magic/{tier_dir}/micro{name}.py
-2. Use place_file to copy the manim scene to no-magic-viz/scenes/scene_micro{name}.py
-3. Use create_branch to create feature branches in both repos
-4. Use open_pr to create PRs in both repos with cross-references
-
-Naming convention: all files use the 'micro' prefix (e.g., microquicksort.py).
-"""
-
-
-def clone_repo(repo_url: str, target_dir: str) -> dict[str, Any]:
-    """Clone a GitHub repository to a local directory.
-
-    Args:
-        repo_url: GitHub repository URL (e.g. "https://github.com/no-magic-ai/no-magic").
-        target_dir: Local directory path to clone into.
-
-    Returns:
-        Dict with 'success' bool and 'path' to the cloned directory.
+    Attributes:
+        published: Pull requests already opened before the failure.
     """
-    target = Path(target_dir)
-    if target.exists():
-        return {"success": True, "path": str(target), "note": "Directory already exists"}
 
-    try:
-        subprocess.run(
-            ["git", "clone", "--depth", "1", repo_url, str(target)],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=True,
-        )
-        return {"success": True, "path": str(target)}
-    except subprocess.CalledProcessError as exc:
-        return {"success": False, "path": "", "error": exc.stderr[:300]}
-    except subprocess.TimeoutExpired:
-        return {"success": False, "path": "", "error": "Clone timed out after 60s"}
+    def __init__(self, message: str, published: list[dict[str, Any]] | None = None) -> None:
+        super().__init__(message)
+        self.published = published or []
 
 
-def create_branch(repo_dir: str, branch_name: str) -> dict[str, Any]:
-    """Create and checkout a new git branch in a repository.
+@dataclass(frozen=True)
+class RepositorySubmission:
+    """One repository's promoted branch, verified commit and opened pull request."""
 
-    Args:
-        repo_dir: Path to the local repository.
-        branch_name: Name of the branch to create (e.g. "feat/microquicksort").
+    repository: str
+    base: str
+    branch: str
+    commit: str
+    paths: tuple[str, ...]
+    pr_url: str = ""
 
-    Returns:
-        Dict with 'success' bool.
-    """
-    try:
-        subprocess.run(
-            ["git", "checkout", "-b", branch_name],
-            cwd=repo_dir,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=True,
-        )
-        return {"success": True, "branch": branch_name}
-    except subprocess.CalledProcessError as exc:
-        return {"success": False, "error": exc.stderr[:300]}
-
-
-def place_file(source_path: str, dest_path: str) -> dict[str, Any]:
-    """Copy a file to a destination path, creating directories as needed.
-
-    Args:
-        source_path: Absolute path to the source file.
-        dest_path: Absolute path to the destination file.
-
-    Returns:
-        Dict with 'success' bool and 'path' to the placed file.
-    """
-    src = Path(source_path)
-    dst = Path(dest_path)
-
-    if not src.exists():
-        return {"success": False, "error": f"Source file not found: {source_path}"}
-
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
-    return {"success": True, "path": str(dst)}
-
-
-def open_pr(
-    repo_dir: str,
-    title: str,
-    body: str,
-    base_branch: str = "main",
-) -> dict[str, Any]:
-    """Stage all changes, commit, push, and open a pull request via gh CLI.
-
-    Args:
-        repo_dir: Path to the local repository.
-        title: PR title.
-        body: PR body/description.
-        base_branch: Target branch for the PR.
-
-    Returns:
-        Dict with 'success' bool and 'pr_url' string.
-    """
-    try:
-        subprocess.run(
-            ["git", "add", "-A"],
-            cwd=repo_dir,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=True,
-        )
-        subprocess.run(
-            ["git", "commit", "-m", title],
-            cwd=repo_dir,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=True,
-        )
-        subprocess.run(
-            ["git", "push", "-u", "origin", "HEAD"],
-            cwd=repo_dir,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=True,
-        )
-
-        result = subprocess.run(
-            [
-                "gh",
-                "pr",
-                "create",
-                "--title",
-                title,
-                "--body",
-                body,
-                "--base",
-                base_branch,
-            ],
-            cwd=repo_dir,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=True,
-        )
-        pr_url = result.stdout.strip()
-        return {"success": True, "pr_url": pr_url}
-    except subprocess.CalledProcessError as exc:
-        return {"success": False, "pr_url": "", "error": exc.stderr[:300]}
-    except FileNotFoundError:
-        return {"success": False, "pr_url": "", "error": "gh CLI not found"}
-
-
-def render_preview(manim_scene_path: str, output_path: str) -> dict[str, Any]:
-    """Render a Manim scene to GIF for PR preview.
-
-    Args:
-        manim_scene_path: Path to the Manim scene Python file.
-        output_path: Path where the GIF should be saved.
-
-    Returns:
-        Dict with 'success' bool and 'path' to the rendered GIF.
-    """
-    try:
-        result = subprocess.run(
-            [
-                "manim",
-                "render",
-                "-ql",
-                "--format",
-                "gif",
-                "-o",
-                output_path,
-                manim_scene_path,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        if result.returncode == 0:
-            return {"success": True, "path": output_path}
-        return {"success": False, "path": "", "error": result.stderr[:300]}
-    except FileNotFoundError:
+    def to_dict(self) -> dict[str, Any]:
         return {
-            "success": False,
-            "path": "",
-            "error": "manim CLI not found — install manim for preview rendering",
+            "repository": self.repository,
+            "base": self.base,
+            "branch": self.branch,
+            "commit": self.commit,
+            "paths": list(self.paths),
+            "pr_url": self.pr_url,
         }
-    except subprocess.TimeoutExpired:
-        return {"success": False, "path": "", "error": "Render timed out after 120s"}
 
 
-def get_tier_directory(tier: int) -> dict[str, str]:
-    """Get the no-magic repository directory name for an algorithm tier.
+def _run(args: list[str], cwd: Path, timeout: int, env: dict[str, str] | None = None) -> bytes:
+    try:
+        result = subprocess.run(
+            args, cwd=cwd, capture_output=True, timeout=timeout, check=False, env=env
+        )
+    except FileNotFoundError as exc:
+        raise PackagingError(f"{args[0]} is not installed") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise PackagingError(f"{' '.join(args[:3])} timed out after {timeout}s") from exc
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", "replace").strip()
+        raise PackagingError(f"{' '.join(args[:3])} failed ({result.returncode}): {stderr}")
+    return result.stdout
 
-    Args:
-        tier: Algorithm tier (1-4).
 
-    Returns:
-        Dict with 'tier_dir' name.
-    """
-    tier_dir = _TIER_DIRS.get(tier, _TIER_DIRS[2])
-    return {"tier_dir": tier_dir}
+def _git(clone: Path, *args: str, timeout: int = 30, env: dict[str, str] | None = None) -> bytes:
+    return _run(["git", *args], clone, timeout, env)
 
 
-def build_packaging_agent(model: LiteLlm) -> LlmAgent:
-    """Build an ADK LlmAgent for multi-repo PR packaging.
+def _safe_destination(path: str) -> PurePosixPath:
+    relative = PurePosixPath(path)
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(part in ("", ".", "..", ".git") for part in relative.parts)
+    ):
+        raise PackagingError(f"unsupported destination path {path!r}")
+    return relative
 
-    Creates coordinated PRs in no-magic and no-magic-viz repositories,
-    placing artifacts in correct directories with micro prefix.
 
-    Args:
-        model: LiteLlm model instance.
+def _place(clone: Path, destination: PurePosixPath, data: bytes) -> None:
+    """Create `destination` inside `clone` without following or replacing anything."""
+    directory = clone
+    for part in destination.parts[:-1]:
+        directory = directory / part
+        if os.path.lexists(directory):
+            if directory.is_symlink() or not directory.is_dir():
+                raise PackagingError(f"destination parent {directory} is not a plain directory")
+        else:
+            directory.mkdir()
+    target = directory / destination.parts[-1]
+    if os.path.lexists(target):
+        raise PackagingError(f"destination {destination} already exists in the repository")
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(data)
 
-    Returns:
-        A configured LlmAgent with file management and git tools.
-    """
-    return LlmAgent(
-        name="packaging",
-        model=model,
-        instruction=_INSTRUCTION,
-        tools=[clone_repo, create_branch, place_file, open_pr, render_preview, get_tier_directory],
-        output_key="pr_urls",
-        description="Packages algorithm artifacts into coordinated PRs across repositories.",
+
+def _group_by_repository(snapshot: BundleSnapshot) -> dict[str, list[tuple[PurePosixPath, bytes]]]:
+    groups: dict[str, list[tuple[PurePosixPath, bytes]]] = {}
+    for artifact in snapshot.artifacts:
+        if artifact.destination is None:
+            continue
+        repository = artifact.destination["repository"]
+        if repository not in _REPOSITORY_URLS:
+            raise PackagingError(f"unsupported destination repository {repository!r}")
+        groups.setdefault(repository, []).append(
+            (_safe_destination(artifact.destination["path"]), artifact.data)
+        )
+    if CORE_REPOSITORY not in groups:
+        raise PackagingError("approved bundle promotes nothing to the core repository")
+    return {repo: groups[repo] for repo in _REPOSITORY_URLS if repo in groups}
+
+
+def _prepare(
+    repository: str,
+    files: list[tuple[PurePosixPath, bytes]],
+    snapshot: BundleSnapshot,
+    approval: dict[str, Any],
+    workspace: Path,
+) -> RepositorySubmission:
+    clone = workspace / repository.split("/")[1]
+    _run(["git", "clone", "--depth", "1", _REPOSITORY_URLS[repository], str(clone)], workspace, 120)
+    base = _git(clone, "symbolic-ref", "--short", "HEAD").decode().strip()
+    branch = f"apprentice/{snapshot.run_id}"
+    _git(clone, "checkout", "-b", branch)
+
+    paths = [str(destination) for destination, _ in files]
+    for destination, data in files:
+        _place(clone, destination, data)
+    _git(clone, "add", "--", *paths)
+    staged = _git(clone, "diff", "--cached", "--name-only", "-z").decode().split("\0")
+    if sorted(name for name in staged if name) != sorted(paths):
+        raise PackagingError(f"{repository} staged files {staged} differ from {paths}")
+
+    # Author and committer dates come from the approval, so the same approved
+    # bundle on the same base always produces the same commit.
+    commit_env = {
+        **os.environ,
+        "GIT_AUTHOR_DATE": approval["approved_at"],
+        "GIT_COMMITTER_DATE": approval["approved_at"],
+    }
+    message = (
+        f"Add micro{snapshot.algorithm}\n\n"
+        f"Apprentice-Run: {snapshot.run_id}\n"
+        f"Apprentice-Manifest: {snapshot.manifest_sha256}\n"
+        f"Approved-By: {approval['approved_by']}\n"
     )
+    _git(clone, "commit", "--no-verify", "-q", "-m", message, env=commit_env)
+    for destination, data in files:
+        if _git(clone, "cat-file", "blob", f"HEAD:{destination}") != data:
+            raise PackagingError(
+                f"{repository} commit content of {destination} differs from approval"
+            )
+    committed = _git(clone, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "HEAD")
+    if sorted(name for name in committed.decode().split("\0") if name) != sorted(paths):
+        raise PackagingError(f"{repository} commit touches files outside the approved destinations")
+    commit = _git(clone, "rev-parse", "HEAD").decode().strip()
+    return RepositorySubmission(repository, base, branch, commit, tuple(paths))
+
+
+def _pr_body(snapshot: BundleSnapshot, approval: dict[str, Any], companion: str) -> str:
+    lines = [
+        f"Promotes the approved apprentice bundle for `{snapshot.algorithm}` "
+        f"(tier {snapshot.tier}) byte-for-byte; nothing was regenerated.",
+        "",
+        f"- Run: `{snapshot.run_id}`",
+        f"- Manifest SHA-256: `{snapshot.manifest_sha256}`",
+        f"- Approved by `{approval['approved_by']}` at {approval['approved_at']}",
+    ]
+    for artifact in snapshot.artifacts:
+        if artifact.destination is not None:
+            lines.append(
+                f"- `{artifact.destination['repository']}:{artifact.destination['path']}` "
+                f"sha256 `{artifact.sha256}`"
+            )
+    if companion:
+        lines.append(f"- Companion PR: {companion}")
+    return "\n".join(lines)
+
+
+def submit_snapshot(
+    snapshot: BundleSnapshot, approval: dict[str, Any], workspace: Path
+) -> list[RepositorySubmission]:
+    """Promote a verified approved snapshot into one pull request per repository.
+
+    Args:
+        snapshot: Bundle bytes already verified against the approval.
+        approval: The run's approval (approver and time are recorded in commits).
+        workspace: Fresh exclusive directory for the repository clones.
+
+    Returns:
+        One submission per promoted repository, core repository first.
+
+    Raises:
+        PackagingError: If any clone, placement, commit check, push or pull
+            request fails; `published` lists pull requests opened before it.
+    """
+    prepared = [
+        _prepare(repository, files, snapshot, approval, workspace)
+        for repository, files in _group_by_repository(snapshot).items()
+    ]
+    for submission in prepared:
+        clone = workspace / submission.repository.split("/")[1]
+        _git(clone, "push", "origin", f"HEAD:refs/heads/{submission.branch}", timeout=120)
+
+    published: list[RepositorySubmission] = []
+    companion = ""
+    for submission in prepared:
+        clone = workspace / submission.repository.split("/")[1]
+        try:
+            pr_url = (
+                _run(
+                    [
+                        "gh",
+                        "pr",
+                        "create",
+                        "--repo",
+                        submission.repository,
+                        "--base",
+                        submission.base,
+                        "--head",
+                        submission.branch,
+                        "--title",
+                        f"Add micro{snapshot.algorithm}",
+                        "--body",
+                        _pr_body(snapshot, approval, companion),
+                    ],
+                    clone,
+                    60,
+                )
+                .decode()
+                .strip()
+            )
+        except PackagingError as exc:
+            raise PackagingError(str(exc), [p.to_dict() for p in published]) from exc
+        opened = RepositorySubmission(
+            submission.repository,
+            submission.base,
+            submission.branch,
+            submission.commit,
+            submission.paths,
+            pr_url,
+        )
+        published.append(opened)
+        companion = companion or pr_url
+    return published

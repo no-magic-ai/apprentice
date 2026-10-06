@@ -103,25 +103,14 @@ class TestBuildPipeline:
         pipeline = build_pipeline(_model(), _config(), scope)
         assert pipeline.name == "apprentice_pipeline"
 
-    def test_has_sub_agents_without_packaging(self, scope: RunScope) -> None:
-        pipeline = build_pipeline(_model(), _config(), scope, include_packaging=False)
-        # impl + 2 impl gates + parallel + 2 artifact gates + review = 7
-        assert len(pipeline.sub_agents) == 7
-
-    def test_has_sub_agents_with_packaging(self, scope: RunScope) -> None:
-        approval = {
-            "approved_by": "tester",
-            "approved_at": "2026-04-21T00:00:00+00:00",
-            "artifact_hashes": {},
-        }
-        pipeline = build_pipeline(
-            _model(), _config(), scope, include_packaging=True, approval=approval
-        )
-        # build path (7) + review gate + packaging = 9
-        assert len(pipeline.sub_agents) == 9
+    def test_pipeline_only_generates(self, scope: RunScope) -> None:
+        pipeline = build_pipeline(_model(), _config(), scope)
+        names = [a.name for a in pipeline.sub_agents]
+        assert names[-1] == "review_loop"
+        assert not any("packaging" in name or "review_after" in name for name in names)
 
     def test_gate_agents_inserted(self, scope: RunScope) -> None:
-        pipeline = build_pipeline(_model(), _config(), scope, include_packaging=False)
+        pipeline = build_pipeline(_model(), _config(), scope)
         gate_agents = [a for a in pipeline.sub_agents if isinstance(a, GateAgent)]
         gate_names = {g.gate.name for g in gate_agents}
         assert gate_names == {"correctness", "lint", "consistency", "schema_compliance"}

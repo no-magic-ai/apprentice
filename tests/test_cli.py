@@ -19,6 +19,7 @@ from apprentice.cli import (
     _run_pipeline,
     main,
 )
+from apprentice.core.artifacts import canonical_json, manifest_digest
 from apprentice.core.config import load_config
 from apprentice.core.session_store import RunRecord, SessionStore
 from apprentice.models.work_item import BlockingGateError
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from apprentice.core.artifacts import RunScope
+    from tests.conftest import OfflineRemotes
 
 
 def _last_json(capsys: pytest.CaptureFixture[str]) -> str:
@@ -68,11 +70,9 @@ class _PreviewArgs:
 
 
 class _SubmitArgs:
-    def __init__(self, algorithm: str, run_id: str | None, tier: int | None = None) -> None:
+    def __init__(self, algorithm: str, run_id: str, tier: int | None = None) -> None:
         self.algorithm = algorithm
         self.tier = tier
-        self.backend = None
-        self.model = None
         self.run_id = run_id
 
 
@@ -131,7 +131,14 @@ class TestApproveCommand:
         approval = SessionStore(store_dir=store_dir).load(rec.run_id).approval
         assert approval["manifest_sha256"] == rec.manifest_sha256
         assert approval["approved_by"] == "tester"
-        assert set(approval["artifact_hashes"]) == {"anki_deck", "implementation", "manim_scene"}
+        assert set(approval) == {
+            "run_id",
+            "algorithm",
+            "tier",
+            "manifest_sha256",
+            "approved_by",
+            "approved_at",
+        }
 
     def test_approve_rejects_tampered_bundle(
         self, store_dir: Path, capsys: pytest.CaptureFixture[str]
@@ -204,24 +211,159 @@ class TestPreviewCommand:
         assert "added=['extra.py']" in json.loads(capsys.readouterr().out)["error"]
 
 
-class TestSubmitGuard:
+def _approved_run(store_dir: Path) -> RunRecord:
+    rec = _make_completed_run(store_dir)
+    assert _cmd_approve(_ApproveArgs(rec.run_id)) == 0
+    return rec
+
+
+def _add_file(store_dir: Path, rec: RunRecord) -> None:
+    (SessionStore(store_dir=store_dir).bundle_dir(rec.run_id) / "extra.py").write_text("x = 1\n")
+
+
+def _remove_file(store_dir: Path, rec: RunRecord) -> None:
+    (SessionStore(store_dir=store_dir).bundle_dir(rec.run_id) / "cards.csv").unlink()
+
+
+def _change_bytes(store_dir: Path, rec: RunRecord) -> None:
+    _tamper(store_dir, rec.run_id, "implementation.py", b"print('tampered')\n")
+
+
+def _symlink_artifact(store_dir: Path, rec: RunRecord) -> None:
+    path = SessionStore(store_dir=store_dir).bundle_dir(rec.run_id) / "scene.py"
+    outside = store_dir.parent / "outside_scene.py"
+    outside.write_bytes(path.read_bytes())
+    path.unlink()
+    path.symlink_to(outside)
+
+
+def _approval_of_other_run(store_dir: Path, rec: RunRecord) -> None:
+    other = _approved_run(store_dir)
+    store = SessionStore(store_dir=store_dir)
+    record = store.load(rec.run_id)
+    record.approval = store.load(other.run_id).approval
+    store.save(record)
+
+
+def _retarget_destination(store_dir: Path, rec: RunRecord) -> None:
+    store = SessionStore(store_dir=store_dir)
+    manifest_path = store.bundle_dir(rec.run_id) / "manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    manifest["artifacts"][1]["destination"]["path"] = "01-foundations/microselection.py"
+    del manifest["manifest_sha256"]
+    manifest["manifest_sha256"] = manifest_digest(manifest)
+    manifest_path.chmod(0o644)
+    manifest_path.write_bytes(canonical_json(manifest))
+
+
+class TestSubmitCommand:
+    def test_submit_requires_run_id(self) -> None:
+        with pytest.raises(SystemExit, match="2"):
+            main(["submit", "selection"])
+
     def test_submit_blocks_without_approval(
         self, store_dir: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        _make_completed_run(store_dir)
+        rec = _make_completed_run(store_dir)
 
-        code = _cmd_submit(cfg=None, args=_SubmitArgs("selection", run_id=None))
-        assert code == 1
+        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
         out = json.loads(capsys.readouterr().out)
-        assert "apprentice approve" in out["remediation"]
+        assert out["remediation"] == f"apprentice approve {rec.run_id}"
 
-    def test_submit_requires_completed_run(
+    def test_submit_rejects_unknown_run(
         self, store_dir: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        code = _cmd_submit(cfg=None, args=_SubmitArgs("no_such_algo", run_id=None))
-        assert code == 1
+        assert _cmd_submit(_SubmitArgs("selection", f"selection-20260101T000000Z-{'0' * 32}")) == 1
+        assert "No run record found" in json.loads(capsys.readouterr().out)["error"]
+
+    def test_restarted_submit_promotes_approved_bytes_without_generation(
+        self,
+        store_dir: Path,
+        offline_remotes: OfflineRemotes,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rec = _approved_run(store_dir)
+        approved = json.loads(capsys.readouterr().out)
+
+        def _tripwire(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("submit reached model or generation dispatch")
+
+        monkeypatch.setattr("apprentice.providers.factory.create_model", _tripwire)
+        monkeypatch.setattr("apprentice.providers.factory.create_model_from_override", _tripwire)
+        monkeypatch.setattr("google.adk.runners.Runner.run_async", _tripwire)
+
+        assert _cmd_submit(_SubmitArgs("selection", rec.run_id, tier=2)) == 0
+
         out = json.loads(capsys.readouterr().out)
-        assert "No completed build" in out["error"]
+        assert out["manifest_sha256"] == approved["manifest_sha256"]
+        branch = f"apprentice/{rec.run_id}"
+        bundle = SessionStore(store_dir=store_dir).bundle_dir(rec.run_id)
+        assert (
+            offline_remotes.blob("no-magic-ai/no-magic", branch, "02-alignment/microselection.py")
+            == (bundle / "implementation.py").read_bytes()
+        )
+        assert (
+            offline_remotes.blob(
+                "no-magic-ai/no-magic-viz", branch, "scenes/scene_microselection.py"
+            )
+            == (bundle / "scene.py").read_bytes()
+        )
+        stored = SessionStore(store_dir=store_dir).load(rec.run_id).submission
+        assert [r["pr_url"] for r in stored["repositories"]] == [
+            r["pr_url"] for r in out["repositories"]
+        ]
+
+    def test_already_submitted_run_is_not_published_again(
+        self,
+        store_dir: Path,
+        offline_remotes: OfflineRemotes,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rec = _approved_run(store_dir)
+        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 0
+        calls = len(offline_remotes.gh_calls())
+
+        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
+        assert "already submitted" in capsys.readouterr().out
+        assert len(offline_remotes.gh_calls()) == calls
+
+    @pytest.mark.parametrize(
+        ("mutate", "args", "message"),
+        [
+            (_change_bytes, {}, "differ from its manifest"),
+            (_add_file, {}, "added=['extra.py']"),
+            (_remove_file, {}, "removed=['cards.csv']"),
+            (_symlink_artifact, {}, "refusing to follow symlink"),
+            (_approval_of_other_run, {}, "does not match its sealed bundle"),
+            (_retarget_destination, {}, "destination for implementation differs"),
+            (None, {"algorithm": "quicksort"}, "not 'quicksort'"),
+            (None, {"tier": 3}, "not tier 3"),
+        ],
+    )
+    def test_invalid_bundle_or_identity_fails_before_packaging(
+        self,
+        store_dir: Path,
+        offline_remotes: OfflineRemotes,
+        capsys: pytest.CaptureFixture[str],
+        mutate: Any,
+        args: dict[str, Any],
+        message: str,
+    ) -> None:
+        rec = _approved_run(store_dir)
+        if mutate is not None:
+            mutate(store_dir, rec)
+        capsys.readouterr()
+
+        submit_args = _SubmitArgs(args.get("algorithm", "selection"), rec.run_id, args.get("tier"))
+        assert _cmd_submit(submit_args) == 1
+
+        assert message in json.loads(capsys.readouterr().out)["error"]
+        assert not (store_dir / "scratch").exists()
+        assert offline_remotes.branches("no-magic-ai/no-magic") == ["main"]
+        assert offline_remotes.branches("no-magic-ai/no-magic-viz") == ["main"]
+        assert offline_remotes.gh_calls() == []
+        assert SessionStore(store_dir=store_dir).load(rec.run_id).submission == {}
 
 
 class _BuildArgs:
@@ -363,75 +505,6 @@ class TestRunnerStateCarrier:
         assert state["gate_verdicts"][-1] == excinfo.value.verdict
 
 
-def _seal_from_build(
-    store_dir: Path, monkeypatch: pytest.MonkeyPatch, outputs: dict[str, str], tier: int = 2
-) -> RunRecord:
-    _use_model(monkeypatch, outputs)
-    assert _cmd_build(load_config(None), _BuildArgs(tier=tier)) == 0
-    record = _only_record(store_dir)
-    assert _cmd_approve(_ApproveArgs(record.run_id)) == 0
-    return SessionStore(store_dir=store_dir).load(record.run_id)
-
-
-def _bundle_bytes(store_dir: Path, run_id: str) -> dict[str, tuple[bytes, int]]:
-    bundle = SessionStore(store_dir=store_dir).bundle_dir(run_id)
-    return {p.name: (p.read_bytes(), p.stat().st_mode) for p in sorted(bundle.iterdir())}
-
-
-class TestRootSubmitRegeneration:
-    @pytest.mark.parametrize(
-        ("regenerated", "diffs"),
-        [
-            (
-                dict(fixture_outputs("A"), drafter=fixture_outputs("B")["drafter"]),
-                {"implementation"},
-            ),
-            (fixture_outputs("B"), {"implementation", "instrumented", "manim_scene", "anki_deck"}),
-            (fixture_outputs("A", omit=("assessment",)), {"anki_deck"}),
-        ],
-    )
-    def test_mismatch_halts_before_the_publisher_and_leaves_approval_untouched(
-        self,
-        store_dir: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-        regenerated: dict[str, str],
-        diffs: set[str],
-    ) -> None:
-        approved = _seal_from_build(store_dir, monkeypatch, fixture_outputs("A"))
-        sealed = _bundle_bytes(store_dir, approved.run_id)
-        record_bytes = (store_dir / f"{approved.run_id}.json").read_bytes()
-        llm = _use_model(monkeypatch, regenerated)
-        capsys.readouterr()
-
-        assert _cmd_submit(load_config(None), _SubmitArgs("selection", approved.run_id)) == 1
-
-        out = json.loads(_last_json(capsys))
-        assert out["error"] == "blocking gate failed: review after review"
-        assert set(out["gate"]["diagnostics"]["diffs"]) == diffs
-        assert "packaging" not in llm.roles()
-        assert _bundle_bytes(store_dir, approved.run_id) == sealed
-        assert (store_dir / f"{approved.run_id}.json").read_bytes() == record_bytes
-
-    def test_identical_regeneration_reaches_the_publisher_with_fresh_paths(
-        self, store_dir: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        approved = _seal_from_build(store_dir, monkeypatch, fixture_outputs("A"))
-        llm = _use_model(monkeypatch, fixture_outputs("A"))
-
-        assert _cmd_submit(load_config(None), _SubmitArgs("selection", approved.run_id)) == 0
-
-        (instruction,) = [text for role, text in llm.requests if role == "packaging"]
-        store = SessionStore(store_dir=store_dir)
-        (fresh,) = list((store_dir / "scratch").iterdir())
-        assert f"Implementation: {fresh / 'implementation.py'}" in instruction
-        assert f"Anki deck: {fresh / 'cards.csv'}" in instruction
-        assert "no-magic/02-alignment/microselection.py" in instruction
-        assert "no-magic-viz/scenes/scene_microselection.py" in instruction
-        assert str(store.bundle_dir(approved.run_id)) not in instruction
-        assert "{" not in instruction
-
-
 def _tree(root: Path) -> dict[str, tuple[bytes | None, int]]:
     """Every path under `root` with its bytes (files) and mode."""
     return {
@@ -450,204 +523,17 @@ def _damage_record(store_dir: Path, run_id: str, mutate: Callable[[dict[str, Any
     path.write_text(json.dumps(data))
 
 
-class TestRootSubmitIdentity:
-    """Root submit publishes only the identity of the verified sealed bundle it was approved for."""
-
-    @pytest.mark.parametrize(
-        ("algorithm", "tier", "refusal"),
-        [
-            ("insertion", None, "requested algorithm/tier does not match the approved run"),
-            ("selection", 3, "requested algorithm/tier does not match the approved run"),
-        ],
-    )
-    def test_conflicting_request_is_refused_before_any_work(
-        self,
-        store_dir: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-        algorithm: str,
-        tier: int | None,
-        refusal: str,
-    ) -> None:
-        approved = _seal_from_build(store_dir, monkeypatch, fixture_outputs("A"))
-        self._assert_refused_before_any_work(
-            store_dir, monkeypatch, capsys, _SubmitArgs(algorithm, approved.run_id, tier), refusal
-        )
-
-    @pytest.mark.parametrize(
-        ("mutate", "refusal"),
-        [
-            (
-                lambda r: r["approval"].update(run_id="0" * 32),
-                "approval does not match the run's sealed bundle",
-            ),
-            (
-                lambda r: r["approval"].update(algorithm="insertion"),
-                "approval does not match the run's sealed bundle",
-            ),
-            (
-                lambda r: r["approval"].update(tier=3),
-                "approval does not match the run's sealed bundle",
-            ),
-            (
-                lambda r: r["approval"].update(tier="2"),
-                "approval does not match the run's sealed bundle",
-            ),
-            (
-                lambda r: r["approval"].update(manifest_sha256="0" * 64),
-                "approval does not match the run's sealed bundle",
-            ),
-            (
-                lambda r: r["approval"].pop("tier"),
-                "approval does not match the run's sealed bundle",
-            ),
-            (
-                lambda r: r["approval"].update(tier=2.0),
-                "approval does not match the run's sealed bundle",
-            ),
-            (
-                lambda r: r["approval"]["artifact_hashes"].update(implementation="0" * 64),
-                "approval does not match the run's sealed bundle",
-            ),
-            (
-                lambda r: r["approval"]["artifact_hashes"].pop("anki_deck"),
-                "approval does not match the run's sealed bundle",
-            ),
-            (
-                lambda r: r["approval"]["artifact_hashes"].update(extra="0" * 64),
-                "approval does not match the run's sealed bundle",
-            ),
-            (
-                lambda r: r["approval"].pop("artifact_hashes"),
-                "approval does not match the run's sealed bundle",
-            ),
-            (
-                lambda r: r["approval"].update(
-                    artifact_hashes=sorted(r["approval"]["artifact_hashes"].items())
-                ),
-                "approval does not match the run's sealed bundle",
-            ),
-            (
-                lambda r: r.update(approval=["approved"]),
-                "stored approval of this run is not an object",
-            ),
-            (
-                lambda r: r.update(approval="approved"),
-                "stored approval of this run is not an object",
-            ),
-            (lambda r: r.update(approval=5), "stored approval of this run is not an object"),
-            (lambda r: r.update(tier=2.0), "field 'tier' must be an integer"),
-            (lambda r: r.update(tier=True), "field 'tier' must be an integer"),
-            (lambda r: r.update(algorithm_name="insertion"), "bundle identity does not match"),
-            (lambda r: r.update(tier=3), "bundle identity does not match"),
-            (lambda r: r.update(run_id="0" * 32), "carries a different run ID"),
-        ],
-    )
-    def test_damaged_stored_approval_or_record_is_refused_before_any_work(
-        self,
-        store_dir: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-        mutate: Callable[[dict[str, Any]], None],
-        refusal: str,
-    ) -> None:
-        approved = _seal_from_build(store_dir, monkeypatch, fixture_outputs("A"))
-        _damage_record(store_dir, approved.run_id, mutate)
-        self._assert_refused_before_any_work(
-            store_dir, monkeypatch, capsys, _SubmitArgs("selection", approved.run_id), refusal
-        )
-
-    @staticmethod
-    def _assert_refused_before_any_work(
-        store_dir: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-        args: _SubmitArgs,
-        refusal: str,
-    ) -> None:
-        # The regeneration would match the approval, so only the refusal stops it.
-        llm = OfflineFixtureLlm(model="offline-fixture", outputs=fixture_outputs("A"))
-        resolved: list[object] = []
-
-        def resolve(cfg: object, submit_args: object) -> OfflineFixtureLlm:
-            resolved.append(submit_args)
-            return llm
-
-        monkeypatch.setattr("apprentice.cli._resolve_model", resolve)
-        before = _tree(store_dir)
-        capsys.readouterr()
-
-        assert _cmd_submit(load_config(None), args) == 1
-
-        assert refusal in json.loads(_last_json(capsys))["error"]
-        assert resolved == []
-        assert llm.requests == []
-        assert _tree(store_dir) == before
-
-    @pytest.mark.parametrize(
-        ("built_tier", "asserted_tier", "tier_dir"),
-        [(1, None, "01-foundations"), (3, None, "03-systems"), (3, 3, "03-systems")],
-    )
-    def test_publisher_receives_the_sealed_name_and_tier(
-        self,
-        store_dir: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-        built_tier: int,
-        asserted_tier: int | None,
-        tier_dir: str,
-    ) -> None:
-        approved = _seal_from_build(store_dir, monkeypatch, fixture_outputs("A"), tier=built_tier)
-        sealed = _bundle_bytes(store_dir, approved.run_id)
-        llm = _use_model(monkeypatch, fixture_outputs("A"))
-        capsys.readouterr()
-
-        args = _SubmitArgs("selection", approved.run_id, asserted_tier)
-        assert _cmd_submit(load_config(None), args) == 0
-
-        out = json.loads(_last_json(capsys))
-        assert (out["run_id"], out["algorithm"], out["tier"]) == (
-            approved.run_id,
-            "selection",
-            built_tier,
-        )
-        (instruction,) = [text for role, text in llm.requests if role == "packaging"]
-        assert f"- Tier: {built_tier}\n" in instruction
-        assert f"no-magic/{tier_dir}/microselection.py" in instruction
-        assert "no-magic-viz/scenes/scene_microselection.py" in instruction
-        assert "{" not in instruction
-        tier_prompts = [text for text in llm.user_texts if "(tier " in text]
-        assert tier_prompts
-        assert all(f"selection algorithm (tier {built_tier})" in text for text in tier_prompts)
-        assert _bundle_bytes(store_dir, approved.run_id) == sealed
-
-    def test_role_absent_from_the_approval_gives_the_publisher_an_empty_path(
-        self, store_dir: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        outputs = fixture_outputs("A", omit=("assessment",))
-        approved = _seal_from_build(store_dir, monkeypatch, outputs)
-        llm = _use_model(monkeypatch, outputs)
-
-        assert _cmd_submit(load_config(None), _SubmitArgs("selection", approved.run_id)) == 0
-
-        (instruction,) = [text for role, text in llm.requests if role == "packaging"]
-        (fresh,) = list((store_dir / "scratch").iterdir())
-        assert "- Anki deck: " in instruction.splitlines()
-        assert f"Implementation: {fresh / 'implementation.py'}" in instruction
-        assert not (fresh / "cards.csv").exists()
-
-
 class TestSealedTierType:
-    def test_float_tier_in_a_re_signed_bundle_bound_to_its_record_is_refused_before_any_work(
+    def test_float_tier_in_a_re_signed_bundle_bound_to_its_record_is_refused_before_packaging(
         self,
         store_dir: Path,
-        monkeypatch: pytest.MonkeyPatch,
+        offline_remotes: OfflineRemotes,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        from apprentice.core.artifacts import MANIFEST_FILENAME, canonical_json, manifest_digest
+        from apprentice.core.artifacts import MANIFEST_FILENAME
 
-        approved = _seal_from_build(store_dir, monkeypatch, fixture_outputs("A"))
-        path = SessionStore(store_dir=store_dir).bundle_dir(approved.run_id) / MANIFEST_FILENAME
+        rec = _approved_run(store_dir)
+        path = SessionStore(store_dir=store_dir).bundle_dir(rec.run_id) / MANIFEST_FILENAME
         path.chmod(0o644)
         manifest = json.loads(path.read_bytes())
         del manifest["manifest_sha256"]
@@ -659,14 +545,17 @@ class TestSealedTierType:
             record["manifest_sha256"] = digest
             record["approval"]["manifest_sha256"] = digest
 
-        _damage_record(store_dir, approved.run_id, rebind)
-        TestRootSubmitIdentity._assert_refused_before_any_work(
-            store_dir,
-            monkeypatch,
-            capsys,
-            _SubmitArgs("selection", approved.run_id),
-            "unsupported tier 2.0",
-        )
+        _damage_record(store_dir, rec.run_id, rebind)
+        before = _tree(store_dir)
+        capsys.readouterr()
+
+        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
+
+        assert "unsupported tier 2.0" in json.loads(_last_json(capsys))["error"]
+        assert _tree(store_dir) == before
+        assert offline_remotes.gh_calls() == []
+        assert offline_remotes.branches("no-magic-ai/no-magic") == ["main"]
+        assert offline_remotes.branches("no-magic-ai/no-magic-viz") == ["main"]
 
 
 def _store_with_a_corrupt_record(store_dir: Path) -> Path:
@@ -683,9 +572,8 @@ class TestCorruptRecordAtListingConsumers:
             lambda: main(["history"]),
             lambda: main(["metrics"]),
             lambda: _cmd_preview(_PreviewArgs()),
-            lambda: _cmd_submit(load_config(None), _SubmitArgs("selection", None)),
         ],
-        ids=["history", "metrics", "preview-default", "submit-latest"],
+        ids=["history", "metrics", "preview-default"],
     )
     def test_command_reports_the_corrupt_record_and_changes_nothing(
         self,

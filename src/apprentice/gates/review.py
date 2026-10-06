@@ -1,122 +1,86 @@
-"""Human review gate — blocks `submit` until an operator approves artifacts.
+"""Human review gate — the required check at the root of `submit`.
 
-Design (per issue #14):
-- After `build` produces artifacts, the run record carries `review_approval_required=True`.
-- `apprentice approve <run_id>` writes `review_approval` onto the run record,
-  including a per-artifact SHA-256 fingerprint.
-- This gate runs at the start of `submit` (before packaging) and FAILs when
-  either no approval exists or any artifact hash has changed since approval.
-
-The gate is pure; it reads approval metadata from the run record via the
-session-state key `review_approval` populated by the CLI before launching
-the submit pipeline. Any gate failure halts the pipeline before `open_pr`
-can run, so operators cannot accidentally publish unapproved artifacts.
+`apprentice approve <run_id>` records an approval bound to the run identity
+and the digest of the run's sealed bundle manifest. Before packaging touches
+any repository, `submit` passes through this gate, which loads the sealed
+bundle once, verifies every byte against its manifest, and requires the
+approval, the run record, the bundle and the operator's requested algorithm
+and tier to agree. Packaging then receives exactly the bytes verified here.
 """
 
 from __future__ import annotations
 
-import hashlib
-from pathlib import Path
-from typing import TYPE_CHECKING, Any
-
-from apprentice.models.work_item import GateResult, GateVerdict, WorkItem
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from apprentice.models.artifact import ArtifactBundle
+    from apprentice.core.artifacts import BundleSnapshot
+    from apprentice.core.session_store import RunRecord, SessionStore
+
+_APPROVAL_FIELDS = frozenset(
+    {"run_id", "algorithm", "tier", "manifest_sha256", "approved_by", "approved_at"}
+)
 
 
-def compute_artifact_hashes(bundle: ArtifactBundle) -> dict[str, str]:
-    """Return a dict of artifact_name -> sha256 hex digest for every present file."""
-    fields = {
-        "implementation": bundle.implementation_path,
-        "instrumented": bundle.instrumented_path,
-        "manim_scene": bundle.manim_scene_path,
-        "anki_deck": bundle.anki_deck_path,
-    }
-    hashes: dict[str, str] = {}
-    for name, path_str in fields.items():
-        if not path_str:
-            continue
-        path = Path(path_str)
-        if not path.exists():
-            continue
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        hashes[name] = digest
-    return hashes
+class ApprovalError(Exception):
+    """Raised when a run has no approval that authorizes submitting its bundle."""
+
+    def __init__(self, message: str, remediation: str) -> None:
+        super().__init__(message)
+        self.remediation = remediation
 
 
-class ReviewGate:
-    """Blocks `submit` unless a recorded approval matches current artifact hashes.
+def require_approved_snapshot(
+    store: SessionStore, record: RunRecord, *, algorithm: str, tier: int | None
+) -> BundleSnapshot:
+    """Return the verified sealed bundle that `record`'s approval authorizes.
 
-    Approval payload (written by `apprentice approve`):
-        {
-            "approved_by": "<gh_login>",
-            "approved_at": "<iso8601>",
-            "run_id": "<run_id>",
-            "artifact_hashes": {"implementation": "<sha256>", ...}
-        }
+    Args:
+        store: Store owning the run's sealed bundle.
+        record: Run record holding the approval.
+        algorithm: Algorithm the operator asked to submit.
+        tier: Tier the operator asked to submit, or None to accept the approved tier.
+
+    Raises:
+        ApprovalError: If the run is not completed, has no well-formed
+            approval, or the approval, run, bundle and requested identity disagree.
+        ArtifactError: If the sealed bundle is missing or fails verification.
     """
-
-    name = "review"
-    max_retries = 0
-    blocking = True
-
-    def __init__(self, approval: dict[str, Any] | None = None) -> None:
-        self._approval = approval or {}
-
-    def evaluate(self, work_item: WorkItem, artifacts: ArtifactBundle) -> GateResult:
-        approval = self._approval
-        if not approval:
-            return GateResult(
-                gate_name=self.name,
-                verdict=GateVerdict.FAIL,
-                diagnostics={
-                    "error": "no approval recorded",
-                    "remediation": (
-                        "Run `apprentice approve <run_id>` after manually "
-                        "reviewing generated artifacts, then re-run `submit`."
-                    ),
-                },
-            )
-
-        required_fields = ("approved_by", "approved_at", "artifact_hashes")
-        missing = [field for field in required_fields if field not in approval]
-        if missing:
-            return GateResult(
-                gate_name=self.name,
-                verdict=GateVerdict.FAIL,
-                diagnostics={
-                    "error": f"approval payload is missing fields: {missing}",
-                    "approval": approval,
-                },
-            )
-
-        expected = approval.get("artifact_hashes", {})
-        current = compute_artifact_hashes(artifacts)
-        diffs = {
-            name: {"approved": expected.get(name, ""), "current": current.get(name, "")}
-            for name in set(expected) | set(current)
-            if expected.get(name) != current.get(name)
-        }
-
-        if diffs:
-            return GateResult(
-                gate_name=self.name,
-                verdict=GateVerdict.FAIL,
-                diagnostics={
-                    "error": "artifact hashes diverge from approval — re-approve required",
-                    "diffs": diffs,
-                    "approved_by": approval.get("approved_by", ""),
-                    "approved_at": approval.get("approved_at", ""),
-                },
-            )
-
-        return GateResult(
-            gate_name=self.name,
-            verdict=GateVerdict.PASS,
-            diagnostics={
-                "approved_by": approval.get("approved_by", ""),
-                "approved_at": approval.get("approved_at", ""),
-                "hashes_matched": sorted(current.keys()),
-            },
+    rebuild = f"apprentice build {record.algorithm_name} --tier {record.tier}"
+    if record.status != "completed":
+        raise ApprovalError(f"run {record.run_id} is {record.status}, not completed", rebuild)
+    approval = record.approval
+    if not approval:
+        raise ApprovalError(
+            f"no human-review approval recorded for run {record.run_id}",
+            f"apprentice approve {record.run_id}",
         )
+    if set(approval) != _APPROVAL_FIELDS:
+        raise ApprovalError(
+            f"approval of run {record.run_id} is not bound to a sealed bundle manifest",
+            f"apprentice approve {record.run_id}",
+        )
+    if algorithm != record.algorithm_name:
+        raise ApprovalError(
+            f"run {record.run_id} built {record.algorithm_name!r}, not {algorithm!r}",
+            f"apprentice submit {record.algorithm_name} --run-id {record.run_id}",
+        )
+    if tier is not None and tier != record.tier:
+        raise ApprovalError(
+            f"run {record.run_id} is tier {record.tier}, not tier {tier}",
+            f"apprentice submit {record.algorithm_name} --run-id {record.run_id}",
+        )
+
+    snapshot = store.load_bundle(record)
+    approved = (
+        approval["run_id"],
+        approval["algorithm"],
+        approval["tier"],
+        approval["manifest_sha256"],
+    )
+    if approved != (snapshot.run_id, snapshot.algorithm, snapshot.tier, snapshot.manifest_sha256):
+        raise ApprovalError(
+            f"approval of run {record.run_id} does not match its sealed bundle",
+            f"review the bundle with `apprentice preview --run-id {record.run_id}` "
+            f"and re-approve with `apprentice approve {record.run_id}`",
+        )
+    return snapshot

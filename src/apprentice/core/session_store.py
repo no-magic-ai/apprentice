@@ -56,6 +56,7 @@ class RunRecord:
         elapsed_seconds: Wall-clock duration.
         manifest_sha256: Digest of the sealed bundle manifest (completed runs only).
         approval: Human-review approval bound to the sealed manifest.
+        submission: Pull requests opened by `submit` for the approved bundle.
     """
 
     run_id: str
@@ -70,6 +71,7 @@ class RunRecord:
     elapsed_seconds: float = 0.0
     manifest_sha256: str = ""
     approval: dict[str, Any] = field(default_factory=dict)
+    submission: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -106,6 +108,7 @@ class RunRecord:
             # Absent on records written before sealed bundles existed.
             manifest_sha256=data.get("manifest_sha256", ""),
             approval=data.get("approval", {}),
+            submission=data.get("submission", {}),
         )
 
 

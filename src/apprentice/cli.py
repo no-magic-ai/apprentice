@@ -46,21 +46,18 @@ def main(argv: list[str] | None = None) -> int:
         "--model", type=str, default=None, help="Override model (e.g. ollama_chat/llama3.3)"
     )
 
-    submit_parser = subparsers.add_parser("submit", help="Package last build into PRs")
-    submit_parser.add_argument("algorithm", help="Algorithm name to package")
-    submit_parser.add_argument(
-        "--tier",
-        type=int,
-        default=None,
-        help="Assert the approved run's tier (the sealed bundle's tier is always used)",
+    submit_parser = subparsers.add_parser(
+        "submit", help="Open PRs with the exact approved bytes of a run (no regeneration)"
     )
-    submit_parser.add_argument("--backend", type=str, default=None, help="Override backend")
-    submit_parser.add_argument("--model", type=str, default=None, help="Override model")
+    submit_parser.add_argument("algorithm", help="Algorithm the approved run built")
+    submit_parser.add_argument(
+        "--tier", type=int, default=None, help="Tier the approved run must have (optional)"
+    )
     submit_parser.add_argument(
         "--run-id",
         type=str,
-        default=None,
-        help="Run ID whose approval authorizes this submit (from 'apprentice history')",
+        required=True,
+        help="Approved run to submit (from 'apprentice history')",
     )
 
     approve_parser = subparsers.add_parser(
@@ -118,7 +115,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "build":
         return _cmd_build(cfg, args)
     if args.command == "submit":
-        return _cmd_submit(cfg, args)
+        return _cmd_submit(args)
     if args.command == "approve":
         return _cmd_approve(args)
     if args.command == "suggest":
@@ -201,7 +198,7 @@ def _cmd_build(cfg: ApprenticeConfig, args: Any) -> int:
         return 1
 
     model = _resolve_model(cfg, args)
-    pipeline = build_pipeline(model, cfg, store.run_scope(record), include_packaging=False)
+    pipeline = build_pipeline(model, cfg, store.run_scope(record))
 
     progress = PipelineProgress(args.algorithm, args.tier)
     start = time.monotonic()
@@ -261,142 +258,68 @@ def _record_gate_halt(
     )
 
 
-def _cmd_submit(cfg: ApprenticeConfig, args: Any) -> int:
-    from apprentice.core.artifacts import ArtifactError, RunScope
+def _cmd_submit(args: Any) -> int:
+    """Promote the exact approved bytes of a run; no model or generation runs."""
+    from datetime import UTC, datetime
+
+    from apprentice.agents.packaging import PackagingError, submit_snapshot
+    from apprentice.core.artifacts import ArtifactError
     from apprentice.core.observability import get_logger
-    from apprentice.core.orchestrator import build_pipeline
     from apprentice.core.session_store import SessionStore
-    from apprentice.models.work_item import BlockingGateError
+    from apprentice.gates.review import ApprovalError, require_approved_snapshot
 
     logger = get_logger(__name__)
     store = SessionStore()
 
     try:
-        run_id = args.run_id or _latest_completed_run_id(store, args.algorithm)
-    except ValueError as exc:
-        _print_json({"error": str(exc)})
-        return 1
-    if run_id is None:
-        _print_json(
-            {
-                "error": (
-                    f"No completed build found for '{args.algorithm}'. "
-                    "Run 'apprentice build' first."
-                )
-            }
-        )
-        return 1
-
-    try:
-        record = store.load(run_id)
+        record = store.load(args.run_id)
     except (FileNotFoundError, ValueError) as exc:
         _print_json({"error": str(exc)})
         return 1
 
     try:
-        snapshot = store.load_bundle(record)
+        snapshot = require_approved_snapshot(
+            store, record, algorithm=args.algorithm, tier=args.tier
+        )
+    except ApprovalError as exc:
+        _print_json({"error": str(exc), "run_id": record.run_id, "remediation": exc.remediation})
+        return 1
     except ArtifactError as exc:
-        _print_json({"error": str(exc), "run_id": run_id})
+        _print_json({"error": str(exc), "run_id": record.run_id})
         return 1
 
-    approval = record.approval
-    if not isinstance(approval, dict):
+    if record.submission:
         _print_json(
             {
-                "error": "stored approval of this run is not an object",
-                "run_id": run_id,
-                "remediation": f"apprentice approve {run_id}",
-            }
-        )
-        return 1
-    if not approval:
-        _print_json(
-            {
-                "error": "no human-review approval recorded for this run",
-                "run_id": run_id,
-                "remediation": f"apprentice approve {run_id}",
+                "error": f"run {record.run_id} was already submitted",
+                "submission": record.submission,
             }
         )
         return 1
 
-    # The approval must name exactly the sealed bundle that was verified above;
-    # the bundle, not the command line, fixes the name and tier published.
-    sealed_identity = {
-        "run_id": snapshot.run_id,
-        "algorithm": snapshot.algorithm,
-        "tier": snapshot.tier,
+    workspace = store.allocate_work_root()
+    logger.info("submit started: run %s manifest %s", record.run_id, snapshot.manifest_sha256)
+    try:
+        submissions = submit_snapshot(snapshot, record.approval, workspace)
+    except PackagingError as exc:
+        _print_json(
+            {
+                "error": str(exc),
+                "run_id": record.run_id,
+                "workspace": str(workspace),
+                "published": exc.published,
+            }
+        )
+        return 1
+
+    record.submission = {
+        "submitted_at": datetime.now(tz=UTC).isoformat(),
         "manifest_sha256": snapshot.manifest_sha256,
+        "workspace": str(workspace),
+        "repositories": [submission.to_dict() for submission in submissions],
     }
-    approved_identity = {key: approval.get(key) for key in sealed_identity}
-    approved_tier = approved_identity["tier"]
-    # The review gate compares regenerated roles with this map, so it must be
-    # exactly the verified bundle's role hashes, not merely present.
-    sealed_hashes = {artifact.role: artifact.sha256 for artifact in snapshot.artifacts}
-    # Equality alone would accept True for 1 and 2.0 for 2; the tier must be an integer.
-    if (
-        approved_identity != sealed_identity
-        or not isinstance(approved_tier, int)
-        or isinstance(approved_tier, bool)
-        or approval.get("artifact_hashes") != sealed_hashes
-    ):
-        _print_json(
-            {
-                "error": "approval does not match the run's sealed bundle",
-                "run_id": run_id,
-                "approved": approved_identity,
-                "sealed": sealed_identity,
-                "remediation": f"apprentice approve {run_id}",
-            }
-        )
-        return 1
-
-    if args.algorithm != snapshot.algorithm or args.tier not in (None, snapshot.tier):
-        _print_json(
-            {
-                "error": "requested algorithm/tier does not match the approved run",
-                "run_id": run_id,
-                "requested": {"algorithm": args.algorithm, "tier": args.tier},
-                "approved": {"algorithm": snapshot.algorithm, "tier": snapshot.tier},
-            }
-        )
-        return 1
-    algorithm, tier = snapshot.algorithm, snapshot.tier
-
-    logger.info("submit started: %s (tier %d, run %s)", algorithm, tier, run_id)
-
-    model = _resolve_model(cfg, args)
-    # Regeneration runs in a distinct fresh root so the sealed approved bundle
-    # is never rewritten; the review gate compares every regenerated role
-    # against the approved hashes before packaging may run.
-    scope = RunScope(
-        run_id=record.run_id,
-        algorithm=algorithm,
-        tier=tier,
-        work_root=store.allocate_work_root(),
-    )
-    try:
-        pipeline = build_pipeline(model, cfg, scope, include_packaging=True, approval=approval)
-    except ArtifactError as exc:
-        _print_json({"error": str(exc), "run_id": run_id})
-        return 1
-
-    start = time.monotonic()
-    try:
-        session_state = asyncio.run(_run_pipeline(pipeline, algorithm, tier, ""))
-    except BlockingGateError as failure:
-        # The approved run and its sealed bundle are left exactly as they were.
-        _print_json(
-            {
-                "error": str(failure),
-                "run_id": run_id,
-                "gate": failure.verdict,
-                "regeneration_root": str(scope.work_root),
-            }
-        )
-        return 1
-    elapsed = time.monotonic() - start
-
-    _print_build_result(algorithm, tier, session_state, elapsed, run_id)
+    store.save(record)
+    _print_json({"run_id": record.run_id, **record.submission})
     return 0
 
 
@@ -452,7 +375,6 @@ def _cmd_approve(args: Any) -> int:
         "manifest_sha256": snapshot.manifest_sha256,
         "approved_by": approver,
         "approved_at": datetime.now(tz=UTC).isoformat(),
-        "artifact_hashes": {artifact.role: artifact.sha256 for artifact in snapshot.artifacts},
     }
     store.save(record)
 
@@ -468,14 +390,6 @@ def _cmd_approve(args: Any) -> int:
         }
     )
     return 0
-
-
-def _latest_completed_run_id(store: SessionStore, algorithm: str) -> str | None:
-    """Return the most recent completed run_id for `algorithm`, or None."""
-    for record in store.list_runs(status="completed", limit=50):
-        if record.algorithm_name == algorithm:
-            return record.run_id
-    return None
 
 
 def _cmd_suggest(cfg: ApprenticeConfig, args: Any) -> int:
@@ -762,7 +676,7 @@ def _cmd_retry(cfg: ApprenticeConfig, args: Any) -> int:
         return 1
 
     model = _resolve_model(cfg, args)
-    pipeline = build_pipeline(model, cfg, store.run_scope(new_record), include_packaging=False)
+    pipeline = build_pipeline(model, cfg, store.run_scope(new_record))
 
     start = time.monotonic()
 
