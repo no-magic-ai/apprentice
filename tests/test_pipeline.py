@@ -237,7 +237,8 @@ class TestPipelineArtifactRoot:
     def test_symlink_root_fails_before_any_stage(self, store: SessionStore, tmp_path: Path) -> None:
         link = tmp_path / "link"
         link.symlink_to(store.allocate_work_root())
-        assert "symlink" in self._refused(PipelineContext(artifact_root=str(link)))
+        error = self._refused(PipelineContext(artifact_root=str(link)))
+        assert error.startswith("artifact root is a symlink")
 
     def test_previously_populated_root_is_not_reused(self, store: SessionStore) -> None:
         root = store.allocate_work_root()

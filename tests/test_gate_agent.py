@@ -143,7 +143,7 @@ class TestGateAgent:
             RunScope(scope.run_id, scope.algorithm, scope.tier, link),
         )
 
-        with pytest.raises(ArtifactError, match="symlink"):
+        with pytest.raises(ArtifactError, match="artifact root is a symlink"):
             anyio.run(
                 _collect,
                 agent._run_async_impl(_StubCtx(state={"generated_code": "x = 1\n"})),

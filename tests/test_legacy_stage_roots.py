@@ -87,7 +87,7 @@ def test_stage_with_symlink_root_refuses_before_provider(
     target = store.allocate_work_root()
     link = tmp_path / "root-link"
     link.symlink_to(target)
-    with pytest.raises(ArtifactError, match="symlink"):
+    with pytest.raises(ArtifactError, match="artifact root is a symlink"):
         stage_cls().execute(
             WorkItem(id="t", algorithm_name="selection", tier=2),
             _context(provider, str(link), implementation),
