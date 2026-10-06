@@ -528,8 +528,15 @@ class TestRootSubmitIdentity:
         args: _SubmitArgs,
         refusal: str,
     ) -> None:
+        # The regeneration would match the approval, so only the refusal stops it.
+        llm = OfflineFixtureLlm(model="offline-fixture", outputs=fixture_outputs("A"))
         resolved: list[object] = []
-        monkeypatch.setattr("apprentice.cli._resolve_model", lambda cfg, a: resolved.append(a))
+
+        def resolve(cfg: object, submit_args: object) -> OfflineFixtureLlm:
+            resolved.append(submit_args)
+            return llm
+
+        monkeypatch.setattr("apprentice.cli._resolve_model", resolve)
         before = _tree(store_dir)
         capsys.readouterr()
 
@@ -537,6 +544,7 @@ class TestRootSubmitIdentity:
 
         assert refusal in json.loads(_last_json(capsys))["error"]
         assert resolved == []
+        assert llm.requests == []
         assert _tree(store_dir) == before
 
     @pytest.mark.parametrize(
