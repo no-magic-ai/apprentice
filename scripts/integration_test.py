@@ -170,11 +170,11 @@ def main() -> int:
     store = SessionStore()
 
     if args.report_only:
-        records = store.list_runs(limit=50)
-        if not records:
+        past_records = store.list_runs(limit=50)
+        if not past_records:
             print("No past runs found.")
             return 0
-        report = aggregate_runs(records)
+        report = aggregate_runs(past_records)
         progress = IntegrationProgress(0, "", "")
         progress.print_summary(report)
         return 0
