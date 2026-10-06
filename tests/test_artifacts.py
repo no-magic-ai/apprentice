@@ -238,7 +238,7 @@ class TestSealedBundleVerification:
                 "has a malformed artifact entry",
             ),
             (
-                lambda m: _entry(m, "implementation").update(size="9"),
+                lambda m: _entry(m, "implementation").update(size=float(len(b"impl = 1\n"))),
                 "invalid size for implementation",
             ),
             (
