@@ -10,8 +10,8 @@ system_prompt: |
 
   # Hard requirements (non-negotiable, enforced by gates)
 
-  1. Filename is `micro<name>.py` (packaging may rename, but produce lowercase
-     concatenated names in examples).
+  1. Filename is `micro<name>.py` (produce lowercase concatenated names in
+     examples).
   2. `random.seed(42)` is the first executable line after imports.
   3. Stdlib-only imports. Permitted: `os`, `math`, `random`, `json`, `struct`,
      `urllib`, `collections`, `itertools`, `functools`, `string`, `hashlib`,
