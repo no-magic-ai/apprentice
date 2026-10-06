@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -18,7 +19,6 @@ from apprentice.core.session_store import SessionStore
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
-    from pathlib import Path
 
     from apprentice.core.artifacts import RunScope
 
@@ -227,6 +227,27 @@ class OfflineRemotes:
         hook = self.bare[repository] / "hooks" / "pre-receive"
         hook.write_text("#!/bin/sh\necho 'offline fixture: push rejected' >&2\nexit 1\n")
         hook.chmod(0o755)
+
+    def mutate_staged_python(self, repository: str) -> None:
+        """Make native git rewrite staged `*.py` content through a clean filter.
+
+        The repository's main branch gains a `.gitattributes` routing `*.py`
+        through a filter defined in the isolated global git config, so a
+        clone's `git add` stores different bytes than the working file.
+        """
+        config = Path(os.environ["GIT_CONFIG_GLOBAL"])
+        with config.open("a", encoding="utf-8") as handle:
+            handle.write(
+                '[filter "offline-mutate"]\n\tclean = sed -e s/$/_mutated/\n\trequired = true\n'
+            )
+        seed = self.bare[repository].parent / f"attributes-{self.bare[repository].stem}"
+        subprocess.run(["git", "clone", "-q", str(self.bare[repository]), str(seed)], check=True)
+        (seed / ".gitattributes").write_text("*.py filter=offline-mutate\n")
+        subprocess.run(["git", "add", ".gitattributes"], cwd=seed, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "route python through a filter"], cwd=seed, check=True
+        )
+        subprocess.run(["git", "push", "-q", "origin", "main"], cwd=seed, check=True)
 
     def blob(self, repository: str, ref: str, path: str) -> bytes:
         return subprocess.run(

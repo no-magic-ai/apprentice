@@ -180,3 +180,41 @@ def test_second_pull_request_failure_reports_the_opened_core_pr(
 
     assert _effects(excinfo) == [(_CORE, True, True), (_VIZ, True, False)]
     assert excinfo.value.effects[0]["pr_url"].endswith("/pull/offline-1")
+
+
+def test_packaging_uses_captured_bytes_even_if_the_bundle_changes_after_verification(
+    store: SessionStore, offline_remotes: OfflineRemotes
+) -> None:
+    snapshot = _snapshot(store)
+    approved = {a.role: a.data for a in snapshot.artifacts}
+    bundle = store.bundle_dir(snapshot.run_id)
+    for name in ("implementation.py", "scene.py"):
+        path = bundle / name
+        path.chmod(0o644)
+        path.write_bytes(b"swapped_after_verification = True\n")
+
+    submit_snapshot(snapshot, _APPROVAL, store.allocate_work_root())
+
+    branch = f"apprentice/{snapshot.run_id}"
+    assert (
+        offline_remotes.blob(_CORE, branch, "02-alignment/microselection.py")
+        == approved["implementation"]
+    )
+    assert (
+        offline_remotes.blob(_VIZ, branch, "scenes/scene_microselection.py")
+        == approved["manim_scene"]
+    )
+
+
+def test_commit_whose_stored_blob_differs_is_never_pushed(
+    store: SessionStore, offline_remotes: OfflineRemotes
+) -> None:
+    offline_remotes.mutate_staged_python(_CORE)
+
+    with pytest.raises(PackagingError, match="differs from approval") as excinfo:
+        submit_snapshot(_snapshot(store), _APPROVAL, store.allocate_work_root())
+
+    assert excinfo.value.effects == []
+    assert offline_remotes.branches(_CORE) == ["main"]
+    assert offline_remotes.branches(_VIZ) == ["main"]
+    assert offline_remotes.gh_calls() == []

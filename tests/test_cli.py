@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
+import os
+import subprocess
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import anyio
 import pytest
@@ -276,22 +282,14 @@ class TestSubmitCommand:
         assert _cmd_submit(_SubmitArgs("selection", f"selection-20260101T000000Z-{'0' * 32}")) == 1
         assert "No run record found" in json.loads(capsys.readouterr().out)["error"]
 
-    def test_restarted_submit_promotes_approved_bytes_without_generation(
+    def test_restarted_submit_promotes_approved_bytes(
         self,
         store_dir: Path,
         offline_remotes: OfflineRemotes,
-        monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         rec = _approved_run(store_dir)
         approved = json.loads(capsys.readouterr().out)
-
-        def _tripwire(*args: Any, **kwargs: Any) -> Any:
-            raise AssertionError("submit reached model or generation dispatch")
-
-        monkeypatch.setattr("apprentice.providers.factory.create_model", _tripwire)
-        monkeypatch.setattr("apprentice.providers.factory.create_model_from_override", _tripwire)
-        monkeypatch.setattr("google.adk.runners.Runner.run_async", _tripwire)
 
         assert _cmd_submit(_SubmitArgs("selection", rec.run_id, tier=2)) == 0
 
@@ -822,3 +820,122 @@ class TestBlockingGateFailures:
     ) -> None:
         rec = _sealed_with_verdicts(store_dir, verdicts)
         assert _cmd_approve(_ApproveArgs(rec.run_id)) == 0
+
+
+class TestSubmitPublicationGuards:
+    def test_mutated_commit_blob_is_not_pushed_or_reported_submitted(
+        self,
+        store_dir: Path,
+        offline_remotes: OfflineRemotes,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rec = _approved_run(store_dir)
+        offline_remotes.mutate_staged_python("no-magic-ai/no-magic")
+        capsys.readouterr()
+
+        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
+
+        submission = SessionStore(store_dir=store_dir).load(rec.run_id).submission
+        assert submission["status"] == "failed"
+        assert "differs from approval" in submission["error"]
+        assert submission["repositories"] == []
+        assert offline_remotes.branches("no-magic-ai/no-magic") == ["main"]
+        assert offline_remotes.branches("no-magic-ai/no-magic-viz") == ["main"]
+        assert offline_remotes.gh_calls() == []
+
+
+def _forbidden_generation_modules() -> set[str]:
+    """Generation-only modules, including every client the provider factory imports."""
+    import apprentice.providers
+
+    forbidden = {
+        "google.adk",
+        "litellm",
+        "apprentice.providers",
+        "apprentice.core.orchestrator",
+        "apprentice.core.gate_agent",
+    }
+    for source in Path(apprentice.providers.__file__).parent.glob("*.py"):
+        for node in ast.walk(ast.parse(source.read_text(encoding="utf-8"))):
+            names = (
+                [alias.name for alias in node.names]
+                if isinstance(node, ast.Import)
+                else [node.module]
+                if isinstance(node, ast.ImportFrom) and node.module and node.level == 0
+                else []
+            )
+            for name in names:
+                parts = name.split(".")
+                if parts[0] in sys.stdlib_module_names or parts[0] in ("apprentice", "__future__"):
+                    continue
+                forbidden.add(".".join(parts[:2]) if parts[0] == "google" else parts[0])
+    return forbidden
+
+
+class _CountingHandler(BaseHTTPRequestHandler):
+    requests: ClassVar[list[str]] = []
+
+    def log_message(self, format: str, *args: Any) -> None:
+        return
+
+    def do_POST(self) -> None:
+        self.requests.append(self.path)
+        self.send_response(503)
+        self.end_headers()
+
+    def do_GET(self) -> None:
+        self.do_POST()
+
+
+class TestFreshSubmitProcess:
+    def test_submit_in_a_fresh_interpreter_loads_no_generation_module_and_calls_no_model(
+        self, tmp_path: Path, offline_remotes: OfflineRemotes, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        home = tmp_path / "home"
+        sessions = home / ".apprentice" / "sessions"
+        monkeypatch.setattr("apprentice.core.session_store._DEFAULT_STORE_DIR", sessions)
+        rec = _approved_run(sessions)
+        _CountingHandler.requests = []
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _CountingHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        root = Path(__file__).parent.parent
+        config = (root / "config" / "apprentice.toml").read_text(encoding="utf-8")
+        config = config.replace('backend = "openai"', 'backend = "local"').replace(
+            'local_api_base = ""', f'local_api_base = "http://127.0.0.1:{server.server_port}/v1"'
+        )
+        config = config.replace('"${HOME}/.apprentice/logs"', f'"{home}/logs"')
+        config_path = tmp_path / "apprentice.toml"
+        config_path.write_text(config, encoding="utf-8")
+        forbidden = sorted(_forbidden_generation_modules())
+        script = (
+            "import json, sys\n"
+            "from apprentice.cli import main\n"
+            f"code = main(['--config', {str(config_path)!r}, 'submit', 'selection', '--run-id', {rec.run_id!r}])\n"
+            f"forbidden = {forbidden!r}\n"
+            "loaded = sorted(m for m in sys.modules if any(m == f or m.startswith(f + '.') for f in forbidden))\n"
+            "print('FRESH-SUBMIT ' + json.dumps({'code': code, 'loaded': loaded}))\n"
+        )
+        env = {
+            "PATH": os.environ["PATH"],
+            "HOME": str(home),
+            "PYTHONPATH": str(root / "src"),
+            "GIT_CONFIG_GLOBAL": os.environ["GIT_CONFIG_GLOBAL"],
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_ALLOW_PROTOCOL": "file",
+        }
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", script], env=env, capture_output=True, text=True, check=False
+            )
+        finally:
+            server.shutdown()
+
+        line = next(x for x in result.stdout.splitlines() if x.startswith("FRESH-SUBMIT "))
+        outcome = json.loads(line.removeprefix("FRESH-SUBMIT "))
+        assert outcome == {"code": 0, "loaded": []}, result.stderr[-2000:]
+        assert _CountingHandler.requests == []
+        assert {"google.adk", "litellm", "openai", "anthropic"} <= set(forbidden)
+        assert offline_remotes.branches("no-magic-ai/no-magic") == [
+            f"apprentice/{rec.run_id}",
+            "main",
+        ]
