@@ -15,6 +15,7 @@ from apprentice.agents.instrumentation import build_instrumentation_agent
 from apprentice.agents.packaging import build_packaging_agent
 from apprentice.agents.review import build_review_agent
 from apprentice.agents.visualization import build_visualization_agent
+from apprentice.core.artifacts import ROLE_FILENAMES, tier_directory, validate_algorithm_name
 from apprentice.core.budget import (
     BudgetTracker,
     make_after_agent_callback,
@@ -126,6 +127,33 @@ def build_pipeline(
     model_name = getattr(model, "model", "")
     for sub in sub_agents:
         wire_agent_callbacks(sub, tracker, model_name)
+
+    if include_packaging:
+        # The old publisher's instruction names the regenerated role paths and
+        # the destination name/tier. Seed them from the fresh regeneration root
+        # (roles that were not regenerated stay empty) after the budget wiring
+        # above, which replaces each agent's before_agent_callback.
+        publisher = sub_agents[-1]
+        name = validate_algorithm_name(scope.algorithm)
+        tier_dir = tier_directory(scope.tier)
+        state_keys = {
+            "implementation_path": "implementation",
+            "instrumented_path": "instrumented",
+            "manim_scene_path": "manim_scene",
+            "anki_deck_path": "anki_deck",
+        }
+
+        async def seed_publisher_context(callback_context: Any) -> None:
+            for key, role in state_keys.items():
+                path = scope.work_root / ROLE_FILENAMES[role]
+                callback_context.state[key] = str(path) if path.is_file() else ""
+            callback_context.state["name"] = name
+            callback_context.state["tier_dir"] = tier_dir
+
+        publisher.before_agent_callback = [
+            publisher.before_agent_callback,
+            seed_publisher_context,
+        ]
 
     return pipeline
 

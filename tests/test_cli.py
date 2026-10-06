@@ -359,3 +359,72 @@ class TestRunnerStateCarrier:
         state = excinfo.value.persisted_state()
         assert state["generated_code"] == fixture_outputs(failing_implementation=True)["drafter"]
         assert state["gate_verdicts"][-1] == excinfo.value.verdict
+
+
+def _seal_from_build(
+    store_dir: Path, monkeypatch: pytest.MonkeyPatch, outputs: dict[str, str]
+) -> RunRecord:
+    _use_model(monkeypatch, outputs)
+    assert _cmd_build(load_config(None), _BuildArgs()) == 0
+    record = _only_record(store_dir)
+    assert _cmd_approve(_ApproveArgs(record.run_id)) == 0
+    return SessionStore(store_dir=store_dir).load(record.run_id)
+
+
+def _bundle_bytes(store_dir: Path, run_id: str) -> dict[str, tuple[bytes, int]]:
+    bundle = SessionStore(store_dir=store_dir).bundle_dir(run_id)
+    return {p.name: (p.read_bytes(), p.stat().st_mode) for p in sorted(bundle.iterdir())}
+
+
+class TestRootSubmitRegeneration:
+    @pytest.mark.parametrize(
+        ("regenerated", "diffs"),
+        [
+            (
+                dict(fixture_outputs("A"), drafter=fixture_outputs("B")["drafter"]),
+                {"implementation"},
+            ),
+            (fixture_outputs("B"), {"implementation", "instrumented", "manim_scene", "anki_deck"}),
+            (fixture_outputs("A", omit=("assessment",)), {"anki_deck"}),
+        ],
+    )
+    def test_mismatch_halts_before_the_publisher_and_leaves_approval_untouched(
+        self,
+        store_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        regenerated: dict[str, str],
+        diffs: set[str],
+    ) -> None:
+        approved = _seal_from_build(store_dir, monkeypatch, fixture_outputs("A"))
+        sealed = _bundle_bytes(store_dir, approved.run_id)
+        record_bytes = (store_dir / f"{approved.run_id}.json").read_bytes()
+        llm = _use_model(monkeypatch, regenerated)
+        capsys.readouterr()
+
+        assert _cmd_submit(load_config(None), _SubmitArgs("selection", approved.run_id)) == 1
+
+        out = json.loads(_last_json(capsys))
+        assert out["error"] == "blocking gate failed: review after review"
+        assert set(out["gate"]["diagnostics"]["diffs"]) == diffs
+        assert "packaging" not in llm.roles()
+        assert _bundle_bytes(store_dir, approved.run_id) == sealed
+        assert (store_dir / f"{approved.run_id}.json").read_bytes() == record_bytes
+
+    def test_identical_regeneration_reaches_the_publisher_with_fresh_paths(
+        self, store_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        approved = _seal_from_build(store_dir, monkeypatch, fixture_outputs("A"))
+        llm = _use_model(monkeypatch, fixture_outputs("A"))
+
+        assert _cmd_submit(load_config(None), _SubmitArgs("selection", approved.run_id)) == 0
+
+        (instruction,) = [text for role, text in llm.requests if role == "packaging"]
+        store = SessionStore(store_dir=store_dir)
+        (fresh,) = list((store_dir / "scratch").iterdir())
+        assert f"Implementation: {fresh / 'implementation.py'}" in instruction
+        assert f"Anki deck: {fresh / 'cards.csv'}" in instruction
+        assert "no-magic/02-alignment/microselection.py" in instruction
+        assert "no-magic-viz/scenes/scene_microselection.py" in instruction
+        assert str(store.bundle_dir(approved.run_id)) not in instruction
+        assert "{" not in instruction
