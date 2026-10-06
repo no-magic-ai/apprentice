@@ -472,7 +472,12 @@ class TestSealRefusal:
         store = SessionStore(store_dir=tmp_path)
         record = store.create_run("selection", 2)
         verdicts = [
-            {"gate_name": "lint", "after_stage": "implementation", "verdict": "warn", "blocking": True},
+            {
+                "gate_name": "lint",
+                "after_stage": "implementation",
+                "verdict": "warn",
+                "blocking": True,
+            },
             {**_CORRECTNESS_FAIL, "verdict": "pass"},
             {**_CORRECTNESS_FAIL, "blocking": False},
         ]
