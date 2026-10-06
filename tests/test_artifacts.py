@@ -224,6 +224,17 @@ class TestSealedBundleVerification:
         [
             (lambda m: m.update(extra=1), "does not have the supported field set"),
             (lambda m: m.update(version=2), "unsupported manifest version 2"),
+            (lambda m: m.update(tier=2.0), "unsupported tier 2.0"),
+            (lambda m: m.update(tier=[2]), r"unsupported tier \[2\]"),
+            (lambda m: m.update(tier={}), r"unsupported tier \{\}"),
+            (
+                lambda m: _entry(m, "anki_deck").update(role=["anki_deck"]),
+                r"lists unsupported role \['anki_deck'\]",
+            ),
+            (
+                lambda m: _entry(m, "anki_deck").update(role={"anki_deck": 1}),
+                "lists unsupported role",
+            ),
             (
                 lambda m: _entry(m, "anki_deck").update(role="slides"),
                 "lists unsupported role 'slides'",

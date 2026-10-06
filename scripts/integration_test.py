@@ -180,7 +180,11 @@ def main() -> int:
     store = SessionStore()
 
     if args.report_only:
-        past_records = store.list_runs(limit=50)
+        try:
+            past_records = store.list_runs(limit=50)
+        except ValueError as exc:
+            print(f"Cannot report: {exc}", file=sys.stderr)
+            return 1
         if not past_records:
             print("No past runs found.")
             return 0

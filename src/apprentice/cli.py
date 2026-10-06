@@ -271,7 +271,11 @@ def _cmd_submit(cfg: ApprenticeConfig, args: Any) -> int:
     logger = get_logger(__name__)
     store = SessionStore()
 
-    run_id = args.run_id or _latest_completed_run_id(store, args.algorithm)
+    try:
+        run_id = args.run_id or _latest_completed_run_id(store, args.algorithm)
+    except ValueError as exc:
+        _print_json({"error": str(exc)})
+        return 1
     if run_id is None:
         _print_json(
             {
@@ -296,6 +300,15 @@ def _cmd_submit(cfg: ApprenticeConfig, args: Any) -> int:
         return 1
 
     approval = record.approval
+    if not isinstance(approval, dict):
+        _print_json(
+            {
+                "error": "stored approval of this run is not an object",
+                "run_id": run_id,
+                "remediation": f"apprentice approve {run_id}",
+            }
+        )
+        return 1
     if not approval:
         _print_json(
             {
@@ -315,7 +328,13 @@ def _cmd_submit(cfg: ApprenticeConfig, args: Any) -> int:
         "manifest_sha256": snapshot.manifest_sha256,
     }
     approved_identity = {key: approval.get(key) for key in sealed_identity}
-    if approved_identity != sealed_identity:
+    approved_tier = approved_identity["tier"]
+    # Equality alone would accept True for 1 and 2.0 for 2; the tier must be an integer.
+    if (
+        approved_identity != sealed_identity
+        or not isinstance(approved_tier, int)
+        or isinstance(approved_tier, bool)
+    ):
         _print_json(
             {
                 "error": "approval does not match the run's sealed bundle",
@@ -624,7 +643,11 @@ def _cmd_preview(args: Any) -> int:
     store = SessionStore()
     run_id = args.run_id
     if run_id is None:
-        completed = store.list_runs(status="completed", limit=1)
+        try:
+            completed = store.list_runs(status="completed", limit=1)
+        except ValueError as exc:
+            _print_json({"error": str(exc)})
+            return 1
         if not completed:
             _print_json({"error": "No completed run found. Run 'apprentice build' first."})
             return 1
@@ -775,7 +798,11 @@ def _cmd_history(args: Any) -> int:
     from apprentice.core.session_store import SessionStore
 
     store = SessionStore()
-    records = store.list_runs(status=args.status, limit=args.limit)
+    try:
+        records = store.list_runs(status=args.status, limit=args.limit)
+    except ValueError as exc:
+        _print_json({"error": str(exc)})
+        return 1
 
     entries = [
         {
@@ -798,7 +825,11 @@ def _cmd_metrics() -> int:
     from apprentice.core.session_store import SessionStore
 
     store = SessionStore()
-    records = store.list_runs(limit=100)
+    try:
+        records = store.list_runs(limit=100)
+    except ValueError as exc:
+        _print_json({"error": str(exc)})
+        return 1
 
     if not records:
         _print_json({"error": "No run records found. Run 'apprentice build' first."})

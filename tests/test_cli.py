@@ -501,6 +501,21 @@ class TestRootSubmitIdentity:
                 lambda r: r["approval"].pop("tier"),
                 "approval does not match the run's sealed bundle",
             ),
+            (
+                lambda r: r["approval"].update(tier=2.0),
+                "approval does not match the run's sealed bundle",
+            ),
+            (
+                lambda r: r.update(approval=["approved"]),
+                "stored approval of this run is not an object",
+            ),
+            (
+                lambda r: r.update(approval="approved"),
+                "stored approval of this run is not an object",
+            ),
+            (lambda r: r.update(approval=5), "stored approval of this run is not an object"),
+            (lambda r: r.update(tier=2.0), "field 'tier' must be an integer"),
+            (lambda r: r.update(tier=True), "field 'tier' must be an integer"),
             (lambda r: r.update(algorithm_name="insertion"), "bundle identity does not match"),
             (lambda r: r.update(tier=3), "bundle identity does not match"),
             (lambda r: r.update(run_id="0" * 32), "carries a different run ID"),
@@ -598,3 +613,105 @@ class TestRootSubmitIdentity:
         assert "- Anki deck: " in instruction.splitlines()
         assert f"Implementation: {fresh / 'implementation.py'}" in instruction
         assert not (fresh / "cards.csv").exists()
+
+
+class TestSealedTierType:
+    def test_float_tier_in_a_re_signed_bundle_bound_to_its_record_is_refused_before_any_work(
+        self,
+        store_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from apprentice.core.artifacts import MANIFEST_FILENAME, canonical_json, manifest_digest
+
+        approved = _seal_from_build(store_dir, monkeypatch, fixture_outputs("A"))
+        path = SessionStore(store_dir=store_dir).bundle_dir(approved.run_id) / MANIFEST_FILENAME
+        path.chmod(0o644)
+        manifest = json.loads(path.read_bytes())
+        del manifest["manifest_sha256"]
+        manifest["tier"] = 2.0
+        digest = manifest_digest(manifest)
+        path.write_bytes(canonical_json({**manifest, "manifest_sha256": digest}))
+
+        def rebind(record: dict[str, Any]) -> None:
+            record["manifest_sha256"] = digest
+            record["approval"]["manifest_sha256"] = digest
+
+        _damage_record(store_dir, approved.run_id, rebind)
+        TestRootSubmitIdentity._assert_refused_before_any_work(
+            store_dir,
+            monkeypatch,
+            capsys,
+            _SubmitArgs("selection", approved.run_id),
+            "unsupported tier 2.0",
+        )
+
+
+def _store_with_a_corrupt_record(store_dir: Path) -> Path:
+    _make_completed_run(store_dir)
+    path = store_dir / ("selection-20990101T000000Z-" + "0" * 32 + ".json")
+    path.write_text(json.dumps(["not", "a", "record"]))
+    return path
+
+
+class TestCorruptRecordAtListingConsumers:
+    @pytest.mark.parametrize(
+        "command",
+        [
+            lambda: main(["history"]),
+            lambda: main(["metrics"]),
+            lambda: _cmd_preview(_PreviewArgs()),
+            lambda: _cmd_submit(load_config(None), _SubmitArgs("selection", None)),
+        ],
+        ids=["history", "metrics", "preview-default", "submit-latest"],
+    )
+    def test_command_reports_the_corrupt_record_and_changes_nothing(
+        self,
+        store_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+        command: Callable[[], int],
+    ) -> None:
+        corrupt = _store_with_a_corrupt_record(store_dir)
+        before = _tree(store_dir)
+        capsys.readouterr()
+
+        assert command() == 1
+
+        error = json.loads(_last_json(capsys))["error"]
+        assert f"corrupt run record {corrupt}" in error
+        assert _tree(store_dir) == before
+
+    def test_integration_report_reports_the_corrupt_record(
+        self,
+        store_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        import importlib.util
+        import sys
+
+        corrupt = _store_with_a_corrupt_record(store_dir)
+        spec = importlib.util.spec_from_file_location(
+            "integration_test", Path(__file__).parent.parent / "scripts" / "integration_test.py"
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        monkeypatch.setattr(sys, "argv", ["integration_test.py", "--report-only"])
+        capsys.readouterr()
+
+        assert module.main() == 1
+
+        assert f"corrupt run record {corrupt}" in capsys.readouterr().err
+
+
+class TestApprovalRepair:
+    def test_non_object_approval_can_be_replaced_by_approve(self, store_dir: Path) -> None:
+        rec = _make_completed_run(store_dir)
+        _damage_record(store_dir, rec.run_id, lambda r: r.update(approval=["approved"]))
+
+        assert _cmd_approve(_ApproveArgs(rec.run_id)) == 0
+
+        approval = SessionStore(store_dir=store_dir).load(rec.run_id).approval
+        assert approval["run_id"] == rec.run_id
+        assert approval["approved_by"] == "tester"

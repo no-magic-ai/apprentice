@@ -133,7 +133,7 @@ def validate_algorithm_name(name: str) -> str:
 
 def tier_directory(tier: int) -> str:
     """Return the no-magic tier directory for `tier`, rejecting unknown tiers."""
-    if isinstance(tier, bool) or tier not in _TIER_DIRS:
+    if not isinstance(tier, int) or isinstance(tier, bool) or tier not in _TIER_DIRS:
         raise ArtifactError(f"unsupported tier {tier!r}: expected one of {sorted(_TIER_DIRS)}")
     return _TIER_DIRS[tier]
 
@@ -377,7 +377,7 @@ def _validate_entries(body: dict[str, Any], source: Path) -> list[dict[str, Any]
         if not isinstance(entry, dict) or set(entry) != _ENTRY_KEYS:
             raise ArtifactError(f"manifest {source} has a malformed artifact entry")
         role = entry["role"]
-        if role not in BUNDLE_ROLE_STATE_KEYS:
+        if not isinstance(role, str) or role not in BUNDLE_ROLE_STATE_KEYS:
             raise ArtifactError(f"manifest {source} lists unsupported role {role!r}")
         if entry["path"] != ROLE_FILENAMES[role]:
             raise ArtifactError(f"manifest {source} uses an unsupported path for {role}")

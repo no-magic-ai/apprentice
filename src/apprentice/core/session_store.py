@@ -36,6 +36,7 @@ _DEFAULT_STORE_DIR = Path.home() / ".apprentice" / "sessions"
 _RUN_ID = re.compile(r"[a-z][a-z0-9_]{0,63}-\d{8}T\d{6}Z-[0-9a-f]{32}")
 # Records written before run IDs carried a UUID: "<algorithm>-<UTC second>".
 _LEGACY_RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}-\d{8}T\d{6}Z")
+_REQUIRED_TEXT_FIELDS = ("run_id", "algorithm_name", "status", "started_at")
 
 
 @dataclass
@@ -74,7 +75,23 @@ class RunRecord:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> RunRecord:
+    def from_dict(cls, data: object) -> RunRecord:
+        """Build a record from its stored JSON object.
+
+        Raises:
+            ValueError: If `data` is not an object or a required field (run_id,
+                algorithm_name, status and started_at as strings, tier as an
+                integer) is missing or of the wrong type. Optional fields are
+                taken as stored.
+        """
+        if not isinstance(data, dict):
+            raise ValueError(f"run record must be a JSON object, not {type(data).__name__}")
+        for key in _REQUIRED_TEXT_FIELDS:
+            if not isinstance(data.get(key), str):
+                raise ValueError(f"run record field {key!r} must be a string")
+        tier = data.get("tier")
+        if not isinstance(tier, int) or isinstance(tier, bool):
+            raise ValueError("run record field 'tier' must be an integer")
         return cls(
             run_id=data["run_id"],
             algorithm_name=data["algorithm_name"],
@@ -211,28 +228,35 @@ class SessionStore:
         """Load a run record by its exact ID.
 
         Raises:
-            ValueError: If `run_id` is not a supported run ID.
+            ValueError: If `run_id` is not a supported run ID or the stored
+                record is not a valid run record.
             FileNotFoundError: If the run record does not exist.
         """
         path = self._record_path(run_id)
         if not path.exists():
             raise FileNotFoundError(f"No run record found: {run_id}")
-        record = RunRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        record = _read_record(path)
         if record.run_id != run_id:
             raise ValueError(f"run record {path} carries a different run ID {record.run_id!r}")
         return record
 
     def list_runs(self, status: str | None = None, limit: int = 20) -> list[RunRecord]:
-        """List run records, optionally filtered by status, newest `started_at` first."""
-        records = [
-            RunRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
-            for path in self._dir.glob("*.json")
-        ]
-        records.sort(
-            key=lambda record: (datetime.fromisoformat(record.started_at), record.run_id),
-            reverse=True,
-        )
-        matching = [record for record in records if status is None or record.status == status]
+        """List run records, optionally filtered by status, newest `started_at` first.
+
+        Raises:
+            ValueError: If any stored record is not a valid run record or its
+                `started_at` is not an ISO 8601 timestamp; no record is skipped.
+        """
+        keyed = []
+        for path in self._dir.glob("*.json"):
+            record = _read_record(path)
+            try:
+                started = datetime.fromisoformat(record.started_at)
+            except ValueError as exc:
+                raise ValueError(f"corrupt run record {path}: {exc}") from exc
+            keyed.append(((started, record.run_id), record))
+        keyed.sort(key=lambda item: item[0], reverse=True)
+        matching = [record for _, record in keyed if status is None or record.status == status]
         return matching[:limit]
 
     def save(self, record: RunRecord) -> RunRecord:
@@ -277,3 +301,11 @@ class SessionStore:
         staging = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
         staging.write_text(json.dumps(record.to_dict(), indent=2, default=str), encoding="utf-8")
         staging.replace(path)
+
+
+def _read_record(path: Path) -> RunRecord:
+    """Parse one stored run record, naming the file if it is not a valid record."""
+    try:
+        return RunRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
+    except ValueError as exc:
+        raise ValueError(f"corrupt run record {path}: {exc}") from exc

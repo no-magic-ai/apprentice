@@ -311,3 +311,102 @@ class TestSealedBundle:
         with pytest.raises(ArtifactError, match="apprentice build selection --tier 2"):
             store.load_bundle(record)
         assert not store.bundle_dir(record.run_id).exists()
+
+
+def _stored(store: SessionStore, record: RunRecord, data: object) -> Path:
+    path = store.store_dir / f"{record.run_id}.json"
+    path.write_text(json.dumps(data))
+    return path
+
+
+_REQUIRED_FIELD_DAMAGE: list[tuple[str, object]] = [
+    ("run_id", None),
+    ("run_id", 5),
+    ("algorithm_name", ["selection"]),
+    ("status", None),
+    ("started_at", 0),
+    ("tier", "2"),
+    ("tier", 2.0),
+    ("tier", True),
+    ("tier", None),
+]
+
+
+class TestStoredRecordShape:
+    @pytest.mark.parametrize("data", [[], "record", 5, None])
+    def test_record_that_is_not_an_object_is_refused_naming_the_file(
+        self, tmp_path: Path, data: object
+    ) -> None:
+        store = SessionStore(store_dir=tmp_path)
+        record = store.create_run("selection", 2)
+        path = _stored(store, record, data)
+
+        with pytest.raises(ValueError, match="must be a JSON object") as excinfo:
+            store.load(record.run_id)
+        assert str(path) in str(excinfo.value)
+
+    @pytest.mark.parametrize(("field", "value"), _REQUIRED_FIELD_DAMAGE)
+    def test_required_field_of_the_wrong_type_is_refused(
+        self, tmp_path: Path, field: str, value: object
+    ) -> None:
+        store = SessionStore(store_dir=tmp_path)
+        record = store.create_run("selection", 2)
+        data = record.to_dict()
+        data[field] = value
+        _stored(store, record, data)
+
+        with pytest.raises(ValueError, match=f"field '{field}'"):
+            store.load(record.run_id)
+
+    @pytest.mark.parametrize("field", ["run_id", "algorithm_name", "tier", "status", "started_at"])
+    def test_missing_required_field_is_refused(self, tmp_path: Path, field: str) -> None:
+        store = SessionStore(store_dir=tmp_path)
+        record = store.create_run("selection", 2)
+        data = record.to_dict()
+        del data[field]
+        _stored(store, record, data)
+
+        with pytest.raises(ValueError, match=f"field '{field}'"):
+            store.load(record.run_id)
+
+    def test_optional_and_unknown_fields_are_kept_as_stored(self, tmp_path: Path) -> None:
+        store = SessionStore(store_dir=tmp_path)
+        record = store.create_run("selection", 2)
+        data = {
+            k: record.to_dict()[k]
+            for k in ("run_id", "algorithm_name", "tier", "status", "started_at")
+        }
+        data.update(approval=["not", "an", "object"], budget_summary="kept", future_field=1)
+        _stored(store, record, data)
+
+        loaded = store.load(record.run_id)
+
+        assert (loaded.tier, loaded.approval, loaded.budget_summary) == (
+            2,
+            ["not", "an", "object"],
+            "kept",
+        )
+
+    def test_listing_refuses_a_corrupt_record_instead_of_skipping_it(self, tmp_path: Path) -> None:
+        store = SessionStore(store_dir=tmp_path)
+        store.create_run("selection", 2)
+        damaged = store.create_run("selection", 2)
+        data = damaged.to_dict()
+        data["tier"] = 2.0
+        path = _stored(store, damaged, data)
+
+        with pytest.raises(ValueError, match="field 'tier'") as excinfo:
+            store.list_runs()
+        assert str(path) in str(excinfo.value)
+
+    def test_listing_refuses_a_started_at_that_is_not_iso(self, tmp_path: Path) -> None:
+        store = SessionStore(store_dir=tmp_path)
+        store.create_run("selection", 2)
+        damaged = store.create_run("selection", 2)
+        data = damaged.to_dict()
+        data["started_at"] = "yesterday"
+        path = _stored(store, damaged, data)
+
+        with pytest.raises(ValueError, match="corrupt run record") as excinfo:
+            store.list_runs()
+        assert str(path) in str(excinfo.value)
