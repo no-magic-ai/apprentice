@@ -24,7 +24,6 @@ _AGENT_LABELS: dict[str, str] = {
     "assessment": "Generating Anki cards",
     "review_loop": "Reviewing artifacts",
     "reviewer": "Running validators",
-    "packaging": "Creating PRs",
     "discovery": "Discovering algorithms",
 }
 
