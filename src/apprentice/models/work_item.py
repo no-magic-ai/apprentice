@@ -35,6 +35,34 @@ class GateVerdict(StrEnum):
     WARN = "warn"
 
 
+class BlockingGateError(Exception):
+    """A blocking gate failed during generation; the pipeline stops here.
+
+    Raised by `GateAgent` after its verdict has been yielded as a persisted
+    session-state delta. The runner that drove the pipeline reads the stored
+    session back and attaches it, so callers can record the halted run with
+    its actual outputs and diagnostics.
+
+    Attributes:
+        verdict: The gate verdict entry (gate_name, after_stage, verdict,
+            blocking, diagnostics) exactly as recorded.
+        session_state: Persisted session state, attached by the runner.
+    """
+
+    def __init__(self, verdict: dict[str, Any]) -> None:
+        super().__init__(
+            f"blocking gate failed: {verdict['gate_name']} after {verdict['after_stage']}"
+        )
+        self.verdict = verdict
+        self.session_state: dict[str, Any] | None = None
+
+    def persisted_state(self) -> dict[str, Any]:
+        """Return the attached persisted session state, failing loudly if absent."""
+        if self.session_state is None:
+            raise RuntimeError(f"{self}: persisted session state was not attached")
+        return self.session_state
+
+
 @dataclass
 class WorkItem:
     """A single algorithm to be processed through the pipeline."""
@@ -149,13 +177,20 @@ class GateResult:
 
 @dataclass
 class PipelineContext:
-    """Carries configuration and state through the pipeline."""
+    """Carries configuration and state through the pipeline.
+
+    `artifact_root` is the exclusive directory one pipeline invocation writes
+    its artifacts into, allocated by `SessionStore.allocate_work_root()`.
+    Stages refuse to run without it; it is storage isolation only, not
+    execution containment or an approval record.
+    """
 
     config: dict[str, Any] = field(default_factory=dict)
     budget_remaining_tokens: int = 0
     budget_remaining_usd: float = 0.0
     prompt_registry_path: str = ""
     convention_schema_path: str = ""
+    artifact_root: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -164,6 +199,7 @@ class PipelineContext:
             "budget_remaining_usd": self.budget_remaining_usd,
             "prompt_registry_path": self.prompt_registry_path,
             "convention_schema_path": self.convention_schema_path,
+            "artifact_root": self.artifact_root,
         }
 
     @classmethod
@@ -174,4 +210,5 @@ class PipelineContext:
             budget_remaining_usd=data.get("budget_remaining_usd", 0.0),
             prompt_registry_path=data.get("prompt_registry_path", ""),
             convention_schema_path=data.get("convention_schema_path", ""),
+            artifact_root=data.get("artifact_root", ""),
         )

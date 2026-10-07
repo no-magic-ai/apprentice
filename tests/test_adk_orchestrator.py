@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from google.adk.agents import ParallelAgent, SequentialAgent
 from google.adk.models.lite_llm import LiteLlm
 
@@ -22,6 +24,9 @@ from apprentice.core.config import (
 )
 from apprentice.core.gate_agent import GateAgent
 from apprentice.core.orchestrator import build_discovery_pipeline, build_pipeline
+
+if TYPE_CHECKING:
+    from apprentice.core.artifacts import RunScope
 
 
 def _model() -> LiteLlm:
@@ -90,50 +95,50 @@ def _config() -> ApprenticeConfig:
 
 
 class TestBuildPipeline:
-    def test_returns_sequential_agent(self) -> None:
-        pipeline = build_pipeline(_model(), _config())
+    def test_returns_sequential_agent(self, scope: RunScope) -> None:
+        pipeline = build_pipeline(_model(), _config(), scope)
         assert isinstance(pipeline, SequentialAgent)
 
-    def test_pipeline_name(self) -> None:
-        pipeline = build_pipeline(_model(), _config())
+    def test_pipeline_name(self, scope: RunScope) -> None:
+        pipeline = build_pipeline(_model(), _config(), scope)
         assert pipeline.name == "apprentice_pipeline"
 
-    def test_has_sub_agents_without_packaging(self) -> None:
-        pipeline = build_pipeline(_model(), _config(), include_packaging=False)
+    def test_has_sub_agents_without_packaging(self, scope: RunScope) -> None:
+        pipeline = build_pipeline(_model(), _config(), scope, include_packaging=False)
         # impl + 2 impl gates + parallel + 2 artifact gates + review = 7
         assert len(pipeline.sub_agents) == 7
 
-    def test_has_sub_agents_with_packaging(self) -> None:
+    def test_has_sub_agents_with_packaging(self, scope: RunScope) -> None:
         approval = {
             "approved_by": "tester",
             "approved_at": "2026-04-21T00:00:00+00:00",
             "artifact_hashes": {},
         }
         pipeline = build_pipeline(
-            _model(), _config(), include_packaging=True, approval=approval
+            _model(), _config(), scope, include_packaging=True, approval=approval
         )
         # build path (7) + review gate + packaging = 9
         assert len(pipeline.sub_agents) == 9
 
-    def test_gate_agents_inserted(self) -> None:
-        pipeline = build_pipeline(_model(), _config(), include_packaging=False)
+    def test_gate_agents_inserted(self, scope: RunScope) -> None:
+        pipeline = build_pipeline(_model(), _config(), scope, include_packaging=False)
         gate_agents = [a for a in pipeline.sub_agents if isinstance(a, GateAgent)]
         gate_names = {g.gate.name for g in gate_agents}
         assert gate_names == {"correctness", "lint", "consistency", "schema_compliance"}
 
-    def test_parallel_agent_in_pipeline(self) -> None:
-        pipeline = build_pipeline(_model(), _config())
+    def test_parallel_agent_in_pipeline(self, scope: RunScope) -> None:
+        pipeline = build_pipeline(_model(), _config(), scope)
         parallel_agents = [a for a in pipeline.sub_agents if isinstance(a, ParallelAgent)]
         assert len(parallel_agents) == 1
         assert parallel_agents[0].name == "artifact_generation"
 
-    def test_parallel_has_three_sub_agents(self) -> None:
-        pipeline = build_pipeline(_model(), _config())
+    def test_parallel_has_three_sub_agents(self, scope: RunScope) -> None:
+        pipeline = build_pipeline(_model(), _config(), scope)
         parallel = next(a for a in pipeline.sub_agents if isinstance(a, ParallelAgent))
         assert len(parallel.sub_agents) == 3
 
-    def test_has_callbacks(self) -> None:
-        pipeline = build_pipeline(_model(), _config())
+    def test_has_callbacks(self, scope: RunScope) -> None:
+        pipeline = build_pipeline(_model(), _config(), scope)
         assert pipeline.before_agent_callback is not None
         assert pipeline.after_agent_callback is not None
 

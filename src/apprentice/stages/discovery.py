@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import re
-import tempfile
 import tomllib
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from apprentice.core.artifacts import require_owned_root, write_role
 
 if TYPE_CHECKING:
     from apprentice.models.budget import CostEstimate
@@ -85,6 +86,7 @@ class DiscoveryStage:
         """
         from apprentice.models.work_item import StageResult
 
+        root = require_owned_root(context.artifact_root)
         catalog_path = Path(context.config.get("catalog_path", str(_CATALOG_PATH)))
         existing_names = _load_catalog_names(catalog_path)
 
@@ -124,7 +126,7 @@ class DiscoveryStage:
 
             accepted.append({"name": normalized, "rationale": rationale})
 
-        artifact_path = self._write_artifact(work_item.algorithm_name, accepted)
+        artifact_path = self._write_artifact(root, accepted)
         total_tokens = completion.input_tokens + completion.output_tokens
         cost = (
             completion.input_tokens * _INPUT_RATE_USD + completion.output_tokens * _OUTPUT_RATE_USD
@@ -201,21 +203,13 @@ class DiscoveryStage:
             "No provider configured. Set context.config['provider'] to a ProviderInterface instance."
         )
 
-    def _write_artifact(self, context_name: str, candidates: list[dict[str, str]]) -> str:
-        """Persist the accepted candidates as a JSON file.
-
-        Args:
-            context_name: Used as a stem for the output filename.
-            candidates: List of accepted candidate dicts with name and rationale.
+    def _write_artifact(self, root: Path, candidates: list[dict[str, str]]) -> str:
+        """Write the discovery artifact into the invocation's owned root.
 
         Returns:
-            Absolute path to the written JSON file as a string.
+            Absolute path to the written file as a string.
         """
-        tmp_dir = Path(tempfile.gettempdir()) / "apprentice_artifacts"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        dest = tmp_dir / f"{context_name}_discovery.json"
-        dest.write_text(json.dumps(candidates, indent=2), encoding="utf-8")
-        return str(dest)
+        return str(write_role(root, "discovery", json.dumps(candidates, indent=2)))
 
 
 # ---------------------------------------------------------------------------

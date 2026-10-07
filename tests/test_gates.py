@@ -5,6 +5,7 @@ from __future__ import annotations
 import textwrap
 from typing import TYPE_CHECKING
 
+from apprentice.core.artifacts import artifact_bundle, write_state_roles
 from apprentice.gates.consistency import ConsistencyGate
 from apprentice.gates.correctness import CorrectnessGate
 from apprentice.gates.lint import LintGate
@@ -15,6 +16,8 @@ from apprentice.models.work_item import GateVerdict, WorkItem
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from apprentice.core.session_store import SessionStore
 
 
 def _make_bundle(**kwargs: str) -> ArtifactBundle:
@@ -213,3 +216,82 @@ class TestReviewGate:
         result = ReviewGate(approval=approval).evaluate(_make_item(), bundle)
         assert result.verdict == GateVerdict.FAIL
         assert "missing fields" in result.diagnostics["error"]
+
+
+class TestReviewGateAgainstSealedApproval:
+    """Submit regenerates into a fresh owned root; the gate compares every role."""
+
+    def _approved(self, store: SessionStore) -> dict[str, object]:
+        record = store.create_run("selection", 2)
+        store.complete_run(
+            record,
+            {"generated_code": "impl = 1\n", "manim_scene_code": "scene = 1\n"},
+            {},
+            1.0,
+        )
+        snapshot = store.load_bundle(record)
+        return {
+            "approved_by": "tester",
+            "approved_at": "2026-10-06T00:00:00+00:00",
+            "artifact_hashes": {a.role: a.sha256 for a in snapshot.artifacts},
+        }
+
+    def _regenerate(self, store: SessionStore, state: dict[str, str]) -> ArtifactBundle:
+        root = store.allocate_work_root()
+        return artifact_bundle("regenerated", write_state_roles(root, state))
+
+    def test_identical_regenerated_bytes_pass(self, store: SessionStore) -> None:
+        approval = self._approved(store)
+        bundle = self._regenerate(
+            store, {"generated_code": "impl = 1\n", "manim_scene_code": "scene = 1\n"}
+        )
+        result = ReviewGate(approval=approval).evaluate(_make_item(), bundle)
+        assert result.verdict == GateVerdict.PASS
+
+    def test_different_regenerated_bytes_fail(self, store: SessionStore) -> None:
+        approval = self._approved(store)
+        bundle = self._regenerate(
+            store, {"generated_code": "impl = 2\n", "manim_scene_code": "scene = 1\n"}
+        )
+        result = ReviewGate(approval=approval).evaluate(_make_item(), bundle)
+        assert result.verdict == GateVerdict.FAIL
+        assert set(result.diagnostics["diffs"]) == {"implementation"}
+
+    def test_regenerated_role_absent_from_approval_fails(self, store: SessionStore) -> None:
+        approval = self._approved(store)
+        bundle = self._regenerate(
+            store,
+            {
+                "generated_code": "impl = 1\n",
+                "manim_scene_code": "scene = 1\n",
+                "anki_deck_content": "front,back\n",
+            },
+        )
+        result = ReviewGate(approval=approval).evaluate(_make_item(), bundle)
+        assert result.verdict == GateVerdict.FAIL
+        assert set(result.diagnostics["diffs"]) == {"anki_deck"}
+
+    def test_approved_role_missing_from_regeneration_fails(self, store: SessionStore) -> None:
+        approval = self._approved(store)
+        bundle = self._regenerate(store, {"generated_code": "impl = 1\n"})
+        result = ReviewGate(approval=approval).evaluate(_make_item(), bundle)
+        assert result.verdict == GateVerdict.FAIL
+        assert set(result.diagnostics["diffs"]) == {"manim_scene"}
+
+    def test_changed_instrumented_role_fails(self, store: SessionStore) -> None:
+        record = store.create_run("selection", 2)
+        store.complete_run(
+            record, {"generated_code": "impl = 1\n", "instrumented_code": "trace = 1\n"}, {}, 1.0
+        )
+        snapshot = store.load_bundle(record)
+        approval = {
+            "approved_by": "tester",
+            "approved_at": "2026-10-06T00:00:00+00:00",
+            "artifact_hashes": {a.role: a.sha256 for a in snapshot.artifacts},
+        }
+        bundle = self._regenerate(
+            store, {"generated_code": "impl = 1\n", "instrumented_code": "trace = 2\n"}
+        )
+        result = ReviewGate(approval=approval).evaluate(_make_item(), bundle)
+        assert result.verdict == GateVerdict.FAIL
+        assert set(result.diagnostics["diffs"]) == {"instrumented"}

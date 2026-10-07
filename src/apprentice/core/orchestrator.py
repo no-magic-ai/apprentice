@@ -15,6 +15,7 @@ from apprentice.agents.instrumentation import build_instrumentation_agent
 from apprentice.agents.packaging import build_packaging_agent
 from apprentice.agents.review import build_review_agent
 from apprentice.agents.visualization import build_visualization_agent
+from apprentice.core.artifacts import ROLE_FILENAMES, tier_directory, validate_algorithm_name
 from apprentice.core.budget import (
     BudgetTracker,
     make_after_agent_callback,
@@ -29,12 +30,14 @@ from apprentice.gates.review import ReviewGate
 from apprentice.gates.schema_compliance import SchemaComplianceGate
 
 if TYPE_CHECKING:
+    from apprentice.core.artifacts import RunScope
     from apprentice.core.config import ApprenticeConfig
 
 
 def build_pipeline(
     model: LiteLlm,
     config: ApprenticeConfig,
+    scope: RunScope,
     include_packaging: bool = False,
     approval: dict[str, Any] | None = None,
 ) -> SequentialAgent:
@@ -58,6 +61,8 @@ def build_pipeline(
     Args:
         model: LiteLlm model instance for all agents.
         config: Full apprentice configuration.
+        scope: Identity and exclusive work root of the run; every gate and
+            validation callback writes and evaluates artifacts only there.
         include_packaging: Whether to include the packaging agent
             (True for `submit`, False for `build`).
         approval: Human-review approval payload loaded from the run record.
@@ -74,6 +79,7 @@ def build_pipeline(
 
     implementation_agent = build_implementation_agent(
         model,
+        scope.work_root,
         max_retries=config.agents.max_implementation_retries,
     )
     artifact_parallel = ParallelAgent(
@@ -87,22 +93,24 @@ def build_pipeline(
     )
     review_agent = build_review_agent(
         model,
+        scope.work_root,
+        scope.algorithm,
         max_iterations=config.agents.max_review_rounds,
     )
 
     sub_agents: list[Any] = [
         implementation_agent,
-        GateAgent(CorrectnessGate(), after_stage="implementation", tracker=tracker),
-        GateAgent(LintGate(), after_stage="implementation", tracker=tracker),
+        GateAgent.after(CorrectnessGate(), "implementation", scope, tracker=tracker),
+        GateAgent.after(LintGate(), "implementation", scope, tracker=tracker),
         artifact_parallel,
-        GateAgent(ConsistencyGate(), after_stage="artifact_generation", tracker=tracker),
-        GateAgent(SchemaComplianceGate(), after_stage="artifact_generation", tracker=tracker),
+        GateAgent.after(ConsistencyGate(), "artifact_generation", scope, tracker=tracker),
+        GateAgent.after(SchemaComplianceGate(), "artifact_generation", scope, tracker=tracker),
         review_agent,
     ]
 
     if include_packaging:
         sub_agents.append(
-            GateAgent(ReviewGate(approval=approval), after_stage="review", tracker=tracker),
+            GateAgent.after(ReviewGate(approval=approval), "review", scope, tracker=tracker),
         )
         sub_agents.append(build_packaging_agent(model))
 
@@ -119,6 +127,33 @@ def build_pipeline(
     model_name = getattr(model, "model", "")
     for sub in sub_agents:
         wire_agent_callbacks(sub, tracker, model_name)
+
+    if include_packaging:
+        # The old publisher's instruction names the regenerated role paths and
+        # the destination name/tier. Seed them from the fresh regeneration root
+        # (roles that were not regenerated stay empty) after the budget wiring
+        # above, which replaces each agent's before_agent_callback.
+        publisher = sub_agents[-1]
+        name = validate_algorithm_name(scope.algorithm)
+        tier_dir = tier_directory(scope.tier)
+        state_keys = {
+            "implementation_path": "implementation",
+            "instrumented_path": "instrumented",
+            "manim_scene_path": "manim_scene",
+            "anki_deck_path": "anki_deck",
+        }
+
+        async def seed_publisher_context(callback_context: Any) -> None:
+            for key, role in state_keys.items():
+                path = scope.work_root / ROLE_FILENAMES[role]
+                callback_context.state[key] = str(path) if path.is_file() else ""
+            callback_context.state["name"] = name
+            callback_context.state["tier_dir"] = tier_dir
+
+        publisher.before_agent_callback = [
+            publisher.before_agent_callback,
+            seed_publisher_context,
+        ]
 
     return pipeline
 

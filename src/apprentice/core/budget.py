@@ -84,14 +84,17 @@ class BudgetTracker:
         gate_name: str,
         after_stage: str,
         verdict: str,
+        *,
+        blocking: bool,
         diagnostics: dict[str, Any] | None = None,
     ) -> None:
-        """Append a gate verdict in execution order."""
+        """Append a gate verdict in execution order, noting whether the gate blocks."""
         self.gate_verdicts.append(
             {
                 "gate_name": gate_name,
                 "after_stage": after_stage,
                 "verdict": verdict,
+                "blocking": blocking,
                 "diagnostics": diagnostics or {},
             }
         )

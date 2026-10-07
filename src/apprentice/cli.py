@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from apprentice.core.config import ApprenticeConfig
+    from apprentice.core.session_store import RunRecord, SessionStore
+    from apprentice.models.work_item import BlockingGateError
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -46,7 +48,12 @@ def main(argv: list[str] | None = None) -> int:
 
     submit_parser = subparsers.add_parser("submit", help="Package last build into PRs")
     submit_parser.add_argument("algorithm", help="Algorithm name to package")
-    submit_parser.add_argument("--tier", type=int, default=2, help="Algorithm tier (default: 2)")
+    submit_parser.add_argument(
+        "--tier",
+        type=int,
+        default=None,
+        help="Assert the approved run's tier (the sealed bundle's tier is always used)",
+    )
     submit_parser.add_argument("--backend", type=str, default=None, help="Override backend")
     submit_parser.add_argument("--model", type=str, default=None, help="Override model")
     submit_parser.add_argument(
@@ -85,7 +92,15 @@ def main(argv: list[str] | None = None) -> int:
 
     subparsers.add_parser("metrics", help="Show aggregated pipeline metrics")
 
-    subparsers.add_parser("preview", help="Inspect last build artifacts")
+    preview_parser = subparsers.add_parser(
+        "preview", help="Inspect the sealed artifact bundle of a completed run"
+    )
+    preview_parser.add_argument(
+        "--run-id",
+        type=str,
+        default=None,
+        help="Run ID to preview (default: most recently started completed run)",
+    )
     subparsers.add_parser("status", help="Show budget usage and queue state")
     subparsers.add_parser("config", help="Display current configuration")
 
@@ -115,7 +130,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "metrics":
         return _cmd_metrics()
     if args.command == "preview":
-        return _cmd_preview()
+        return _cmd_preview(args)
     if args.command == "status":
         return _cmd_status(cfg)
     if args.command == "config":
@@ -170,17 +185,23 @@ def _resolve_model(cfg: ApprenticeConfig, args: Any) -> Any:
 
 
 def _cmd_build(cfg: ApprenticeConfig, args: Any) -> int:
+    from apprentice.core.artifacts import ArtifactError
     from apprentice.core.orchestrator import build_pipeline, get_budget_tracker_from_pipeline
     from apprentice.core.progress import PipelineProgress, suppress_noisy_loggers
     from apprentice.core.session_store import SessionStore
+    from apprentice.models.work_item import BlockingGateError
 
     suppress_noisy_loggers()
 
     store = SessionStore()
-    record = store.create_run(args.algorithm, args.tier)
+    try:
+        record = store.create_run(args.algorithm, args.tier)
+    except ArtifactError as exc:
+        _print_json({"error": str(exc)})
+        return 1
 
     model = _resolve_model(cfg, args)
-    pipeline = build_pipeline(model, cfg, include_packaging=False)
+    pipeline = build_pipeline(model, cfg, store.run_scope(record), include_packaging=False)
 
     progress = PipelineProgress(args.algorithm, args.tier)
     start = time.monotonic()
@@ -203,6 +224,12 @@ def _cmd_build(cfg: ApprenticeConfig, args: Any) -> int:
             store.fail_run(record, session_state, budget_summary, elapsed, "no output generated")
             progress.finish(False, elapsed)
 
+    except BlockingGateError as failure:
+        elapsed = time.monotonic() - start
+        _record_gate_halt(store, record, pipeline, failure, elapsed)
+        progress.finish(False, elapsed)
+        _print_json({"error": str(failure), "run_id": record.run_id, "gate": failure.verdict})
+        return 1
     except Exception as exc:
         elapsed = time.monotonic() - start
         store.fail_run(record, {}, {}, elapsed, str(exc))
@@ -214,15 +241,41 @@ def _cmd_build(cfg: ApprenticeConfig, args: Any) -> int:
     return 0
 
 
+def _record_gate_halt(
+    store: SessionStore,
+    record: RunRecord,
+    pipeline: Any,
+    failure: BlockingGateError,
+    elapsed: float,
+) -> RunRecord:
+    """Record a run halted by a blocking gate once, with its persisted state and real budget."""
+    from apprentice.core.orchestrator import get_budget_tracker_from_pipeline
+
+    tracker = get_budget_tracker_from_pipeline(pipeline)
+    return store.fail_run(
+        record,
+        failure.persisted_state(),
+        tracker.to_dict() if tracker else {},
+        elapsed,
+        str(failure),
+    )
+
+
 def _cmd_submit(cfg: ApprenticeConfig, args: Any) -> int:
+    from apprentice.core.artifacts import ArtifactError, RunScope
     from apprentice.core.observability import get_logger
     from apprentice.core.orchestrator import build_pipeline
     from apprentice.core.session_store import SessionStore
+    from apprentice.models.work_item import BlockingGateError
 
     logger = get_logger(__name__)
     store = SessionStore()
 
-    run_id = args.run_id or _latest_completed_run_id(store, args.algorithm)
+    try:
+        run_id = args.run_id or _latest_completed_run_id(store, args.algorithm)
+    except ValueError as exc:
+        _print_json({"error": str(exc)})
+        return 1
     if run_id is None:
         _print_json(
             {
@@ -236,11 +289,26 @@ def _cmd_submit(cfg: ApprenticeConfig, args: Any) -> int:
 
     try:
         record = store.load(run_id)
-    except FileNotFoundError:
-        _print_json({"error": f"Run not found: {run_id}"})
+    except (FileNotFoundError, ValueError) as exc:
+        _print_json({"error": str(exc)})
         return 1
 
-    approval = record.session_state.get("review_approval") if record.session_state else None
+    try:
+        snapshot = store.load_bundle(record)
+    except ArtifactError as exc:
+        _print_json({"error": str(exc), "run_id": run_id})
+        return 1
+
+    approval = record.approval
+    if not isinstance(approval, dict):
+        _print_json(
+            {
+                "error": "stored approval of this run is not an object",
+                "run_id": run_id,
+                "remediation": f"apprentice approve {run_id}",
+            }
+        )
+        return 1
     if not approval:
         _print_json(
             {
@@ -251,34 +319,101 @@ def _cmd_submit(cfg: ApprenticeConfig, args: Any) -> int:
         )
         return 1
 
-    logger.info("submit started: %s (tier %d, run %s)", args.algorithm, args.tier, run_id)
+    # The approval must name exactly the sealed bundle that was verified above;
+    # the bundle, not the command line, fixes the name and tier published.
+    sealed_identity = {
+        "run_id": snapshot.run_id,
+        "algorithm": snapshot.algorithm,
+        "tier": snapshot.tier,
+        "manifest_sha256": snapshot.manifest_sha256,
+    }
+    approved_identity = {key: approval.get(key) for key in sealed_identity}
+    approved_tier = approved_identity["tier"]
+    # The review gate compares regenerated roles with this map, so it must be
+    # exactly the verified bundle's role hashes, not merely present.
+    sealed_hashes = {artifact.role: artifact.sha256 for artifact in snapshot.artifacts}
+    # Equality alone would accept True for 1 and 2.0 for 2; the tier must be an integer.
+    if (
+        approved_identity != sealed_identity
+        or not isinstance(approved_tier, int)
+        or isinstance(approved_tier, bool)
+        or approval.get("artifact_hashes") != sealed_hashes
+    ):
+        _print_json(
+            {
+                "error": "approval does not match the run's sealed bundle",
+                "run_id": run_id,
+                "approved": approved_identity,
+                "sealed": sealed_identity,
+                "remediation": f"apprentice approve {run_id}",
+            }
+        )
+        return 1
+
+    if args.algorithm != snapshot.algorithm or args.tier not in (None, snapshot.tier):
+        _print_json(
+            {
+                "error": "requested algorithm/tier does not match the approved run",
+                "run_id": run_id,
+                "requested": {"algorithm": args.algorithm, "tier": args.tier},
+                "approved": {"algorithm": snapshot.algorithm, "tier": snapshot.tier},
+            }
+        )
+        return 1
+    algorithm, tier = snapshot.algorithm, snapshot.tier
+
+    logger.info("submit started: %s (tier %d, run %s)", algorithm, tier, run_id)
 
     model = _resolve_model(cfg, args)
-    pipeline = build_pipeline(model, cfg, include_packaging=True, approval=approval)
+    # Regeneration runs in a distinct fresh root so the sealed approved bundle
+    # is never rewritten; the review gate compares every regenerated role
+    # against the approved hashes before packaging may run.
+    scope = RunScope(
+        run_id=record.run_id,
+        algorithm=algorithm,
+        tier=tier,
+        work_root=store.allocate_work_root(),
+    )
+    try:
+        pipeline = build_pipeline(model, cfg, scope, include_packaging=True, approval=approval)
+    except ArtifactError as exc:
+        _print_json({"error": str(exc), "run_id": run_id})
+        return 1
 
     start = time.monotonic()
-    session_state = asyncio.run(_run_pipeline(pipeline, args.algorithm, args.tier, ""))
+    try:
+        session_state = asyncio.run(_run_pipeline(pipeline, algorithm, tier, ""))
+    except BlockingGateError as failure:
+        # The approved run and its sealed bundle are left exactly as they were.
+        _print_json(
+            {
+                "error": str(failure),
+                "run_id": run_id,
+                "gate": failure.verdict,
+                "regeneration_root": str(scope.work_root),
+            }
+        )
+        return 1
     elapsed = time.monotonic() - start
 
-    _print_build_result(args.algorithm, args.tier, session_state, elapsed, run_id)
+    _print_build_result(algorithm, tier, session_state, elapsed, run_id)
     return 0
 
 
 def _cmd_approve(args: Any) -> int:
-    """Record a human-review approval for a completed build run."""
+    """Record a human-review approval bound to a completed run's sealed bundle."""
     import os
     from datetime import UTC, datetime
 
-    from apprentice.core.gate_agent import materialize_artifacts
+    from apprentice.core.artifacts import ArtifactError
     from apprentice.core.session_store import SessionStore
-    from apprentice.gates.review import compute_artifact_hashes
 
     store = SessionStore()
 
     try:
         record = store.load(args.run_id)
-    except FileNotFoundError:
-        _print_json({"error": f"Run not found: {args.run_id}"})
+    except (FileNotFoundError, ValueError) as exc:
+        _print_json({"error": str(exc)})
         return 1
 
     if record.status != "completed":
@@ -304,44 +439,38 @@ def _cmd_approve(args: Any) -> int:
         )
         return 1
 
-    bundle = materialize_artifacts(record.session_state or {})
-    hashes = compute_artifact_hashes(bundle)
-    if not hashes:
-        _print_json(
-            {
-                "error": (
-                    "no artifacts could be materialized from run state; "
-                    "rebuild before approving."
-                ),
-                "run_id": args.run_id,
-            }
-        )
+    try:
+        snapshot = store.load_bundle(record)
+    except ArtifactError as exc:
+        _print_json({"error": str(exc), "run_id": args.run_id})
         return 1
 
-    approval = {
+    record.approval = {
+        "run_id": snapshot.run_id,
+        "algorithm": snapshot.algorithm,
+        "tier": snapshot.tier,
+        "manifest_sha256": snapshot.manifest_sha256,
         "approved_by": approver,
         "approved_at": datetime.now(tz=UTC).isoformat(),
-        "run_id": args.run_id,
-        "artifact_hashes": hashes,
+        "artifact_hashes": {artifact.role: artifact.sha256 for artifact in snapshot.artifacts},
     }
-
-    state = dict(record.session_state) if record.session_state else {}
-    state["review_approval"] = approval
-    record.session_state = state
     store.save(record)
 
     _print_json(
         {
             "approved": True,
-            "run_id": args.run_id,
+            "run_id": snapshot.run_id,
+            "algorithm": snapshot.algorithm,
+            "tier": snapshot.tier,
+            "manifest_sha256": snapshot.manifest_sha256,
             "approved_by": approver,
-            "artifact_hashes": hashes,
+            "artifacts": snapshot.describe(),
         }
     )
     return 0
 
 
-def _latest_completed_run_id(store: Any, algorithm: str) -> str | None:
+def _latest_completed_run_id(store: SessionStore, algorithm: str) -> str | None:
     """Return the most recent completed run_id for `algorithm`, or None."""
     for record in store.list_runs(status="completed", limit=50):
         if record.algorithm_name == algorithm:
@@ -396,6 +525,8 @@ async def _run_pipeline_with_progress(
     from google.adk.sessions import InMemorySessionService
     from google.genai import types
 
+    from apprentice.models.work_item import BlockingGateError
+
     session_service = InMemorySessionService()  # type: ignore[no-untyped-call]
     artifact_service = InMemoryArtifactService()
 
@@ -431,23 +562,34 @@ async def _run_pipeline_with_progress(
 
     run_config = RunConfig(max_llm_calls=50)
 
-    if progress is not None:
-        with progress.start():
-            async for event in runner.run_async(
+    try:
+        if progress is not None:
+            with progress.start():
+                async for event in runner.run_async(
+                    user_id=user_id,
+                    session_id=session.id,
+                    new_message=user_message,
+                    run_config=run_config,
+                ):
+                    progress.on_event(event)
+        else:
+            async for _event in runner.run_async(
                 user_id=user_id,
                 session_id=session.id,
                 new_message=user_message,
                 run_config=run_config,
             ):
-                progress.on_event(event)
-    else:
-        async for _event in runner.run_async(
-            user_id=user_id,
-            session_id=session.id,
-            new_message=user_message,
-            run_config=run_config,
-        ):
-            pass
+                pass
+    except BlockingGateError as failure:
+        # The gate's verdict delta is already stored; read the session back
+        # from this same service so the halted run keeps its outputs.
+        stored = await session_service.get_session(
+            app_name="apprentice", user_id=user_id, session_id=session.id
+        )
+        if stored is None:
+            raise RuntimeError(f"session {session.id} vanished after {failure}") from failure
+        failure.session_state = dict(stored.state)
+        raise
 
     updated_session = await session_service.get_session(
         app_name="apprentice", user_id=user_id, session_id=session.id
@@ -498,27 +640,46 @@ async def _run_agent(agent: Any, prompt: str) -> dict[str, Any]:
     return dict(updated_session.state) if updated_session else {}
 
 
-def _cmd_preview() -> int:
-    import tempfile
+def _cmd_preview(args: Any) -> int:
+    from apprentice.core.artifacts import ArtifactError
+    from apprentice.core.session_store import SessionStore
 
-    artifacts_dir = Path(tempfile.gettempdir()) / "apprentice_artifacts"
-    if not artifacts_dir.exists():
-        _print_json({"error": "No artifacts found. Run 'apprentice build' first."})
+    store = SessionStore()
+    run_id = args.run_id
+    if run_id is None:
+        try:
+            completed = store.list_runs(status="completed", limit=1)
+        except ValueError as exc:
+            _print_json({"error": str(exc)})
+            return 1
+        if not completed:
+            _print_json({"error": "No completed run found. Run 'apprentice build' first."})
+            return 1
+        run_id = completed[0].run_id
+
+    try:
+        record = store.load(run_id)
+        snapshot = store.load_bundle(record)
+    except (FileNotFoundError, ValueError, ArtifactError) as exc:
+        _print_json({"error": str(exc), "run_id": run_id})
         return 1
 
-    files = sorted(artifacts_dir.iterdir())
-    artifacts: dict[str, dict[str, Any]] = {}
-    for f in files:
-        if f.is_file():
-            content = f.read_text(encoding="utf-8")
-            preview = content[:500] + ("..." if len(content) > 500 else "")
-            artifacts[f.name] = {
-                "path": str(f),
-                "size_bytes": f.stat().st_size,
-                "preview": preview,
-            }
+    artifacts = snapshot.describe()
+    for entry, artifact in zip(artifacts, snapshot.artifacts, strict=True):
+        content = artifact.data.decode("utf-8")
+        entry["preview"] = content[:500] + ("..." if len(content) > 500 else "")
 
-    _print_json({"artifacts_dir": str(artifacts_dir), "files": artifacts})
+    _print_json(
+        {
+            "run_id": snapshot.run_id,
+            "algorithm": snapshot.algorithm,
+            "tier": snapshot.tier,
+            "manifest_sha256": snapshot.manifest_sha256,
+            "bundle_dir": str(store.bundle_dir(snapshot.run_id)),
+            "approved": bool(record.approval),
+            "artifacts": artifacts,
+        }
+    )
     return 0
 
 
@@ -571,17 +732,19 @@ def _cmd_dev(cfg: ApprenticeConfig, args: Any) -> int:
 
 
 def _cmd_retry(cfg: ApprenticeConfig, args: Any) -> int:
+    from apprentice.core.artifacts import ArtifactError
     from apprentice.core.observability import get_logger
     from apprentice.core.orchestrator import build_pipeline, get_budget_tracker_from_pipeline
     from apprentice.core.session_store import SessionStore
+    from apprentice.models.work_item import BlockingGateError
 
     logger = get_logger(__name__)
     store = SessionStore()
 
     try:
         old_record = store.load(args.run_id)
-    except FileNotFoundError:
-        _print_json({"error": f"Run not found: {args.run_id}"})
+    except (FileNotFoundError, ValueError) as exc:
+        _print_json({"error": str(exc)})
         return 1
 
     if old_record.status != "failed":
@@ -592,10 +755,15 @@ def _cmd_retry(cfg: ApprenticeConfig, args: Any) -> int:
     tier = old_record.tier
     logger.info("retrying: %s (tier %d) from run %s", algorithm, tier, args.run_id)
 
-    model = _resolve_model(cfg, args)
-    pipeline = build_pipeline(model, cfg, include_packaging=False)
+    try:
+        new_record = store.create_run(algorithm, tier)
+    except ArtifactError as exc:
+        _print_json({"error": str(exc)})
+        return 1
 
-    new_record = store.create_run(algorithm, tier)
+    model = _resolve_model(cfg, args)
+    pipeline = build_pipeline(model, cfg, store.run_scope(new_record), include_packaging=False)
+
     start = time.monotonic()
 
     try:
@@ -613,6 +781,12 @@ def _cmd_retry(cfg: ApprenticeConfig, args: Any) -> int:
                 new_record, session_state, budget_summary, elapsed, "no output generated"
             )
 
+    except BlockingGateError as failure:
+        elapsed = time.monotonic() - start
+        _record_gate_halt(store, new_record, pipeline, failure, elapsed)
+        logger.error("retry failed: %s", failure)
+        _print_json({"error": str(failure), "run_id": new_record.run_id, "gate": failure.verdict})
+        return 1
     except Exception as exc:
         elapsed = time.monotonic() - start
         store.fail_run(new_record, {}, {}, elapsed, str(exc))
@@ -628,7 +802,11 @@ def _cmd_history(args: Any) -> int:
     from apprentice.core.session_store import SessionStore
 
     store = SessionStore()
-    records = store.list_runs(status=args.status, limit=args.limit)
+    try:
+        records = store.list_runs(status=args.status, limit=args.limit)
+    except ValueError as exc:
+        _print_json({"error": str(exc)})
+        return 1
 
     entries = [
         {
@@ -651,7 +829,11 @@ def _cmd_metrics() -> int:
     from apprentice.core.session_store import SessionStore
 
     store = SessionStore()
-    records = store.list_runs(limit=100)
+    try:
+        records = store.list_runs(limit=100)
+    except ValueError as exc:
+        _print_json({"error": str(exc)})
+        return 1
 
     if not records:
         _print_json({"error": "No run records found. Run 'apprentice build' first."})

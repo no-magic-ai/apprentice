@@ -29,6 +29,7 @@ from apprentice.core.metrics import PipelineReport, aggregate_runs
 from apprentice.core.observability import get_logger, setup_logging
 from apprentice.core.progress import IntegrationProgress, suppress_noisy_loggers
 from apprentice.core.session_store import RunRecord, SessionStore
+from apprentice.models.work_item import BlockingGateError
 
 _REPORT_DIR = Path.home() / ".apprentice" / "reports"
 
@@ -87,7 +88,7 @@ def _run_single(
     logger: Any,
 ) -> RunRecord:
     """Run the pipeline for a single algorithm and return the run record."""
-    from apprentice.core.orchestrator import build_pipeline
+    from apprentice.core.orchestrator import build_pipeline, get_budget_tracker_from_pipeline
     from apprentice.providers.factory import create_model, create_model_from_override
 
     if model:
@@ -109,8 +110,8 @@ def _run_single(
     else:
         llm_model = create_model(cfg.provider)
 
-    pipeline = build_pipeline(llm_model, cfg, include_packaging=False)
     record = store.create_run(algorithm, tier)
+    pipeline = build_pipeline(llm_model, cfg, store.run_scope(record), include_packaging=False)
 
     logger.info("starting: %s (tier %d) [%s]", algorithm, tier, record.run_id)
     start = time.monotonic()
@@ -120,8 +121,6 @@ def _run_single(
 
         session_state = asyncio.run(_run_pipeline(pipeline, algorithm, tier, ""))
         elapsed = time.monotonic() - start
-
-        from apprentice.core.orchestrator import get_budget_tracker_from_pipeline
 
         tracker = get_budget_tracker_from_pipeline(pipeline)
         budget_summary = tracker.to_dict() if tracker else {}
@@ -140,6 +139,17 @@ def _run_single(
             )
             logger.warning("failed: %s in %.1fs — no output", algorithm, elapsed)
 
+    except BlockingGateError as failure:
+        elapsed = time.monotonic() - start
+        tracker = get_budget_tracker_from_pipeline(pipeline)
+        record = store.fail_run(
+            record,
+            failure.persisted_state(),
+            tracker.to_dict() if tracker else {},
+            elapsed,
+            str(failure),
+        )
+        logger.error("halted: %s in %.1fs — %s", algorithm, elapsed, failure)
     except Exception as exc:
         elapsed = time.monotonic() - start
         record = store.fail_run(record, {}, {}, elapsed, str(exc))
@@ -170,11 +180,15 @@ def main() -> int:
     store = SessionStore()
 
     if args.report_only:
-        records = store.list_runs(limit=50)
-        if not records:
+        try:
+            past_records = store.list_runs(limit=50)
+        except ValueError as exc:
+            print(f"Cannot report: {exc}", file=sys.stderr)
+            return 1
+        if not past_records:
             print("No past runs found.")
             return 0
-        report = aggregate_runs(records)
+        report = aggregate_runs(past_records)
         progress = IntegrationProgress(0, "", "")
         progress.print_summary(report)
         return 0

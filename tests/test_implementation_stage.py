@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from apprentice.models.budget import CostEstimate
 from apprentice.models.work_item import PipelineContext, WorkItem
 from apprentice.stages.implementation import (
@@ -9,6 +11,9 @@ from apprentice.stages.implementation import (
     _check_stdlib_only,
     _extract_code_block,
 )
+
+if TYPE_CHECKING:
+    from apprentice.core.session_store import SessionStore
 
 
 class TestExtractCodeBlock:
@@ -66,11 +71,11 @@ class TestImplementationStage:
         est4 = stage.estimate_cost(WorkItem(id="t", algorithm_name="a", tier=4))
         assert est4.estimated_input_tokens > est1.estimated_input_tokens
 
-    def test_execute_requires_provider(self) -> None:
+    def test_execute_requires_provider(self, store: SessionStore) -> None:
         import pytest
 
         stage = ImplementationStage()
         item = WorkItem(id="t", algorithm_name="test", tier=1)
-        ctx = PipelineContext(config={})
+        ctx = PipelineContext(config={}, artifact_root=str(store.allocate_work_root()))
         with pytest.raises(RuntimeError, match="No provider configured"):
             stage.execute(item, ctx)

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import re
-import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from apprentice.core.artifacts import require_owned_root, write_role
 
 if TYPE_CHECKING:
     from apprentice.models.budget import CostEstimate
@@ -72,6 +73,7 @@ class VisualizationStage:
         """
         from apprentice.models.work_item import StageResult
 
+        root = require_owned_root(context.artifact_root)
         implementation_code = self._load_implementation(context)
         template_text = self._load_template(context)
         prompt = self._build_prompt(work_item, implementation_code, template_text)
@@ -87,7 +89,7 @@ class VisualizationStage:
             animation_steps=animation_steps,
         )
 
-        artifact_path = self._write_artifact(work_item.algorithm_name, scene_source)
+        artifact_path = self._write_artifact(root, scene_source)
         total_tokens = completion.input_tokens + completion.output_tokens
         cost = (
             completion.input_tokens * _INPUT_RATE_USD + completion.output_tokens * _OUTPUT_RATE_USD
@@ -226,21 +228,13 @@ class VisualizationStage:
             "No provider configured. Set context.config['provider'] to a ProviderInterface instance."
         )
 
-    def _write_artifact(self, algorithm_name: str, scene_source: str) -> str:
-        """Write the rendered Manim scene to a temp file.
-
-        Args:
-            algorithm_name: Used as the filename stem.
-            scene_source: Complete Python source for the Manim scene.
+    def _write_artifact(self, root: Path, scene_source: str) -> str:
+        """Write the manim_scene artifact into the invocation's owned root.
 
         Returns:
             Absolute path to the written file as a string.
         """
-        tmp_dir = Path(tempfile.gettempdir()) / "apprentice_artifacts"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        dest = tmp_dir / f"{algorithm_name}_scene.py"
-        dest.write_text(scene_source, encoding="utf-8")
-        return str(dest)
+        return str(write_role(root, "manim_scene", scene_source))
 
 
 # ---------------------------------------------------------------------------

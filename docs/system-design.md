@@ -489,10 +489,12 @@ Validators are pure Python functions wrapped with ADK's `FunctionTool`. Agents c
 ```python
 from google.adk.tools import FunctionTool
 
+
 def lint_validate(code_path: str) -> dict:
     """Validate Python code for syntax, docstrings, type annotations, and style."""
     result = LintValidator().validate({"implementation": code_path}, work_item)
     return result.to_dict()
+
 
 lint_tool = FunctionTool(func=lint_validate)
 ```
@@ -521,6 +523,7 @@ async def before_agent_budget_check(callback_context: CallbackContext):
     if remaining <= 0:
         return types.Content(parts=[types.Part(text="Budget exhausted.")])
     return None
+
 
 async def after_agent_track_cost(callback_context: CallbackContext):
     """Deduct actual usage from remaining budget."""
@@ -569,7 +572,7 @@ stateDiagram-v2
 
 ## 8. User Workflow — Assisted Mode (v1)
 
-Current CLI flow (0.4.0): `build` runs the pipeline through review; `preview` shows the artifacts; `apprentice approve <run-id>` records a human approval with artifact hashes; `submit <algorithm> --run-id <run-id>` re-runs the pipeline with packaging, and the human-review gate blocks packaging unless the regenerated artifact hashes match the approved ones. The diagram below predates the approval step.
+Current CLI flow (0.4.0): `build` runs the pipeline through review and seals the run's artifacts into an immutable run-owned bundle; `preview` verifies and shows that bundle; `apprentice approve <run-id>` binds a human approval to the run identity and bundle manifest digest; `submit <algorithm> --run-id <run-id>` checks the approval against the verified bundle, takes the name and tier from it, re-runs the pipeline with packaging into a fresh run-owned root, and the human-review gate stops the pipeline before packaging unless every regenerated artifact hash matches the approved ones (`submit` then exits 1 with the gate's diagnostics). The diagram below predates the approval step.
 
 ```mermaid
 sequenceDiagram
@@ -610,7 +613,7 @@ sequenceDiagram
 ```
 apprentice suggest [--tier N] [--limit N]               # Discovery Agent
 apprentice build <algorithm> [--tier N]                 # Full ADK pipeline through review
-apprentice preview                                      # Inspect last build artifacts
+apprentice preview [--run-id ID]                        # Verify and inspect a sealed bundle
 apprentice approve <run-id> [--approver NAME]           # Record human-review approval
 apprentice submit <algorithm> [--tier N] [--run-id ID]  # Re-run with packaging; gated on approval
 apprentice status                                       # Configured budget/limit values

@@ -9,49 +9,25 @@ Since artifact agents don't retry, this effectively runs once.
 from __future__ import annotations
 
 import json
-import tempfile
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from google.adk.agents import LlmAgent, LoopAgent
 
+from apprentice.core.artifacts import write_state_roles
+
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from google.adk.models.lite_llm import LiteLlm
 
 
-def _validate_all_artifacts(state: dict[str, Any]) -> dict[str, Any]:
-    """Run consistency and schema validators on all artifacts in session state."""
+def _validate_all_artifacts(
+    state: dict[str, Any], work_root: Path, algorithm_name: str
+) -> dict[str, Any]:
+    """Write session-state artifacts into the run's work root and validate them all."""
     from apprentice.validators.tools import consistency_validate, schema_validate
 
-    algorithm_name = state.get("algorithm_name", "algorithm")
-    tmp_dir = Path(tempfile.gettempdir()) / "apprentice_artifacts"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-
-    paths: dict[str, str] = {}
-
-    impl_code = state.get("generated_code", "")
-    if impl_code:
-        p = tmp_dir / f"{algorithm_name}.py"
-        p.write_text(impl_code, encoding="utf-8")
-        paths["implementation"] = str(p)
-
-    instr_code = state.get("instrumented_code", "")
-    if instr_code:
-        p = tmp_dir / f"{algorithm_name}_instrumented.py"
-        p.write_text(instr_code, encoding="utf-8")
-        paths["instrumented"] = str(p)
-
-    manim_code = state.get("manim_scene_code", "")
-    if manim_code:
-        p = tmp_dir / f"{algorithm_name}_scene.py"
-        p.write_text(manim_code, encoding="utf-8")
-        paths["manim_scene"] = str(p)
-
-    anki_content = state.get("anki_deck_content", "")
-    if anki_content:
-        p = tmp_dir / f"{algorithm_name}_cards.csv"
-        p.write_text(anki_content, encoding="utf-8")
-        paths["anki_deck"] = str(p)
+    paths = {role: str(path) for role, path in write_state_roles(work_root, state).items()}
 
     if not paths:
         return {
@@ -61,7 +37,7 @@ def _validate_all_artifacts(state: dict[str, Any]) -> dict[str, Any]:
         }
 
     artifacts_json = json.dumps(paths)
-    consistency = consistency_validate(artifacts_json)
+    consistency = consistency_validate(artifacts_json, algorithm_name)
     schema = schema_validate(artifacts_json)
 
     all_passed = consistency["passed"] and schema["passed"]
@@ -77,6 +53,8 @@ def _validate_all_artifacts(state: dict[str, Any]) -> dict[str, Any]:
 
 def build_review_agent(
     model: LiteLlm,
+    work_root: Path,
+    algorithm_name: str,
     max_iterations: int = 2,
 ) -> LoopAgent:
     """Build a review stage that validates artifacts programmatically.
@@ -87,6 +65,8 @@ def build_review_agent(
 
     Args:
         model: LiteLlm model instance (used for the placeholder agent).
+        work_root: The run's exclusive work root artifacts are validated in.
+        algorithm_name: The run's algorithm, checked for cross-artifact consistency.
         max_iterations: Maximum review rounds.
 
     Returns:
@@ -97,7 +77,7 @@ def build_review_agent(
         from google.genai import types
 
         state = callback_context.state
-        result = _validate_all_artifacts(state)
+        result = _validate_all_artifacts(state, work_root, algorithm_name)
 
         if result["all_passed"]:
             state["review_verdict"] = "passed"

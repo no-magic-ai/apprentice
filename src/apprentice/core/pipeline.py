@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -9,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING
 
+from apprentice.core.artifacts import ArtifactError, require_owned_root
 from apprentice.core.observability import get_logger, log_gate_result, log_stage_metrics
 from apprentice.models.artifact import ArtifactBundle
 from apprentice.models.budget import CostEstimate
@@ -264,7 +266,20 @@ class Pipeline:
     # ------------------------------------------------------------------
 
     def run(self, work_item: WorkItem, context: PipelineContext) -> PipelineResult:
-        """Orchestrate the full pipeline and return a PipelineResult."""
+        """Orchestrate the full pipeline and return a PipelineResult.
+
+        Raises:
+            ArtifactError: If `context.artifact_root` is unset, missing, a
+                symlink, or already holds artifacts from another invocation.
+                Checked before any stage (and therefore any provider) runs.
+        """
+        root = require_owned_root(context.artifact_root)
+        with os.scandir(root) as entries:
+            if any(entries):
+                raise ArtifactError(
+                    f"artifact root {root} already holds artifacts; allocate a fresh root "
+                    "with SessionStore.allocate_work_root() for every pipeline invocation"
+                )
         work_item.status = WorkItemStatus.IN_PROGRESS
 
         bundle = ArtifactBundle(

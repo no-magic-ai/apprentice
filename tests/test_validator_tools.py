@@ -109,9 +109,21 @@ class TestConsistencyValidate:
         import json
 
         artifacts = json.dumps({"implementation": str(f)})
-        result = consistency_validate(artifacts)
+        result = consistency_validate(artifacts, "algo")
         assert isinstance(result, dict)
         assert result["validator_name"] == "consistency"
+
+    def test_algorithm_name_comes_from_caller_not_role_filename(self, tmp_path: Path) -> None:
+        import json
+
+        f = tmp_path / "implementation.py"
+        f.write_text(_GOOD_CODE)
+
+        result = consistency_validate(json.dumps({"implementation": str(f)}), "dijkstra")
+
+        messages = [issue["message"] for issue in result["issues"]]
+        assert any("'dijkstra'" in message for message in messages)
+        assert not any("'implementation'" in message for message in messages)
 
 
 class TestSchemaValidate:
