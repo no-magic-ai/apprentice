@@ -29,20 +29,17 @@ Rejects algorithm names other than 1-64 lowercase letters, digits and underscore
 
 ### submit
 
-Regenerate an approved run and hand the regenerated files to the model-driven publisher, which opens PRs in `no-magic` and `no-magic-viz`.
+Open PRs with the exact bytes a human approved. No model is called and nothing is regenerated or rendered.
 
 ```
-apprentice submit <algorithm> [--run-id ID] [--tier N] [--backend NAME] [--model STRING]
+apprentice submit <algorithm> --run-id ID [--tier N]
 ```
 
-- `algorithm` — must equal the approved run's algorithm
-- `--run-id` — run to submit (from `apprentice history`); defaults to the most recently started completed run of `algorithm` among the 50 most recent completed runs
-- `--tier` — optional assertion; when given it must equal the approved run's tier
-- `--backend`, `--model` — as for `build`; they select the model that regenerates the artifacts and drives the publisher
+- `algorithm` — algorithm the approved run built; must match the run
+- `--run-id` — approved run to submit (required)
+- `--tier` — if given, must match the run's tier
 
-Before resolving a model or allocating any work root, `submit` verifies the run's sealed bundle (see [Architecture: Run-Owned Artifacts](architecture.md#run-owned-artifacts)) and requires an approval recorded with `apprentice approve` whose run ID, algorithm, tier, manifest digest and per-role artifact hashes equal that bundle. A run without a sealed bundle (it must be rebuilt), a bundle that fails verification, a missing or mismatched approval, or a conflicting algorithm or `--tier` prints a JSON error and exits 1 without changing the run. The approved name and tier, never a default, then drive the regeneration, the prompts and the publisher destinations `no-magic/<tier dir>/micro<name>.py` and `no-magic-viz/scenes/scene_micro<name>.py`.
-
-`submit` re-runs the model pipeline into a fresh root under `~/.apprentice/sessions/scratch/`. The review gate compares every regenerated role with the approved hashes; a changed, missing or added role stops the run with a JSON `gate` error before the publisher. When every role matches, the publisher receives the regenerated files' paths (not the sealed bundle) and uses its clone, branch, place-file and PR tools with the operator's ambient `git` and `gh` credentials. The publisher is model-driven, so `submit` does not guarantee that exactly the approved bytes are published, and it does not record a submission on the run.
+Verifies the approval, run identity and sealed bundle before any repository is cloned, then promotes the approved implementation to `no-magic/<tier dir>/micro<name>.py` and the approved scene to `no-magic-viz/scenes/scene_micro<name>.py` on branch `apprentice/<run-id>` and opens a PR in each repository with `gh`. Uses the operator's `git` and `gh` credentials. Under a short per-run lock it records the attempt on the run as `pending` before any clone; it ends `complete`, `partial` (lists, per repository, whether the branch was pushed and the PR opened before the error; `null` when a push or `gh pr create` timed out and its effect is unknown) or `failed` (no branch pushed), recorded only if the stored attempt is still the one it reserved (otherwise it exits non-zero and prints the effects it knows about). A run with any recorded attempt is refused without touching a repository and its stored attempt is printed; there is no retry or resume. A run whose build recorded a failed blocking gate is refused, and a run without a sealed bundle gets the rebuild instruction. See [Architecture: Packaging](architecture.md#packaging).
 
 ### suggest
 
@@ -97,9 +94,9 @@ apprentice approve <run_id> [--approver NAME]
 ```
 
 - `run_id` — exact ID from `apprentice history`
-- `--approver` — approver identity (default: `$GITHUB_USER`, then `$USER`)
+- `--approver` — approver identity (default: `$GITHUB_USER`, then `$USER`); must be non-blank without CR, LF or NUL, and an invalid explicit value is refused rather than replaced by the default
 
-Verifies the run's sealed bundle and stores the run ID, algorithm, tier, manifest digest, approver and time on the run record; prints every artifact's role, size, SHA-256 and destination. Fails for a tampered bundle and, for a run without a sealed bundle, asks for a rebuild. The approval is a local operator attestation, not a cryptographic identity.
+Verifies the run's sealed bundle and stores the run ID, algorithm, tier, manifest digest, approver and time on the run record; prints every artifact's role, size, SHA-256 and destination. Fails for a tampered bundle, for a run whose build recorded a failed blocking gate and for a run that already has a submission attempt (its approval is then fixed); for a run without a sealed bundle, asks for a rebuild. Re-approving before any attempt replaces the approval. The approval is a local operator attestation, not a cryptographic identity.
 
 ### preview
 

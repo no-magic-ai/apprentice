@@ -16,11 +16,6 @@ from apprentice.agents.discovery import (
 )
 from apprentice.agents.implementation import build_implementation_agent
 from apprentice.agents.instrumentation import build_instrumentation_agent
-from apprentice.agents.packaging import (
-    build_packaging_agent,
-    get_tier_directory,
-    place_file,
-)
 from apprentice.agents.review import build_review_agent
 from apprentice.agents.visualization import build_visualization_agent
 
@@ -150,43 +145,3 @@ class TestReviewAgentBuilder:
     def test_max_iterations(self, scope: RunScope) -> None:
         agent = build_review_agent(_model(), scope.work_root, scope.algorithm, max_iterations=3)
         assert agent.max_iterations == 3
-
-
-class TestPackagingAgentBuilder:
-    def test_returns_llm_agent(self) -> None:
-        agent = build_packaging_agent(_model())
-        assert isinstance(agent, LlmAgent)
-
-    def test_name(self) -> None:
-        agent = build_packaging_agent(_model())
-        assert agent.name == "packaging"
-
-    def test_has_tools(self) -> None:
-        agent = build_packaging_agent(_model())
-        assert len(agent.tools) >= 5
-
-
-class TestPackagingTools:
-    def test_get_tier_directory(self) -> None:
-        result = get_tier_directory(1)
-        assert result["tier_dir"] == "01-foundations"
-
-    def test_get_tier_directory_default(self) -> None:
-        result = get_tier_directory(99)
-        assert result["tier_dir"] == "02-alignment"
-
-    def test_place_file(self, tmp_path: object) -> None:
-        from pathlib import Path
-
-        tmp = Path(str(tmp_path))
-        src = tmp / "source.py"
-        src.write_text("print('hello')")
-        dst = tmp / "subdir" / "dest.py"
-
-        result = place_file(str(src), str(dst))
-        assert result["success"] is True
-        assert dst.exists()
-
-    def test_place_file_missing_source(self) -> None:
-        result = place_file("/nonexistent/file.py", "/tmp/dest.py")
-        assert result["success"] is False

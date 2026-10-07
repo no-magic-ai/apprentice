@@ -5,6 +5,7 @@ The store is the single authority for run identity and artifact ownership:
     <store_dir>/<run_id>.json            run record
     <store_dir>/runs/<run_id>/work/      mutable generation root of one run
     <store_dir>/runs/<run_id>/bundle/    sealed bundle + manifest (on completion)
+    <store_dir>/runs/<run_id>.lock       empty coordination file of `record_lock`
     <store_dir>/scratch/<uuid>/          exclusive roots for runs without a record
 """
 
@@ -14,15 +15,17 @@ import json
 import os
 import re
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from apprentice.core.artifacts import (
     ArtifactError,
     BundleSnapshot,
     RunScope,
+    _open_single_link_file,
     load_snapshot,
     require_owned_root,
     seal_bundle,
@@ -31,7 +34,11 @@ from apprentice.core.artifacts import (
     validate_algorithm_name,
 )
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
 _DEFAULT_STORE_DIR = Path.home() / ".apprentice" / "sessions"
+_FAIL = "fail"
 
 _RUN_ID = re.compile(r"[a-z][a-z0-9_]{0,63}-\d{8}T\d{6}Z-[0-9a-f]{32}")
 # Records written before run IDs carried a UUID: "<algorithm>-<UTC second>".
@@ -56,6 +63,9 @@ class RunRecord:
         elapsed_seconds: Wall-clock duration.
         manifest_sha256: Digest of the sealed bundle manifest (completed runs only).
         approval: Human-review approval bound to the sealed manifest.
+        submission: The run's single submit attempt: status (pending, partial,
+            failed or complete), manifest digest, workspace, branch, error and
+            the repository effects known so far (pushed branches, opened PRs).
     """
 
     run_id: str
@@ -70,6 +80,7 @@ class RunRecord:
     elapsed_seconds: float = 0.0
     manifest_sha256: str = ""
     approval: dict[str, Any] = field(default_factory=dict)
+    submission: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -106,7 +117,44 @@ class RunRecord:
             # Absent on records written before sealed bundles existed.
             manifest_sha256=data.get("manifest_sha256", ""),
             approval=data.get("approval", {}),
+            submission=data.get("submission", {}),
         )
+
+
+def blocking_gate_failures(budget_summary: object) -> list[dict[str, Any]]:
+    """Return the recorded gate verdicts that failed a blocking gate.
+
+    Verdicts are those `GateAgent` records through `BudgetTracker`. Entries
+    written before the `blocking` flag was recorded came from the four
+    pipeline gates, which are all blocking, so a missing flag counts as
+    blocking — the same default `GateAgent` applies to a gate without one.
+    WARN and PASS verdicts never block. A live blocking FAIL already halts
+    generation with `BlockingGateError`; this check keeps such a summary from
+    being sealed and refuses completed records sealed before that halt existed.
+
+    Raises:
+        ValueError: If the summary is not an object, its `gate_verdicts` is not
+            a list of objects, or a blocking FAIL lacks a string `gate_name` or
+            `after_stage`.
+    """
+    if not isinstance(budget_summary, dict):
+        raise ValueError("budget summary is not an object")
+    verdicts = budget_summary.get("gate_verdicts", [])
+    if not isinstance(verdicts, list) or not all(isinstance(v, dict) for v in verdicts):
+        raise ValueError("budget summary gate_verdicts is not a list of objects")
+    failures = [v for v in verdicts if v.get("verdict") == _FAIL and v.get("blocking", True)]
+    for failure in failures:
+        if not isinstance(failure.get("gate_name"), str) or not isinstance(
+            failure.get("after_stage"), str
+        ):
+            raise ValueError("a failed gate verdict has no gate_name or after_stage")
+    return failures
+
+
+def describe_gate_failures(failures: list[dict[str, Any]]) -> str:
+    """Return a one-line description of blocking gate failures."""
+    names = ", ".join(f"{f['gate_name']} after {f['after_stage']}" for f in failures)
+    return f"blocking gate failed: {names}"
 
 
 class SessionStore:
@@ -162,7 +210,20 @@ class SessionStore:
         budget_summary: dict[str, Any],
         elapsed: float,
     ) -> RunRecord:
-        """Seal the run's final artifacts into its bundle and mark it completed."""
+        """Seal the run's final artifacts into its bundle and mark it completed.
+
+        Raises:
+            ArtifactError: If a blocking gate failed (such a run is never sealed)
+                or the gate verdicts in `budget_summary` are malformed.
+        """
+        try:
+            failures = blocking_gate_failures(budget_summary)
+        except ValueError as exc:
+            raise ArtifactError(f"run {record.run_id} cannot be sealed: {exc}") from exc
+        if failures:
+            raise ArtifactError(
+                f"run {record.run_id} cannot be sealed: {describe_gate_failures(failures)}"
+            )
         record.manifest_sha256 = seal_bundle(
             self.bundle_dir(record.run_id),
             run_id=record.run_id,
@@ -263,6 +324,36 @@ class SessionStore:
         """Persist an updated run record, preserving identity."""
         self._write(record)
         return record
+
+    @contextmanager
+    def record_lock(self, run_id: str) -> Iterator[None]:
+        """Hold the exclusive lock that `approve` and `submit` take on one run.
+
+        The lock is an advisory `flock` on `runs/<run_id>.lock`, a dedicated
+        empty file that is created once and never replaced or removed, so every
+        holder locks the same inode. It serializes reading, checking and saving
+        the run record; it is held only for local work (no network, subprocess
+        or model call). Other readers and writers of the record do not take it.
+
+        Raises:
+            ValueError: If `run_id` is not a supported run ID.
+            FileNotFoundError: If the run has no record (no lock file is created).
+            ArtifactError: If the lock path is a symlink, not a regular file or
+                has more than one link.
+        """
+        import fcntl
+
+        if not self._record_path(run_id).exists():
+            raise FileNotFoundError(f"No run record found: {run_id}")
+        runs = self._dir / "runs"
+        runs.mkdir(parents=True, exist_ok=True)
+        path = require_owned_root(runs) / f"{run_id}.lock"
+        fd = _open_single_link_file(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)
 
     def delete(self, run_id: str) -> bool:
         """Delete a run record. Returns True if deleted, False if not found."""

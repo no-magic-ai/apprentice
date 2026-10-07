@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from apprentice.core.artifacts import BundleSnapshot
     from apprentice.core.config import ApprenticeConfig
     from apprentice.core.session_store import RunRecord, SessionStore
     from apprentice.models.work_item import BlockingGateError
@@ -46,21 +47,18 @@ def main(argv: list[str] | None = None) -> int:
         "--model", type=str, default=None, help="Override model (e.g. ollama_chat/llama3.3)"
     )
 
-    submit_parser = subparsers.add_parser("submit", help="Package last build into PRs")
-    submit_parser.add_argument("algorithm", help="Algorithm name to package")
-    submit_parser.add_argument(
-        "--tier",
-        type=int,
-        default=None,
-        help="Assert the approved run's tier (the sealed bundle's tier is always used)",
+    submit_parser = subparsers.add_parser(
+        "submit", help="Open PRs with the exact approved bytes of a run (no regeneration)"
     )
-    submit_parser.add_argument("--backend", type=str, default=None, help="Override backend")
-    submit_parser.add_argument("--model", type=str, default=None, help="Override model")
+    submit_parser.add_argument("algorithm", help="Algorithm the approved run built")
+    submit_parser.add_argument(
+        "--tier", type=int, default=None, help="Tier the approved run must have (optional)"
+    )
     submit_parser.add_argument(
         "--run-id",
         type=str,
-        default=None,
-        help="Run ID whose approval authorizes this submit (from 'apprentice history')",
+        required=True,
+        help="Approved run to submit (from 'apprentice history')",
     )
 
     approve_parser = subparsers.add_parser(
@@ -118,7 +116,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "build":
         return _cmd_build(cfg, args)
     if args.command == "submit":
-        return _cmd_submit(cfg, args)
+        return _cmd_submit(args)
     if args.command == "approve":
         return _cmd_approve(args)
     if args.command == "suggest":
@@ -201,7 +199,7 @@ def _cmd_build(cfg: ApprenticeConfig, args: Any) -> int:
         return 1
 
     model = _resolve_model(cfg, args)
-    pipeline = build_pipeline(model, cfg, store.run_scope(record), include_packaging=False)
+    pipeline = build_pipeline(model, cfg, store.run_scope(record))
 
     progress = PipelineProgress(args.algorithm, args.tier)
     start = time.monotonic()
@@ -261,200 +259,261 @@ def _record_gate_halt(
     )
 
 
-def _cmd_submit(cfg: ApprenticeConfig, args: Any) -> int:
-    from apprentice.core.artifacts import ArtifactError, RunScope
+def _cmd_submit(args: Any) -> int:
+    """Promote the exact approved bytes of a run; no model or generation runs.
+
+    The attempt is reserved under the run's record lock before any clone, push
+    or pull request, so concurrent or repeated submits publish at most once.
+    Its outcome is recorded only if the stored attempt is still the one this
+    process reserved.
+    """
+    from datetime import UTC, datetime
+
+    from apprentice.agents.packaging import PackagingError, submit_snapshot
     from apprentice.core.observability import get_logger
-    from apprentice.core.orchestrator import build_pipeline
     from apprentice.core.session_store import SessionStore
-    from apprentice.models.work_item import BlockingGateError
 
     logger = get_logger(__name__)
     store = SessionStore()
+    reservation = _reserve_submission(store, args)
+    if reservation is None:
+        return 1
+    snapshot, approval, reserved = reservation
 
+    logger.info("submit started: run %s manifest %s", snapshot.run_id, snapshot.manifest_sha256)
     try:
-        run_id = args.run_id or _latest_completed_run_id(store, args.algorithm)
-    except ValueError as exc:
-        _print_json({"error": str(exc)})
-        return 1
-    if run_id is None:
-        _print_json(
-            {
-                "error": (
-                    f"No completed build found for '{args.algorithm}'. "
-                    "Run 'apprentice build' first."
-                )
-            }
-        )
-        return 1
-
-    try:
-        record = store.load(run_id)
-    except (FileNotFoundError, ValueError) as exc:
-        _print_json({"error": str(exc)})
+        submissions = submit_snapshot(snapshot, approval, Path(reserved["workspace"]))
+    except PackagingError as exc:
+        # A push whose outcome is unknown (None) may have published, so it is partial.
+        pushed = any(effect["pushed"] is not False for effect in exc.effects)
+        outcome = {
+            "status": "partial" if pushed else "failed",
+            "finished_at": datetime.now(tz=UTC).isoformat(),
+            "error": str(exc),
+            "repositories": exc.effects,
+        }
+        recorded = _finish_submission(store, snapshot.run_id, reserved, outcome)
+        if recorded is not None:
+            _print_json({"error": str(exc), "run_id": snapshot.run_id, **recorded})
         return 1
 
-    try:
-        snapshot = store.load_bundle(record)
-    except ArtifactError as exc:
-        _print_json({"error": str(exc), "run_id": run_id})
-        return 1
-
-    approval = record.approval
-    if not isinstance(approval, dict):
-        _print_json(
-            {
-                "error": "stored approval of this run is not an object",
-                "run_id": run_id,
-                "remediation": f"apprentice approve {run_id}",
-            }
-        )
-        return 1
-    if not approval:
-        _print_json(
-            {
-                "error": "no human-review approval recorded for this run",
-                "run_id": run_id,
-                "remediation": f"apprentice approve {run_id}",
-            }
-        )
-        return 1
-
-    # The approval must name exactly the sealed bundle that was verified above;
-    # the bundle, not the command line, fixes the name and tier published.
-    sealed_identity = {
-        "run_id": snapshot.run_id,
-        "algorithm": snapshot.algorithm,
-        "tier": snapshot.tier,
-        "manifest_sha256": snapshot.manifest_sha256,
+    outcome = {
+        "status": "complete",
+        "finished_at": datetime.now(tz=UTC).isoformat(),
+        "repositories": [submission.to_dict() for submission in submissions],
     }
-    approved_identity = {key: approval.get(key) for key in sealed_identity}
-    approved_tier = approved_identity["tier"]
-    # The review gate compares regenerated roles with this map, so it must be
-    # exactly the verified bundle's role hashes, not merely present.
-    sealed_hashes = {artifact.role: artifact.sha256 for artifact in snapshot.artifacts}
-    # Equality alone would accept True for 1 and 2.0 for 2; the tier must be an integer.
-    if (
-        approved_identity != sealed_identity
-        or not isinstance(approved_tier, int)
-        or isinstance(approved_tier, bool)
-        or approval.get("artifact_hashes") != sealed_hashes
-    ):
-        _print_json(
-            {
-                "error": "approval does not match the run's sealed bundle",
-                "run_id": run_id,
-                "approved": approved_identity,
-                "sealed": sealed_identity,
-                "remediation": f"apprentice approve {run_id}",
-            }
-        )
+    recorded = _finish_submission(store, snapshot.run_id, reserved, outcome)
+    if recorded is None:
         return 1
-
-    if args.algorithm != snapshot.algorithm or args.tier not in (None, snapshot.tier):
-        _print_json(
-            {
-                "error": "requested algorithm/tier does not match the approved run",
-                "run_id": run_id,
-                "requested": {"algorithm": args.algorithm, "tier": args.tier},
-                "approved": {"algorithm": snapshot.algorithm, "tier": snapshot.tier},
-            }
-        )
-        return 1
-    algorithm, tier = snapshot.algorithm, snapshot.tier
-
-    logger.info("submit started: %s (tier %d, run %s)", algorithm, tier, run_id)
-
-    model = _resolve_model(cfg, args)
-    # Regeneration runs in a distinct fresh root so the sealed approved bundle
-    # is never rewritten; the review gate compares every regenerated role
-    # against the approved hashes before packaging may run.
-    scope = RunScope(
-        run_id=record.run_id,
-        algorithm=algorithm,
-        tier=tier,
-        work_root=store.allocate_work_root(),
-    )
-    try:
-        pipeline = build_pipeline(model, cfg, scope, include_packaging=True, approval=approval)
-    except ArtifactError as exc:
-        _print_json({"error": str(exc), "run_id": run_id})
-        return 1
-
-    start = time.monotonic()
-    try:
-        session_state = asyncio.run(_run_pipeline(pipeline, algorithm, tier, ""))
-    except BlockingGateError as failure:
-        # The approved run and its sealed bundle are left exactly as they were.
-        _print_json(
-            {
-                "error": str(failure),
-                "run_id": run_id,
-                "gate": failure.verdict,
-                "regeneration_root": str(scope.work_root),
-            }
-        )
-        return 1
-    elapsed = time.monotonic() - start
-
-    _print_build_result(algorithm, tier, session_state, elapsed, run_id)
+    _print_json({"run_id": snapshot.run_id, **recorded})
     return 0
 
 
+def _reserve_submission(
+    store: SessionStore, args: Any
+) -> tuple[BundleSnapshot, dict[str, Any], dict[str, Any]] | None:
+    """Under the record lock, verify the approval and save a pending attempt.
+
+    Returns the one captured snapshot, the approval read under the lock and
+    the reserved attempt, or None after printing why nothing was reserved.
+    """
+    from datetime import UTC, datetime
+
+    from apprentice.core.artifacts import ArtifactError
+    from apprentice.gates.review import ApprovalError, require_approved_snapshot
+
+    try:
+        with store.record_lock(args.run_id):
+            record = store.load(args.run_id)
+            try:
+                snapshot = require_approved_snapshot(
+                    store, record, algorithm=args.algorithm, tier=args.tier
+                )
+            except ApprovalError as exc:
+                _print_json(
+                    {"error": str(exc), "run_id": record.run_id, "remediation": exc.remediation}
+                )
+                return None
+            if not isinstance(record.submission, dict):
+                _print_json(
+                    {
+                        "error": f"stored submission attempt of run {record.run_id} is not an object",
+                        "run_id": record.run_id,
+                        "submission": record.submission,
+                    }
+                )
+                return None
+            if record.submission:
+                # One attempt per run: an attempt whose effects may be incomplete
+                # or unknown is never retried, resumed or overwritten.
+                _print_json(
+                    {
+                        "error": (
+                            f"run {record.run_id} already has a submission attempt; "
+                            "it is not published again"
+                        ),
+                        "run_id": record.run_id,
+                        "submission": record.submission,
+                    }
+                )
+                return None
+            workspace = store.allocate_work_root()
+            reserved = {
+                "status": "pending",
+                "started_at": datetime.now(tz=UTC).isoformat(),
+                "manifest_sha256": snapshot.manifest_sha256,
+                "workspace": str(workspace),
+                "branch": f"apprentice/{record.run_id}",
+                "repositories": [],
+            }
+            record.submission = dict(reserved)
+            store.save(record)
+            return snapshot, dict(record.approval), reserved
+    except (FileNotFoundError, ValueError) as exc:
+        _print_json({"error": str(exc)})
+        return None
+    except ArtifactError as exc:
+        _print_json({"error": str(exc), "run_id": args.run_id})
+        return None
+
+
+def _finish_submission(
+    store: SessionStore, run_id: str, reserved: dict[str, Any], outcome: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Record the outcome of the reserved attempt and return the stored attempt.
+
+    The record is reloaded under the lock and updated only if its attempt is
+    still exactly `reserved`; otherwise nothing is saved, and the known
+    effects of this process are printed with the discrepancy (returns None).
+    `stored` in that output is the attempt read from disk, or None when the
+    record could not be read.
+    """
+    from apprentice.core.artifacts import ArtifactError
+
+    stored: object
+    try:
+        with store.record_lock(run_id):
+            latest = store.load(run_id)
+            if latest.submission == reserved:
+                latest.submission = {**reserved, **outcome}
+                try:
+                    store.save(latest)
+                except OSError as exc:
+                    # The atomic replace did not happen: the record still holds `reserved`.
+                    stored, discrepancy = reserved, f"saving the outcome failed: {exc}"
+                else:
+                    return latest.submission
+            else:
+                stored = latest.submission
+                discrepancy = "the stored submission attempt is not the one this process reserved"
+    except (OSError, ValueError, ArtifactError) as exc:
+        stored, discrepancy = None, str(exc)
+    _print_json(
+        {
+            "error": f"submission record of run {run_id} was not updated: {discrepancy}",
+            "run_id": run_id,
+            "reserved": reserved,
+            "stored": stored,
+            "outcome": outcome,
+        }
+    )
+    return None
+
+
 def _cmd_approve(args: Any) -> int:
-    """Record a human-review approval bound to a completed run's sealed bundle."""
+    """Record a human-review approval bound to a completed run's sealed bundle.
+
+    The approval is written under the run's record lock and is refused once
+    the run has a submission attempt, so the approval an attempt publishes
+    can no longer change.
+    """
     import os
     from datetime import UTC, datetime
 
     from apprentice.core.artifacts import ArtifactError
     from apprentice.core.session_store import SessionStore
+    from apprentice.gates.review import (
+        ApprovalError,
+        approver_problem,
+        require_reviewable_snapshot,
+    )
+
+    if args.approver is not None:
+        approver = args.approver
+    else:
+        approver = os.environ.get("GITHUB_USER") or os.environ.get("USER") or ""
+        if not approver:
+            _print_json(
+                {
+                    "error": (
+                        "cannot determine approver — pass --approver or set "
+                        "GITHUB_USER/USER environment variable."
+                    )
+                }
+            )
+            return 1
+    problem = approver_problem(approver)
+    if problem:
+        _print_json({"error": f"invalid approver: {problem}"})
+        return 1
 
     store = SessionStore()
-
     try:
-        record = store.load(args.run_id)
+        with store.record_lock(args.run_id):
+            record = store.load(args.run_id)
+            if record.status != "completed":
+                _print_json(
+                    {
+                        "error": (
+                            f"Run {args.run_id} is not completed "
+                            f"(status: {record.status}); nothing to approve."
+                        )
+                    }
+                )
+                return 1
+            if not isinstance(record.submission, dict):
+                _print_json(
+                    {
+                        "error": f"stored submission attempt of run {record.run_id} is not an object",
+                        "run_id": record.run_id,
+                        "submission": record.submission,
+                    }
+                )
+                return 1
+            if record.submission:
+                _print_json(
+                    {
+                        "error": (
+                            f"run {record.run_id} already has a submission attempt; "
+                            "its approval can no longer change"
+                        ),
+                        "run_id": record.run_id,
+                        "submission": record.submission,
+                    }
+                )
+                return 1
+            try:
+                snapshot = require_reviewable_snapshot(store, record)
+            except ApprovalError as exc:
+                _print_json(
+                    {"error": str(exc), "run_id": args.run_id, "remediation": exc.remediation}
+                )
+                return 1
+            record.approval = {
+                "run_id": snapshot.run_id,
+                "algorithm": snapshot.algorithm,
+                "tier": snapshot.tier,
+                "manifest_sha256": snapshot.manifest_sha256,
+                "approved_by": approver,
+                "approved_at": datetime.now(tz=UTC).isoformat(),
+            }
+            store.save(record)
     except (FileNotFoundError, ValueError) as exc:
         _print_json({"error": str(exc)})
         return 1
-
-    if record.status != "completed":
-        _print_json(
-            {
-                "error": (
-                    f"Run {args.run_id} is not completed "
-                    f"(status: {record.status}); nothing to approve."
-                )
-            }
-        )
-        return 1
-
-    approver = args.approver or os.environ.get("GITHUB_USER") or os.environ.get("USER") or ""
-    if not approver:
-        _print_json(
-            {
-                "error": (
-                    "cannot determine approver — pass --approver or set "
-                    "GITHUB_USER/USER environment variable."
-                )
-            }
-        )
-        return 1
-
-    try:
-        snapshot = store.load_bundle(record)
     except ArtifactError as exc:
         _print_json({"error": str(exc), "run_id": args.run_id})
         return 1
-
-    record.approval = {
-        "run_id": snapshot.run_id,
-        "algorithm": snapshot.algorithm,
-        "tier": snapshot.tier,
-        "manifest_sha256": snapshot.manifest_sha256,
-        "approved_by": approver,
-        "approved_at": datetime.now(tz=UTC).isoformat(),
-        "artifact_hashes": {artifact.role: artifact.sha256 for artifact in snapshot.artifacts},
-    }
-    store.save(record)
 
     _print_json(
         {
@@ -468,14 +527,6 @@ def _cmd_approve(args: Any) -> int:
         }
     )
     return 0
-
-
-def _latest_completed_run_id(store: SessionStore, algorithm: str) -> str | None:
-    """Return the most recent completed run_id for `algorithm`, or None."""
-    for record in store.list_runs(status="completed", limit=50):
-        if record.algorithm_name == algorithm:
-            return record.run_id
-    return None
 
 
 def _cmd_suggest(cfg: ApprenticeConfig, args: Any) -> int:
@@ -762,7 +813,7 @@ def _cmd_retry(cfg: ApprenticeConfig, args: Any) -> int:
         return 1
 
     model = _resolve_model(cfg, args)
-    pipeline = build_pipeline(model, cfg, store.run_scope(new_record), include_packaging=False)
+    pipeline = build_pipeline(model, cfg, store.run_scope(new_record))
 
     start = time.monotonic()
 

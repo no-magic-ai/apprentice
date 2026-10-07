@@ -5,11 +5,12 @@ from __future__ import annotations
 import textwrap
 from typing import TYPE_CHECKING
 
-from apprentice.core.artifacts import artifact_bundle, write_state_roles
+import pytest
+
 from apprentice.gates.consistency import ConsistencyGate
 from apprentice.gates.correctness import CorrectnessGate
 from apprentice.gates.lint import LintGate
-from apprentice.gates.review import ReviewGate, compute_artifact_hashes
+from apprentice.gates.review import ApprovalError, require_approved_snapshot
 from apprentice.gates.schema_compliance import SchemaComplianceGate
 from apprentice.models.artifact import ArtifactBundle
 from apprentice.models.work_item import GateVerdict, WorkItem
@@ -17,7 +18,7 @@ from apprentice.models.work_item import GateVerdict, WorkItem
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from apprentice.core.session_store import SessionStore
+    from apprentice.core.session_store import RunRecord, SessionStore
 
 
 def _make_bundle(**kwargs: str) -> ArtifactBundle:
@@ -165,133 +166,38 @@ def gate_eval(
     return gate.evaluate(item, bundle)
 
 
-class TestReviewGate:
-    def test_properties(self) -> None:
-        gate = ReviewGate()
-        assert gate.name == "review"
-        assert gate.blocking is True
+def _approved_record(store: SessionStore, algorithm: str = "selection", tier: int = 2) -> RunRecord:
+    record = store.create_run(algorithm, tier)
+    store.complete_run(
+        record, {"generated_code": "impl = 1\n", "manim_scene_code": "scene = 1\n"}, {}, 1.0
+    )
+    snapshot = store.load_bundle(record)
+    record.approval = {
+        "run_id": snapshot.run_id,
+        "algorithm": snapshot.algorithm,
+        "tier": snapshot.tier,
+        "manifest_sha256": snapshot.manifest_sha256,
+        "approved_by": "tester",
+        "approved_at": "2026-10-06T00:00:00+00:00",
+    }
+    return store.save(record)
 
-    def test_fail_when_no_approval(self, tmp_path: Path) -> None:
-        f = tmp_path / "algo.py"
-        f.write_text("print('ok')\n")
-        bundle = _make_bundle(implementation_path=str(f))
-        result = ReviewGate().evaluate(_make_item(), bundle)
-        assert result.verdict == GateVerdict.FAIL
-        assert "no approval" in result.diagnostics["error"]
-        assert "apprentice approve" in result.diagnostics["remediation"]
 
-    def test_pass_with_matching_hashes(self, tmp_path: Path) -> None:
-        f = tmp_path / "algo.py"
-        f.write_text("print('ok')\n")
-        bundle = _make_bundle(implementation_path=str(f))
-        approval = {
-            "approved_by": "tester",
-            "approved_at": "2026-04-21T00:00:00+00:00",
-            "artifact_hashes": compute_artifact_hashes(bundle),
+class TestRequireApprovedSnapshot:
+    def test_matching_approval_returns_verified_bytes(self, store: SessionStore) -> None:
+        record = _approved_record(store)
+        snapshot = require_approved_snapshot(store, record, algorithm="selection", tier=2)
+        assert {a.role: a.data for a in snapshot.artifacts} == {
+            "implementation": b"impl = 1\n",
+            "manim_scene": b"scene = 1\n",
         }
-        result = ReviewGate(approval=approval).evaluate(_make_item(), bundle)
-        assert result.verdict == GateVerdict.PASS
-        assert result.diagnostics["approved_by"] == "tester"
 
-    def test_fail_when_artifact_changed_after_approval(self, tmp_path: Path) -> None:
-        f = tmp_path / "algo.py"
-        f.write_text("print('ok')\n")
-        bundle = _make_bundle(implementation_path=str(f))
-        original_hashes = compute_artifact_hashes(bundle)
-        f.write_text("print('tampered')\n")
-        approval = {
-            "approved_by": "tester",
-            "approved_at": "2026-04-21T00:00:00+00:00",
-            "artifact_hashes": original_hashes,
-        }
-        result = ReviewGate(approval=approval).evaluate(_make_item(), bundle)
-        assert result.verdict == GateVerdict.FAIL
-        assert "diffs" in result.diagnostics
-
-    def test_fail_on_incomplete_approval(self, tmp_path: Path) -> None:
-        f = tmp_path / "algo.py"
-        f.write_text("print('ok')\n")
-        bundle = _make_bundle(implementation_path=str(f))
-        approval = {"approved_by": "tester"}  # missing approved_at and hashes
-        result = ReviewGate(approval=approval).evaluate(_make_item(), bundle)
-        assert result.verdict == GateVerdict.FAIL
-        assert "missing fields" in result.diagnostics["error"]
-
-
-class TestReviewGateAgainstSealedApproval:
-    """Submit regenerates into a fresh owned root; the gate compares every role."""
-
-    def _approved(self, store: SessionStore) -> dict[str, object]:
-        record = store.create_run("selection", 2)
-        store.complete_run(
-            record,
-            {"generated_code": "impl = 1\n", "manim_scene_code": "scene = 1\n"},
-            {},
-            1.0,
-        )
-        snapshot = store.load_bundle(record)
-        return {
+    def test_hash_only_approval_is_not_accepted(self, store: SessionStore) -> None:
+        record = _approved_record(store)
+        record.approval = {
             "approved_by": "tester",
             "approved_at": "2026-10-06T00:00:00+00:00",
-            "artifact_hashes": {a.role: a.sha256 for a in snapshot.artifacts},
+            "artifact_hashes": {},
         }
-
-    def _regenerate(self, store: SessionStore, state: dict[str, str]) -> ArtifactBundle:
-        root = store.allocate_work_root()
-        return artifact_bundle("regenerated", write_state_roles(root, state))
-
-    def test_identical_regenerated_bytes_pass(self, store: SessionStore) -> None:
-        approval = self._approved(store)
-        bundle = self._regenerate(
-            store, {"generated_code": "impl = 1\n", "manim_scene_code": "scene = 1\n"}
-        )
-        result = ReviewGate(approval=approval).evaluate(_make_item(), bundle)
-        assert result.verdict == GateVerdict.PASS
-
-    def test_different_regenerated_bytes_fail(self, store: SessionStore) -> None:
-        approval = self._approved(store)
-        bundle = self._regenerate(
-            store, {"generated_code": "impl = 2\n", "manim_scene_code": "scene = 1\n"}
-        )
-        result = ReviewGate(approval=approval).evaluate(_make_item(), bundle)
-        assert result.verdict == GateVerdict.FAIL
-        assert set(result.diagnostics["diffs"]) == {"implementation"}
-
-    def test_regenerated_role_absent_from_approval_fails(self, store: SessionStore) -> None:
-        approval = self._approved(store)
-        bundle = self._regenerate(
-            store,
-            {
-                "generated_code": "impl = 1\n",
-                "manim_scene_code": "scene = 1\n",
-                "anki_deck_content": "front,back\n",
-            },
-        )
-        result = ReviewGate(approval=approval).evaluate(_make_item(), bundle)
-        assert result.verdict == GateVerdict.FAIL
-        assert set(result.diagnostics["diffs"]) == {"anki_deck"}
-
-    def test_approved_role_missing_from_regeneration_fails(self, store: SessionStore) -> None:
-        approval = self._approved(store)
-        bundle = self._regenerate(store, {"generated_code": "impl = 1\n"})
-        result = ReviewGate(approval=approval).evaluate(_make_item(), bundle)
-        assert result.verdict == GateVerdict.FAIL
-        assert set(result.diagnostics["diffs"]) == {"manim_scene"}
-
-    def test_changed_instrumented_role_fails(self, store: SessionStore) -> None:
-        record = store.create_run("selection", 2)
-        store.complete_run(
-            record, {"generated_code": "impl = 1\n", "instrumented_code": "trace = 1\n"}, {}, 1.0
-        )
-        snapshot = store.load_bundle(record)
-        approval = {
-            "approved_by": "tester",
-            "approved_at": "2026-10-06T00:00:00+00:00",
-            "artifact_hashes": {a.role: a.sha256 for a in snapshot.artifacts},
-        }
-        bundle = self._regenerate(
-            store, {"generated_code": "impl = 1\n", "instrumented_code": "trace = 2\n"}
-        )
-        result = ReviewGate(approval=approval).evaluate(_make_item(), bundle)
-        assert result.verdict == GateVerdict.FAIL
-        assert set(result.diagnostics["diffs"]) == {"instrumented"}
+        with pytest.raises(ApprovalError, match="not bound to a sealed bundle manifest"):
+            require_approved_snapshot(store, record, algorithm="selection", tier=None)

@@ -22,7 +22,7 @@ class BudgetTracker:
         cost_usd: Running total of USD spent.
         per_agent: Per-agent token and cost breakdown, one entry per stage
             name (e.g. `drafter`, `instrumentation`, `visualization`,
-            `assessment`, `reviewer`, `packaging`, plus gate agents).
+            `assessment`, `reviewer`, plus gate agents).
         gate_verdicts: Ordered list of gate results appended in execution order.
     """
 
@@ -119,7 +119,6 @@ _OUTPUT_KEY_BY_AGENT: dict[str, str] = {
     "assessment": "anki_deck_content",
     "reviewer": "review_verdict",
     "review_loop": "review_verdict",
-    "packaging": "pr_urls",
     "discovery": "discovery_candidates",
 }
 
