@@ -444,7 +444,7 @@ graph LR
    - implementation → `no-magic/{tier_dir}/micro{name}.py`
    - Manim scene → `no-magic-viz/scenes/scene_micro{name}.py`
 4. Stage only those paths, commit with the approval time as author/committer date, and check that each commit contains exactly the approved bytes and paths.
-5. Push both branches, then open the `no-magic` PR and a `no-magic-viz` PR that references it, with `gh`. Under the lock again, the attempt ends `complete`, `partial` (with the branches pushed and PRs opened before the error) or `failed`, but only if the stored attempt is still the one reserved in step 1; otherwise nothing is saved and the known effects are printed. Any recorded attempt blocks another `submit` and any re-approval of that run, with no retry or resume.
+5. Push both branches, then open the `no-magic` PR and a `no-magic-viz` PR that references it, with `gh`. Under the lock again, the attempt ends `complete`, `partial` (with the branches pushed and PRs opened before the error, `null` for a push or PR whose command timed out) or `failed`, but only if the stored attempt is still the one reserved in step 1; otherwise nothing is saved and the known effects are printed. Any recorded attempt blocks another `submit` and any re-approval of that run, with no retry or resume.
 
 Packaging never merges. It uses the operator's ambient `git` and `gh` credentials; credential scoping is open containment work (see the [README status](../README.md#status)).
 

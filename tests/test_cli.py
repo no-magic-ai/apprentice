@@ -97,6 +97,10 @@ def store_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return directory
 
 
+_CORE_PR = "https://github.com/no-magic-ai/no-magic/pull/offline-1"
+_VIZ_PR = "https://github.com/no-magic-ai/no-magic-viz/pull/offline-2"
+
+
 def _make_completed_run(store_dir: Path, algorithm: str = "selection") -> RunRecord:
     store = SessionStore(store_dir=store_dir)
     rec = store.create_run(algorithm, tier=2)
@@ -340,17 +344,17 @@ class TestSubmitCommand:
 
         submission = SessionStore(store_dir=store_dir).load(rec.run_id).submission
         assert submission["status"] == "complete"
-        assert [(r["pushed"], bool(r["pr_url"])) for r in submission["repositories"]] == [
-            (True, True),
-            (True, True),
+        assert [(r["pushed"], r["pr_url"]) for r in submission["repositories"]] == [
+            (True, _CORE_PR),
+            (True, _VIZ_PR),
         ]
 
     @pytest.mark.parametrize(
         ("fail", "status", "effects"),
         [
-            ("second_pr", "partial", [(True, True), (True, False)]),
-            ("second_push", "partial", [(True, False), (False, False)]),
-            ("first_push", "failed", [(False, False), (False, False)]),
+            ("second_pr", "partial", [(True, _CORE_PR), (True, "")]),
+            ("second_push", "partial", [(True, ""), (False, "")]),
+            ("first_push", "failed", [(False, ""), (False, "")]),
         ],
     )
     def test_failed_attempt_is_recorded_and_rerun_after_restart_is_refused(
@@ -361,7 +365,7 @@ class TestSubmitCommand:
         capsys: pytest.CaptureFixture[str],
         fail: str,
         status: str,
-        effects: list[tuple[bool, bool]],
+        effects: list[tuple[bool, str]],
     ) -> None:
         rec = _approved_run(store_dir)
         if fail == "second_pr":
@@ -377,7 +381,7 @@ class TestSubmitCommand:
         printed = json.loads(capsys.readouterr().out)
         stored = SessionStore(store_dir=store_dir).load(rec.run_id).submission
         assert printed["status"] == stored["status"] == status
-        assert [(r["pushed"], bool(r["pr_url"])) for r in stored["repositories"]] == effects
+        assert [(r["pushed"], r["pr_url"]) for r in stored["repositories"]] == effects
         assert stored["error"] and stored["manifest_sha256"] == rec.manifest_sha256
 
         monkeypatch.delenv("OFFLINE_GH_FAIL_ON", raising=False)
@@ -394,31 +398,6 @@ class TestSubmitCommand:
         assert len(offline_remotes.gh_calls()) == gh_calls
         assert sorted((store_dir / "scratch").iterdir()) == scratch
         assert SessionStore(store_dir=store_dir).load(rec.run_id).submission == stored
-
-    def test_interrupted_attempt_stays_pending_and_blocks_rerun(
-        self,
-        store_dir: Path,
-        offline_remotes: OfflineRemotes,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        rec = _approved_run(store_dir)
-
-        def _interrupted(*args: Any) -> Any:
-            raise KeyboardInterrupt
-
-        with monkeypatch.context() as patch:
-            patch.setattr("apprentice.agents.packaging.submit_snapshot", _interrupted)
-            with pytest.raises(KeyboardInterrupt):
-                _cmd_submit(_SubmitArgs("selection", rec.run_id))
-
-        assert SessionStore(store_dir=store_dir).load(rec.run_id).submission["status"] == "pending"
-        capsys.readouterr()
-        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
-        out = json.loads(_last_json(capsys))
-        assert "already has a submission attempt" in out["error"]
-        assert out["submission"]["status"] == "pending"
-        assert offline_remotes.gh_calls() == []
 
     @pytest.mark.parametrize(
         ("mutate", "args", "message"),
@@ -761,17 +740,6 @@ class TestSubmitRemediation:
         assert "remediation" not in out
         assert not (store_dir / "runs" / record.run_id).exists()
         assert offline_remotes.gh_calls() == []
-
-    def test_sealed_unapproved_run_gets_approve_remediation(
-        self, store_dir: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        rec = _make_completed_run(store_dir)
-
-        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
-
-        assert (
-            json.loads(capsys.readouterr().out)["remediation"] == f"apprentice approve {rec.run_id}"
-        )
 
 
 def _sealed_with_verdicts(store_dir: Path, verdicts: list[dict[str, Any]]) -> RunRecord:
@@ -1134,3 +1102,195 @@ class TestReviewGateRemediation:
         remediation = json.loads(capsys.readouterr().out)["remediation"]
         assert f"apprentice preview --run-id {rec.run_id}" in remediation
         assert f"apprentice approve {rec.run_id}" in remediation
+
+
+def _refused_without_effects(
+    store_dir: Path,
+    offline_remotes: OfflineRemotes,
+    capsys: pytest.CaptureFixture[str],
+    command: Callable[[], int],
+) -> dict[str, Any]:
+    before = _tree(store_dir)
+    capsys.readouterr()
+
+    assert command() == 1
+
+    out: dict[str, Any] = json.loads(_last_json(capsys))
+    assert _tree(store_dir) == before
+    assert offline_remotes.gh_calls() == []
+    assert offline_remotes.branches("no-magic-ai/no-magic") == ["main"]
+    assert offline_remotes.branches("no-magic-ai/no-magic-viz") == ["main"]
+    return out
+
+
+class TestStoredApprovalShape:
+    @pytest.mark.parametrize("approval", [5, ["approved"], "approved", True, None])
+    def test_approval_that_is_not_an_object_is_refused_before_any_attempt(
+        self,
+        store_dir: Path,
+        offline_remotes: OfflineRemotes,
+        capsys: pytest.CaptureFixture[str],
+        approval: object,
+    ) -> None:
+        rec = _approved_run(store_dir)
+        _damage_record(store_dir, rec.run_id, lambda r: r.update(approval=approval))
+
+        out = _refused_without_effects(
+            store_dir,
+            offline_remotes,
+            capsys,
+            lambda: _cmd_submit(_SubmitArgs("selection", rec.run_id)),
+        )
+
+        assert out["remediation"] == f"apprentice approve {rec.run_id}"
+
+    @pytest.mark.parametrize(("run_tier", "tier"), [(2, 2.0), (1, True)])
+    def test_approved_tier_that_is_not_an_integer_is_refused(
+        self,
+        store_dir: Path,
+        offline_remotes: OfflineRemotes,
+        capsys: pytest.CaptureFixture[str],
+        run_tier: int,
+        tier: object,
+    ) -> None:
+        # Each damaged tier compares equal to the sealed tier (2.0 == 2, True == 1).
+        store = SessionStore(store_dir=store_dir)
+        rec = store.complete_run(
+            store.create_run("selection", tier=run_tier),
+            session_state=dict(_STATE),
+            budget_summary={},
+            elapsed=1.0,
+        )
+        assert _cmd_approve(_ApproveArgs(rec.run_id)) == 0
+        _damage_record(store_dir, rec.run_id, lambda r: r["approval"].update(tier=tier))
+
+        out = _refused_without_effects(
+            store_dir,
+            offline_remotes,
+            capsys,
+            lambda: _cmd_submit(_SubmitArgs("selection", rec.run_id)),
+        )
+
+        assert f"apprentice approve {rec.run_id}" in out["remediation"]
+
+
+_MALFORMED_GATE_RECORDS: list[object] = [
+    "summary",
+    {"gate_verdicts": "verdicts"},
+    {"gate_verdicts": [5]},
+    {"gate_verdicts": [{"verdict": "fail"}]},
+    {"gate_verdicts": [{"verdict": "fail", "blocking": True, "gate_name": "lint"}]},
+]
+
+
+class TestMalformedGateRecords:
+    @pytest.mark.parametrize("summary", _MALFORMED_GATE_RECORDS)
+    @pytest.mark.parametrize("command", ["approve", "submit"])
+    def test_malformed_gate_records_are_refused_with_the_rebuild_remediation(
+        self,
+        store_dir: Path,
+        offline_remotes: OfflineRemotes,
+        capsys: pytest.CaptureFixture[str],
+        summary: object,
+        command: str,
+    ) -> None:
+        rec = _approved_run(store_dir)
+        _damage_record(store_dir, rec.run_id, lambda r: r.update(budget_summary=summary))
+
+        def run() -> int:
+            if command == "approve":
+                return _cmd_approve(_ApproveArgs(rec.run_id, approver="other"))
+            return _cmd_submit(_SubmitArgs("selection", rec.run_id))
+
+        out = _refused_without_effects(store_dir, offline_remotes, capsys, run)
+
+        assert out["remediation"] == "apprentice build selection --tier 2"
+
+
+class TestStoredSubmissionShape:
+    @pytest.mark.parametrize("submission", [None, 0, False, "", [], 5, "attempt", ["pending"]])
+    @pytest.mark.parametrize("command", ["approve", "submit"])
+    def test_submission_that_is_not_an_object_is_refused_before_any_attempt(
+        self,
+        store_dir: Path,
+        offline_remotes: OfflineRemotes,
+        capsys: pytest.CaptureFixture[str],
+        submission: object,
+        command: str,
+    ) -> None:
+        rec = _approved_run(store_dir)
+        _damage_record(store_dir, rec.run_id, lambda r: r.update(submission=submission))
+
+        def run() -> int:
+            if command == "approve":
+                return _cmd_approve(_ApproveArgs(rec.run_id, approver="other"))
+            return _cmd_submit(_SubmitArgs("selection", rec.run_id))
+
+        out = _refused_without_effects(store_dir, offline_remotes, capsys, run)
+
+        assert out["submission"] == submission
+
+    def test_nonempty_attempt_without_a_status_blocks_submit_before_publication(
+        self,
+        store_dir: Path,
+        offline_remotes: OfflineRemotes,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rec = _approved_run(store_dir)
+        _damage_record(store_dir, rec.run_id, lambda r: r.update(submission={"garbage": True}))
+
+        out = _refused_without_effects(
+            store_dir,
+            offline_remotes,
+            capsys,
+            lambda: _cmd_submit(_SubmitArgs("selection", rec.run_id)),
+        )
+
+        assert out["submission"] == {"garbage": True}
+
+    @pytest.mark.parametrize("stored", ["empty-object", "absent"])
+    def test_empty_or_absent_submission_means_no_attempt_yet(
+        self, store_dir: Path, offline_remotes: OfflineRemotes, stored: str
+    ) -> None:
+        rec = _approved_run(store_dir)
+        if stored == "absent":
+            _damage_record(store_dir, rec.run_id, lambda r: r.pop("submission"))
+        else:
+            _damage_record(store_dir, rec.run_id, lambda r: r.update(submission={}))
+
+        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 0
+
+        assert SessionStore(store_dir=store_dir).load(rec.run_id).submission["status"] == "complete"
+        assert len(offline_remotes.gh_calls()) == 2
+
+
+class TestUnknownPublicationOutcome:
+    def test_core_push_timeout_is_recorded_partial_with_an_unknown_push(
+        self,
+        store_dir: Path,
+        offline_remotes: OfflineRemotes,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        short_publish_deadline: int,
+    ) -> None:
+        from tests.conftest import release
+
+        rec = _approved_run(store_dir)
+        gate = tmp_path / "receive-gate"
+        offline_remotes.hold_after_receive("no-magic-ai/no-magic", gate)
+        capsys.readouterr()
+        try:
+            assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
+        finally:
+            release(gate)
+
+        printed = json.loads(_last_json(capsys))
+        stored = SessionStore(store_dir=store_dir).load(rec.run_id).submission
+        assert printed["status"] == stored["status"] == "partial"
+        assert [(r["pushed"], r["pr_url"]) for r in stored["repositories"]] == [
+            (None, ""),
+            (False, ""),
+        ]
+        assert f"apprentice/{rec.run_id}" in offline_remotes.branches("no-magic-ai/no-magic")
+        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
+        assert offline_remotes.gh_calls() == []

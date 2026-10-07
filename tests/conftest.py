@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from google.adk.models import BaseLlm, LlmRequest, LlmResponse
@@ -223,6 +224,25 @@ class OfflineRemotes:
         ).stdout
         return sorted(out.split())
 
+    def hold_after_receive(self, repository: str, gate: Path) -> None:
+        """Keep a push to `repository` open after its refs are updated, until `gate` is released.
+
+        A post-receive hook blocks reading the FIFO `gate`, so the remote branch
+        exists while the pushing client still waits for an acknowledgement.
+        """
+        os.mkfifo(gate)
+        hook = self.bare[repository] / "hooks" / "post-receive"
+        hook.write_text(f"#!/bin/sh\ncat '{gate}' > /dev/null\n")
+        hook.chmod(0o755)
+
+    def hang_pull_requests(self, gate: Path) -> None:
+        """Make `gh` record each pull request request, then hang until `gate` is released."""
+        os.mkfifo(gate)
+        gh = self.gh_log.parent / "bin" / "gh"
+        gh.write_text(
+            _HANGING_GH.format(python=sys.executable, log=str(self.gh_log), gate=str(gate))
+        )
+
     def reject_pushes(self, repository: str) -> None:
         hook = self.bare[repository] / "hooks" / "pre-receive"
         hook.write_text("#!/bin/sh\necho 'offline fixture: push rejected' >&2\nexit 1\n")
@@ -256,6 +276,41 @@ class OfflineRemotes:
             capture_output=True,
             check=True,
         ).stdout
+
+
+_HANGING_GH = """#!{python}
+import json, sys
+with open({log!r}, "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(sys.argv[1:]) + "\\n")
+with open({gate!r}, encoding="utf-8") as gate:
+    gate.read()
+"""
+
+
+def release(gate: Path) -> None:
+    """Release whatever is blocked reading the FIFO `gate`; nothing to do if no reader is left."""
+    try:
+        fd = os.open(gate, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError as exc:
+        if exc.errno == errno.ENXIO:
+            return
+        raise
+    os.close(fd)
+
+
+@pytest.fixture
+def short_publish_deadline(monkeypatch: pytest.MonkeyPatch) -> int:
+    """Shorten only the push and `gh pr create` deadlines in this test (product deadlines unchanged)."""
+    deadline = 5
+    real_run = subprocess.run
+
+    def run(args: list[str], *positional: Any, **keyword: Any) -> Any:
+        if args[:2] == ["git", "push"] or args[:3] == ["gh", "pr", "create"]:
+            keyword["timeout"] = deadline
+        return real_run(args, *positional, **keyword)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    return deadline
 
 
 _FAKE_GH = """#!{python}

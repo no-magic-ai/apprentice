@@ -488,3 +488,26 @@ class TestSealRefusal:
 
         assert completed.status == "completed"
         assert store.load_bundle(completed).artifacts[0].data == b"impl = 1\n"
+
+
+class TestMalformedGateRecordsAtSealing:
+    @pytest.mark.parametrize(
+        "summary",
+        [
+            "summary",
+            {"gate_verdicts": "verdicts"},
+            {"gate_verdicts": [5]},
+            {"gate_verdicts": [{"verdict": "fail"}]},
+            {"gate_verdicts": [{"verdict": "fail", "gate_name": "lint"}]},
+        ],
+    )
+    def test_malformed_gate_records_are_never_sealed(self, tmp_path: Path, summary: Any) -> None:
+        store = SessionStore(store_dir=tmp_path)
+        record = store.create_run("selection", 2)
+        record_bytes = (tmp_path / f"{record.run_id}.json").read_bytes()
+
+        with pytest.raises(ArtifactError, match="cannot be sealed"):
+            store.complete_run(record, {"generated_code": "x = 1\n"}, summary, 1.0)
+
+        assert (tmp_path / f"{record.run_id}.json").read_bytes() == record_bytes
+        assert not store.bundle_dir(record.run_id).exists()

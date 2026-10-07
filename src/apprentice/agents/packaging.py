@@ -34,7 +34,9 @@ class PackagingError(Exception):
     Attributes:
         effects: Every prepared repository with whether its branch was pushed
             and the pull request opened for it, as known at the failure. Empty
-            when the failure happened before any push.
+            when the failure happened before any push. `pushed` or `pr_url` is
+            None when the push or pull request command timed out: it may have
+            taken effect without acknowledging it.
     """
 
     def __init__(self, message: str, effects: list[dict[str, Any]] | None = None) -> None:
@@ -44,15 +46,19 @@ class PackagingError(Exception):
 
 @dataclass(frozen=True)
 class RepositorySubmission:
-    """One repository's promoted branch, verified commit, push state and pull request."""
+    """One repository's promoted branch, verified commit, push state and pull request.
+
+    `pushed` and `pr_url` are None only when the push or `gh pr create` timed
+    out, so whether the branch or pull request exists is unknown.
+    """
 
     repository: str
     base: str
     branch: str
     commit: str
     paths: tuple[str, ...]
-    pushed: bool = False
-    pr_url: str = ""
+    pushed: bool | None = False
+    pr_url: str | None = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -73,6 +79,8 @@ def _run(args: list[str], cwd: Path, timeout: int, env: dict[str, str] | None = 
         )
     except FileNotFoundError as exc:
         raise PackagingError(f"{args[0]} is not installed") from exc
+    except OSError as exc:
+        raise PackagingError(f"{args[0]} could not be started: {exc}") from exc
     except subprocess.TimeoutExpired as exc:
         raise PackagingError(f"{' '.join(args[:3])} timed out after {timeout}s") from exc
     if result.returncode != 0:
@@ -164,7 +172,7 @@ def _prepare(
         f"Apprentice-Manifest: {snapshot.manifest_sha256}\n"
         f"Approved-By: {approval['approved_by']}\n"
     )
-    _git(clone, "commit", "--no-verify", "-q", "-m", message, env=commit_env)
+    _git(clone, "commit", "--no-verify", "--cleanup=verbatim", "-q", "-m", message, env=commit_env)
     for destination, data in files:
         if _git(clone, "cat-file", "blob", f"HEAD:{destination}") != data:
             raise PackagingError(
@@ -213,7 +221,8 @@ def submit_snapshot(
     Raises:
         PackagingError: If any clone, placement, commit check, push or pull
             request fails; `effects` records which branches were pushed and
-            which pull requests were opened before the failure.
+            which pull requests were opened before the failure, with None for
+            a push or pull request whose command timed out.
     """
     prepared = [
         _prepare(repository, files, snapshot, approval, workspace)
@@ -225,6 +234,8 @@ def submit_snapshot(
         try:
             _git(clone, "push", "origin", f"HEAD:refs/heads/{submission.branch}", timeout=120)
         except PackagingError as exc:
+            if isinstance(exc.__cause__, subprocess.TimeoutExpired):
+                state[index] = replace(submission, pushed=None)
             raise PackagingError(str(exc), [item.to_dict() for item in state]) from exc
         state[index] = replace(submission, pushed=True)
 
@@ -256,6 +267,8 @@ def submit_snapshot(
                 .strip()
             )
         except PackagingError as exc:
+            if isinstance(exc.__cause__, subprocess.TimeoutExpired):
+                state[index] = replace(submission, pr_url=None)
             raise PackagingError(str(exc), [item.to_dict() for item in state]) from exc
         state[index] = replace(submission, pr_url=pr_url)
         companion = companion or pr_url

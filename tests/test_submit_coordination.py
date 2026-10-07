@@ -93,6 +93,30 @@ elif point == "pull-request":  # both branches pushed, before the first `gh pr c
         return original_run(args, *rest, **kwargs)
 
     packaging._run = run
+elif point == "finish-wait":  # effects done, before the terminal update; reports a held run lock
+    import fcntl
+
+    finishing = []
+    original_finish = cli._finish_submission
+
+    def finish(*args, **kwargs):
+        pause()
+        finishing.append(True)
+        return original_finish(*args, **kwargs)
+
+    cli._finish_submission = finish
+    original_flock = fcntl.flock
+
+    def flock(fd, operation):
+        if finishing:
+            try:
+                original_flock(fd, operation | fcntl.LOCK_NB)
+                return
+            except BlockingIOError:
+                os.write(int(reached_fd), b"2")
+        original_flock(fd, operation)
+
+    fcntl.flock = flock
 
 if command == "submit":
     code = cli._cmd_submit(SimpleNamespace(algorithm="selection", run_id=run_id, tier=None))
@@ -139,6 +163,10 @@ class _Contender:
 
     def release(self) -> None:
         os.write(self._go, b"1")
+
+    def signal(self) -> bytes:
+        """The contender's next signal byte, or b"" once it has exited."""
+        return os.read(self._reached, 1)
 
     def finish(self) -> tuple[int, dict[str, Any]]:
         code, out, _ = self._collect()
@@ -536,8 +564,13 @@ class TestTerminalRecord:
         assert "was not updated" in out["error"]
         assert out["reserved"]["status"] == "pending"
         assert out["outcome"]["status"] == ("partial" if fail_on else "complete")
-        assert [bool(r["pr_url"]) for r in out["outcome"]["repositories"]] == (
-            [True, False] if fail_on else [True, True]
+        assert [r["pr_url"] for r in out["outcome"]["repositories"]] == (
+            ["https://github.com/no-magic-ai/no-magic/pull/offline-1", ""]
+            if fail_on
+            else [
+                "https://github.com/no-magic-ai/no-magic/pull/offline-1",
+                "https://github.com/no-magic-ai/no-magic-viz/pull/offline-2",
+            ]
         )
         if change == "deleted":
             assert out["stored"] is None
@@ -545,3 +578,125 @@ class TestTerminalRecord:
         else:
             assert out["stored"] == {"status": "pending", "note": "another writer"}
             assert path.read_bytes() == replacement
+
+    @pytest.mark.parametrize(
+        "damage", ["missing-required", "not-object", "unreadable", "directory"]
+    )
+    @pytest.mark.parametrize("fail_on", [None, "2"])
+    def test_unreadable_or_invalid_record_after_effects_still_reports_the_known_outcome(
+        self,
+        store_dir: Path,
+        offline_remotes: OfflineRemotes,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        damage: str,
+        fail_on: str | None,
+    ) -> None:
+        record = _approved_run(store_dir)
+        path = store_dir / f"{record.run_id}.json"
+        damaged = b""
+        real_submit = packaging.submit_snapshot
+
+        def submit_then_damage(*args: Any) -> Any:
+            nonlocal damaged
+            try:
+                return real_submit(*args)
+            finally:
+                if damage == "missing-required":
+                    data = json.loads(path.read_bytes())
+                    del data["started_at"]
+                    damaged = json.dumps(data).encode()
+                    path.write_bytes(damaged)
+                elif damage == "not-object":
+                    damaged = b"[1, 2]"
+                    path.write_bytes(damaged)
+                elif damage == "unreadable":
+                    path.chmod(0)
+                else:
+                    path.unlink()
+                    path.mkdir()
+
+        monkeypatch.setattr(packaging, "submit_snapshot", submit_then_damage)
+        if fail_on:
+            monkeypatch.setenv("OFFLINE_GH_FAIL_ON", fail_on)
+        capsys.readouterr()
+        try:
+            assert _submit(record.run_id) == 1
+        finally:
+            if damage == "unreadable":
+                path.chmod(0o644)
+
+        out = _last_json(capsys)
+        assert "was not updated" in out["error"]
+        assert out["stored"] is None
+        assert out["outcome"]["status"] == ("partial" if fail_on else "complete")
+        core_pr = "https://github.com/no-magic-ai/no-magic/pull/offline-1"
+        viz_pr = "https://github.com/no-magic-ai/no-magic-viz/pull/offline-2"
+        assert [(r["pushed"], r["pr_url"]) for r in out["outcome"]["repositories"]] == (
+            [(True, core_pr), (True, "")] if fail_on else [(True, core_pr), (True, viz_pr)]
+        )
+        if damage == "directory":
+            assert path.is_dir()
+        elif damage != "unreadable":
+            assert path.read_bytes() == damaged
+
+    def test_failed_outcome_save_reports_the_reserved_attempt_still_on_disk(
+        self,
+        store_dir: Path,
+        offline_remotes: OfflineRemotes,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        record = _approved_run(store_dir)
+        path = store_dir / f"{record.run_id}.json"
+        real_submit = packaging.submit_snapshot
+
+        def submit_then_freeze_store(*args: Any) -> Any:
+            try:
+                return real_submit(*args)
+            finally:
+                store_dir.chmod(0o555)
+
+        monkeypatch.setattr(packaging, "submit_snapshot", submit_then_freeze_store)
+        capsys.readouterr()
+        try:
+            assert _submit(record.run_id) == 1
+        finally:
+            store_dir.chmod(0o755)
+
+        out = _last_json(capsys)
+        on_disk = json.loads(path.read_bytes())["submission"]
+        assert "saving the outcome failed" in out["error"]
+        assert out["stored"] == out["reserved"] == on_disk
+        assert on_disk["status"] == "pending"
+        assert out["outcome"]["status"] == "complete"
+        assert len(offline_remotes.gh_calls()) == 2
+
+    def test_terminal_update_waits_for_the_run_lock_and_keeps_the_holders_change(
+        self, store_dir: Path, offline_remotes: OfflineRemotes
+    ) -> None:
+        record = _approved_run(store_dir)
+        store = SessionStore(store_dir=store_dir)
+        path = store_dir / f"{record.run_id}.json"
+        submitter = _Contender(store_dir, "finish-wait", "submit", record.run_id)
+        submitter.reached()  # both repositories published; terminal update not started
+
+        with store.record_lock(record.run_id):
+            submitter.release()
+            found_lock_held = submitter.signal() == b"2"
+            latest = store.load(record.run_id)
+            latest.submission = {**latest.submission, "note": "holder transition"}
+            store.save(latest)
+            transition = path.read_bytes()
+        code, out = submitter.finish()
+
+        assert code == 1
+        assert path.read_bytes() == transition
+        assert out["stored"] == json.loads(transition)["submission"]
+        assert out["outcome"]["status"] == "complete"
+        assert [(r["pushed"], r["pr_url"]) for r in out["outcome"]["repositories"]] == [
+            (True, "https://github.com/no-magic-ai/no-magic/pull/offline-1"),
+            (True, "https://github.com/no-magic-ai/no-magic-viz/pull/offline-2"),
+        ]
+        assert found_lock_held
+        assert len(offline_remotes.gh_calls()) == 2

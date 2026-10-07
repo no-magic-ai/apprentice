@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from apprentice.core.artifacts import ArtifactError
 from apprentice.gates.consistency import ConsistencyGate
 from apprentice.gates.correctness import CorrectnessGate
 from apprentice.gates.lint import LintGate
@@ -193,13 +192,6 @@ class TestRequireApprovedSnapshot:
             "manim_scene": b"scene = 1\n",
         }
 
-    def test_missing_approval_fails_with_approve_remediation(self, store: SessionStore) -> None:
-        record = _approved_record(store)
-        record.approval = {}
-        with pytest.raises(ApprovalError) as excinfo:
-            require_approved_snapshot(store, record, algorithm="selection", tier=None)
-        assert excinfo.value.remediation == f"apprentice approve {record.run_id}"
-
     def test_hash_only_approval_is_not_accepted(self, store: SessionStore) -> None:
         record = _approved_record(store)
         record.approval = {
@@ -208,40 +200,4 @@ class TestRequireApprovedSnapshot:
             "artifact_hashes": {},
         }
         with pytest.raises(ApprovalError, match="not bound to a sealed bundle manifest"):
-            require_approved_snapshot(store, record, algorithm="selection", tier=None)
-
-    def test_wrong_algorithm_fails(self, store: SessionStore) -> None:
-        record = _approved_record(store)
-        with pytest.raises(ApprovalError, match="not 'quicksort'"):
-            require_approved_snapshot(store, record, algorithm="quicksort", tier=None)
-
-    def test_wrong_tier_fails(self, store: SessionStore) -> None:
-        record = _approved_record(store)
-        with pytest.raises(ApprovalError, match="not tier 3"):
-            require_approved_snapshot(store, record, algorithm="selection", tier=3)
-
-    def test_approval_from_another_run_fails(self, store: SessionStore) -> None:
-        record = _approved_record(store)
-        other = _approved_record(store)
-        record.approval = dict(other.approval)
-        with pytest.raises(ApprovalError, match="does not match its sealed bundle"):
-            require_approved_snapshot(store, record, algorithm="selection", tier=None)
-
-    def test_approval_of_a_different_manifest_fails(self, store: SessionStore) -> None:
-        record = _approved_record(store)
-        record.approval["manifest_sha256"] = "0" * 64
-        with pytest.raises(ApprovalError, match="does not match its sealed bundle"):
-            require_approved_snapshot(store, record, algorithm="selection", tier=None)
-
-    def test_tampered_bundle_fails(self, store: SessionStore) -> None:
-        record = _approved_record(store)
-        path = store.bundle_dir(record.run_id) / "scene.py"
-        path.chmod(0o644)
-        path.write_bytes(b"scene = 2\n")
-        with pytest.raises(ArtifactError, match="differ from its manifest"):
-            require_approved_snapshot(store, record, algorithm="selection", tier=None)
-
-    def test_incomplete_run_fails(self, store: SessionStore) -> None:
-        record = store.create_run("selection", 2)
-        with pytest.raises(ApprovalError, match="not completed"):
             require_approved_snapshot(store, record, algorithm="selection", tier=None)

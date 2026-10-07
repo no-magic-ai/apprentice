@@ -284,7 +284,8 @@ def _cmd_submit(args: Any) -> int:
     try:
         submissions = submit_snapshot(snapshot, approval, Path(reserved["workspace"]))
     except PackagingError as exc:
-        pushed = any(effect["pushed"] for effect in exc.effects)
+        # A push whose outcome is unknown (None) may have published, so it is partial.
+        pushed = any(effect["pushed"] is not False for effect in exc.effects)
         outcome = {
             "status": "partial" if pushed else "failed",
             "finished_at": datetime.now(tz=UTC).isoformat(),
@@ -333,6 +334,15 @@ def _reserve_submission(
                     {"error": str(exc), "run_id": record.run_id, "remediation": exc.remediation}
                 )
                 return None
+            if not isinstance(record.submission, dict):
+                _print_json(
+                    {
+                        "error": f"stored submission attempt of run {record.run_id} is not an object",
+                        "run_id": record.run_id,
+                        "submission": record.submission,
+                    }
+                )
+                return None
             if record.submission:
                 # One attempt per run: an attempt whose effects may be incomplete
                 # or unknown is never retried, resumed or overwritten.
@@ -375,20 +385,28 @@ def _finish_submission(
     The record is reloaded under the lock and updated only if its attempt is
     still exactly `reserved`; otherwise nothing is saved, and the known
     effects of this process are printed with the discrepancy (returns None).
+    `stored` in that output is the attempt read from disk, or None when the
+    record could not be read.
     """
     from apprentice.core.artifacts import ArtifactError
 
-    stored: dict[str, Any] | None
+    stored: object
     try:
         with store.record_lock(run_id):
             latest = store.load(run_id)
             if latest.submission == reserved:
                 latest.submission = {**reserved, **outcome}
-                store.save(latest)
-                return latest.submission
-            stored = latest.submission
-            discrepancy = "the stored submission attempt is not the one this process reserved"
-    except (FileNotFoundError, ValueError, ArtifactError) as exc:
+                try:
+                    store.save(latest)
+                except OSError as exc:
+                    # The atomic replace did not happen: the record still holds `reserved`.
+                    stored, discrepancy = reserved, f"saving the outcome failed: {exc}"
+                else:
+                    return latest.submission
+            else:
+                stored = latest.submission
+                discrepancy = "the stored submission attempt is not the one this process reserved"
+    except (OSError, ValueError, ArtifactError) as exc:
         stored, discrepancy = None, str(exc)
     _print_json(
         {
@@ -450,6 +468,15 @@ def _cmd_approve(args: Any) -> int:
                             f"Run {args.run_id} is not completed "
                             f"(status: {record.status}); nothing to approve."
                         )
+                    }
+                )
+                return 1
+            if not isinstance(record.submission, dict):
+                _print_json(
+                    {
+                        "error": f"stored submission attempt of run {record.run_id} is not an object",
+                        "run_id": record.run_id,
+                        "submission": record.submission,
                     }
                 )
                 return 1

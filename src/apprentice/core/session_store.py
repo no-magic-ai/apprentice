@@ -121,7 +121,7 @@ class RunRecord:
         )
 
 
-def blocking_gate_failures(budget_summary: dict[str, Any]) -> list[dict[str, Any]]:
+def blocking_gate_failures(budget_summary: object) -> list[dict[str, Any]]:
     """Return the recorded gate verdicts that failed a blocking gate.
 
     Verdicts are those `GateAgent` records through `BudgetTracker`. Entries
@@ -131,12 +131,24 @@ def blocking_gate_failures(budget_summary: dict[str, Any]) -> list[dict[str, Any
     WARN and PASS verdicts never block. A live blocking FAIL already halts
     generation with `BlockingGateError`; this check keeps such a summary from
     being sealed and refuses completed records sealed before that halt existed.
+
+    Raises:
+        ValueError: If the summary is not an object, its `gate_verdicts` is not
+            a list of objects, or a blocking FAIL lacks a string `gate_name` or
+            `after_stage`.
     """
-    return [
-        verdict
-        for verdict in budget_summary.get("gate_verdicts", [])
-        if verdict.get("verdict") == _FAIL and verdict.get("blocking", True)
-    ]
+    if not isinstance(budget_summary, dict):
+        raise ValueError("budget summary is not an object")
+    verdicts = budget_summary.get("gate_verdicts", [])
+    if not isinstance(verdicts, list) or not all(isinstance(v, dict) for v in verdicts):
+        raise ValueError("budget summary gate_verdicts is not a list of objects")
+    failures = [v for v in verdicts if v.get("verdict") == _FAIL and v.get("blocking", True)]
+    for failure in failures:
+        if not isinstance(failure.get("gate_name"), str) or not isinstance(
+            failure.get("after_stage"), str
+        ):
+            raise ValueError("a failed gate verdict has no gate_name or after_stage")
+    return failures
 
 
 def describe_gate_failures(failures: list[dict[str, Any]]) -> str:
@@ -201,9 +213,13 @@ class SessionStore:
         """Seal the run's final artifacts into its bundle and mark it completed.
 
         Raises:
-            ArtifactError: If a blocking gate failed; such a run is never sealed.
+            ArtifactError: If a blocking gate failed (such a run is never sealed)
+                or the gate verdicts in `budget_summary` are malformed.
         """
-        failures = blocking_gate_failures(budget_summary)
+        try:
+            failures = blocking_gate_failures(budget_summary)
+        except ValueError as exc:
+            raise ArtifactError(f"run {record.run_id} cannot be sealed: {exc}") from exc
         if failures:
             raise ArtifactError(
                 f"run {record.run_id} cannot be sealed: {describe_gate_failures(failures)}"

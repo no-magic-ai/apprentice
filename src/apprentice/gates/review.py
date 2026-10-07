@@ -74,14 +74,20 @@ def require_reviewable_snapshot(store: SessionStore, record: RunRecord) -> Bundl
     are caught here).
 
     Raises:
-        ApprovalError: If the run is not completed or a blocking gate failed.
+        ApprovalError: If the run is not completed, a blocking gate failed or
+            its recorded gate verdicts are malformed.
         ArtifactError: If the sealed bundle is missing or fails verification.
     """
     rebuild = f"apprentice build {record.algorithm_name} --tier {record.tier}"
     if record.status != "completed":
         raise ApprovalError(f"run {record.run_id} is {record.status}, not completed", rebuild)
     snapshot = store.load_bundle(record)
-    failures = blocking_gate_failures(record.budget_summary)
+    try:
+        failures = blocking_gate_failures(record.budget_summary)
+    except ValueError as exc:
+        raise ApprovalError(
+            f"run {record.run_id} has malformed gate records: {exc}", rebuild
+        ) from exc
     if failures:
         raise ApprovalError(
             f"run {record.run_id} cannot be approved or submitted: "
@@ -120,6 +126,11 @@ def require_approved_snapshot(
             f"apprentice submit {record.algorithm_name} --run-id {record.run_id}",
         )
     approval = record.approval
+    if not isinstance(approval, dict):
+        raise ApprovalError(
+            f"approval of run {record.run_id} is not an object",
+            f"apprentice approve {record.run_id}",
+        )
     if not approval:
         raise ApprovalError(
             f"no human-review approval recorded for run {record.run_id}",
@@ -145,7 +156,14 @@ def require_approved_snapshot(
         approval["tier"],
         approval["manifest_sha256"],
     )
-    if approved != (snapshot.run_id, snapshot.algorithm, snapshot.tier, snapshot.manifest_sha256):
+    approved_tier = approval["tier"]
+    # Equality alone would accept True for tier 1 and 2.0 for tier 2.
+    if (
+        isinstance(approved_tier, bool)
+        or not isinstance(approved_tier, int)
+        or approved
+        != (snapshot.run_id, snapshot.algorithm, snapshot.tier, snapshot.manifest_sha256)
+    ):
         raise ApprovalError(
             f"approval of run {record.run_id} does not match its sealed bundle",
             f"review the bundle with `apprentice preview --run-id {record.run_id}` "
