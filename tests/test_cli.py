@@ -506,6 +506,28 @@ class TestRootSubmitIdentity:
                 "approval does not match the run's sealed bundle",
             ),
             (
+                lambda r: r["approval"]["artifact_hashes"].update(implementation="0" * 64),
+                "approval does not match the run's sealed bundle",
+            ),
+            (
+                lambda r: r["approval"]["artifact_hashes"].pop("anki_deck"),
+                "approval does not match the run's sealed bundle",
+            ),
+            (
+                lambda r: r["approval"]["artifact_hashes"].update(extra="0" * 64),
+                "approval does not match the run's sealed bundle",
+            ),
+            (
+                lambda r: r["approval"].pop("artifact_hashes"),
+                "approval does not match the run's sealed bundle",
+            ),
+            (
+                lambda r: r["approval"].update(
+                    artifact_hashes=sorted(r["approval"]["artifact_hashes"].items())
+                ),
+                "approval does not match the run's sealed bundle",
+            ),
+            (
                 lambda r: r.update(approval=["approved"]),
                 "stored approval of this run is not an object",
             ),

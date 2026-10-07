@@ -329,11 +329,15 @@ def _cmd_submit(cfg: ApprenticeConfig, args: Any) -> int:
     }
     approved_identity = {key: approval.get(key) for key in sealed_identity}
     approved_tier = approved_identity["tier"]
+    # The review gate compares regenerated roles with this map, so it must be
+    # exactly the verified bundle's role hashes, not merely present.
+    sealed_hashes = {artifact.role: artifact.sha256 for artifact in snapshot.artifacts}
     # Equality alone would accept True for 1 and 2.0 for 2; the tier must be an integer.
     if (
         approved_identity != sealed_identity
         or not isinstance(approved_tier, int)
         or isinstance(approved_tier, bool)
+        or approval.get("artifact_hashes") != sealed_hashes
     ):
         _print_json(
             {
