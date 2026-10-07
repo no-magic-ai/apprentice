@@ -9,7 +9,13 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from apprentice.core.artifacts import MANIFEST_FILENAME, ArtifactError, canonical_json
+from apprentice.core.artifacts import (
+    MANIFEST_FILENAME,
+    ArtifactError,
+    canonical_json,
+    load_snapshot,
+    seal_bundle,
+)
 from apprentice.core.session_store import RunRecord, SessionStore
 
 if TYPE_CHECKING:
@@ -302,6 +308,33 @@ class TestSealedBundle:
         with pytest.raises(ArtifactError, match="already has a sealed bundle"):
             store.complete_run(record, {"generated_code": "impl = 2\n"}, {}, 1.0)
         assert store.load_bundle(record).artifacts[0].data == b"impl = 1\n"
+
+    def test_bundle_resealed_for_the_same_run_is_not_the_completed_bundle(
+        self, tmp_path: Path
+    ) -> None:
+        store = SessionStore(store_dir=tmp_path)
+        record = store.create_run("selection", 2)
+        store.complete_run(record, {"generated_code": "impl = 1\n"}, {}, 1.0)
+        record_path = tmp_path / f"{record.run_id}.json"
+        record_bytes = record_path.read_bytes()
+        bundle = store.bundle_dir(record.run_id)
+        # Swap in a valid bundle sealed for the same run, algorithm and tier with other bytes.
+        bundle.chmod(0o755)
+        for path in bundle.iterdir():
+            path.unlink()
+        bundle.rmdir()
+        resealed = seal_bundle(
+            bundle,
+            run_id=record.run_id,
+            algorithm="selection",
+            tier=2,
+            contents={"implementation": "impl = 2\n"},
+        )
+        assert load_snapshot(bundle).manifest_sha256 == resealed != record.manifest_sha256
+
+        with pytest.raises(ArtifactError):
+            store.load_bundle(store.load(record.run_id))
+        assert record_path.read_bytes() == record_bytes
 
     def test_legacy_run_without_bundle_requires_rebuild(self, tmp_path: Path) -> None:
         store = SessionStore(store_dir=tmp_path)
