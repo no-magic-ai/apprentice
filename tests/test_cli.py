@@ -18,13 +18,12 @@ import pytest
 from apprentice.cli import (
     _cmd_approve,
     _cmd_preview,
-    _cmd_submit,
     main,
 )
 from apprentice.core.artifacts import canonical_json, manifest_digest
 from apprentice.core.config import load_config
 from apprentice.core.session_store import RunRecord, SessionStore, default_store_dir
-from tests.conftest import fixture_outputs
+from tests.conftest import fixture_outputs, run_submit
 from tests.responses_fixture import (
     ResponsesFixture,
     ResponsesServer,
@@ -276,14 +275,14 @@ class TestSubmitCommand:
     ) -> None:
         rec = _make_completed_run(store_dir)
 
-        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
+        assert run_submit(_SubmitArgs("selection", rec.run_id)) == 1
         out = json.loads(capsys.readouterr().out)
         assert out["remediation"] == f"apprentice approve {rec.run_id}"
 
     def test_submit_rejects_unknown_run(
         self, store_dir: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        assert _cmd_submit(_SubmitArgs("selection", f"selection-20260101T000000Z-{'0' * 32}")) == 1
+        assert run_submit(_SubmitArgs("selection", f"selection-20260101T000000Z-{'0' * 32}")) == 1
         assert "No run record found" in json.loads(capsys.readouterr().out)["error"]
 
     def test_restarted_submit_promotes_approved_bytes(
@@ -295,7 +294,7 @@ class TestSubmitCommand:
         rec = _approved_run(store_dir)
         approved = json.loads(capsys.readouterr().out)
 
-        assert _cmd_submit(_SubmitArgs("selection", rec.run_id, tier=2)) == 0
+        assert run_submit(_SubmitArgs("selection", rec.run_id, tier=2)) == 0
 
         out = json.loads(capsys.readouterr().out)
         assert out["manifest_sha256"] == approved["manifest_sha256"]
@@ -323,13 +322,13 @@ class TestSubmitCommand:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         rec = _approved_run(store_dir)
-        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 0
+        assert run_submit(_SubmitArgs("selection", rec.run_id)) == 0
         calls = len(offline_remotes.gh_calls())
 
         stored = SessionStore(store_dir=store_dir).load(rec.run_id).submission
         capsys.readouterr()
 
-        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
+        assert run_submit(_SubmitArgs("selection", rec.run_id)) == 1
         out = json.loads(_last_json(capsys))
         assert "already has a submission attempt" in out["error"]
         assert out["submission"] == stored
@@ -340,7 +339,7 @@ class TestSubmitCommand:
         self, store_dir: Path, offline_remotes: OfflineRemotes
     ) -> None:
         rec = _approved_run(store_dir)
-        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 0
+        assert run_submit(_SubmitArgs("selection", rec.run_id)) == 0
 
         submission = SessionStore(store_dir=store_dir).load(rec.run_id).submission
         assert submission["status"] == "complete"
@@ -376,7 +375,7 @@ class TestSubmitCommand:
             offline_remotes.reject_pushes("no-magic-ai/no-magic")
         capsys.readouterr()
 
-        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
+        assert run_submit(_SubmitArgs("selection", rec.run_id)) == 1
 
         printed = json.loads(capsys.readouterr().out)
         stored = SessionStore(store_dir=store_dir).load(rec.run_id).submission
@@ -389,7 +388,7 @@ class TestSubmitCommand:
         gh_calls = len(offline_remotes.gh_calls())
         scratch = sorted((store_dir / "scratch").iterdir())
 
-        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
+        assert run_submit(_SubmitArgs("selection", rec.run_id)) == 1
 
         out = json.loads(_last_json(capsys))
         assert "already has a submission attempt" in out["error"]
@@ -427,7 +426,7 @@ class TestSubmitCommand:
         capsys.readouterr()
 
         submit_args = _SubmitArgs(args.get("algorithm", "selection"), rec.run_id, args.get("tier"))
-        assert _cmd_submit(submit_args) == 1
+        assert run_submit(submit_args) == 1
 
         assert message in json.loads(capsys.readouterr().out)["error"]
         assert not (store_dir / "scratch").exists()
@@ -611,7 +610,7 @@ class TestSealedTierType:
         before = _tree(store_dir)
         capsys.readouterr()
 
-        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
+        assert run_submit(_SubmitArgs("selection", rec.run_id)) == 1
 
         assert "unsupported tier 2.0" in json.loads(_last_json(capsys))["error"]
         assert _tree(store_dir) == before
@@ -724,7 +723,7 @@ class TestSubmitRemediation:
     ) -> None:
         record = _legacy_record(store_dir, "selection-20250101T000000Z", approval)
 
-        assert _cmd_submit(_SubmitArgs("selection", record.run_id)) == 1
+        assert run_submit(_SubmitArgs("selection", record.run_id)) == 1
 
         out = json.loads(capsys.readouterr().out)
         assert "apprentice build selection --tier 2" in out["error"]
@@ -770,7 +769,7 @@ class TestBlockingGateFailures:
         store.save(record)
         capsys.readouterr()
 
-        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
+        assert run_submit(_SubmitArgs("selection", rec.run_id)) == 1
 
         assert "blocking gate failed" in json.loads(capsys.readouterr().out)["error"]
         assert offline_remotes.branches("no-magic-ai/no-magic") == ["main"]
@@ -802,7 +801,7 @@ class TestSubmitPublicationGuards:
         offline_remotes.mutate_staged_python("no-magic-ai/no-magic")
         capsys.readouterr()
 
-        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
+        assert run_submit(_SubmitArgs("selection", rec.run_id)) == 1
 
         submission = SessionStore(store_dir=store_dir).load(rec.run_id).submission
         assert submission["status"] == "failed"
@@ -857,12 +856,15 @@ class _CountingHandler(BaseHTTPRequestHandler):
         self.do_POST()
 
 
-# Fixed driver (argv: config, run ID, forbidden modules as JSON).
+# Fixed driver (argv: config, run ID, forbidden modules as JSON). It applies the
+# test's offline supported-URL map (see `OfflineRemotes`) before the CLI runs.
 _FRESH_SUBMIT = """
-import json, sys
+import json, os, sys
 
+import apprentice.agents.packaging as packaging
 from apprentice.cli import main
 
+packaging._REPOSITORY_URLS = json.loads(os.environ["OFFLINE_REPOSITORY_URLS"])
 config, run_id, forbidden = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
 code = main(["--config", config, "submit", "selection", "--run-id", run_id])
 loaded = sorted(m for m in sys.modules if any(m == f or m.startswith(f + ".") for f in forbidden))
@@ -889,7 +891,6 @@ class TestFreshSubmitProcess:
         config_path = tmp_path / "apprentice.toml"
         config_path.write_text(config, encoding="utf-8")
         forbidden = sorted(_forbidden_generation_modules())
-        argv = [str(config_path), rec.run_id, json.dumps(forbidden)]
         env = {
             "PATH": os.environ["PATH"],
             "HOME": str(home),
@@ -897,7 +898,9 @@ class TestFreshSubmitProcess:
             "GIT_CONFIG_GLOBAL": os.environ["GIT_CONFIG_GLOBAL"],
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_ALLOW_PROTOCOL": "file",
+            "OFFLINE_REPOSITORY_URLS": os.environ["OFFLINE_REPOSITORY_URLS"],
         }
+        argv = [str(config_path), rec.run_id, json.dumps(forbidden)]
         try:
             result = subprocess.run(
                 [sys.executable, "-c", _FRESH_SUBMIT, *argv],
@@ -1009,7 +1012,7 @@ class TestStoredApprovalMetadata:
         record_bytes = (store_dir / f"{rec.run_id}.json").read_bytes()
         capsys.readouterr()
 
-        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
+        assert run_submit(_SubmitArgs("selection", rec.run_id)) == 1
 
         out = json.loads(capsys.readouterr().out)
         assert f"approval of run {rec.run_id} is malformed" in out["error"]
@@ -1024,7 +1027,7 @@ class TestStoredApprovalMetadata:
         rec = _approved_run(store_dir)
         _store_approval_field(store_dir, rec.run_id, "approved_at", "2026-10-07T08:09:10+05:30")
 
-        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 0
+        assert run_submit(_SubmitArgs("selection", rec.run_id)) == 0
 
         dates = subprocess.run(
             ["git", "log", "-1", "--format=%aI %cI", f"apprentice/{rec.run_id}"],
@@ -1051,9 +1054,15 @@ class TestSubmitUsesTheCapturedSnapshot:
             name: (bundle / name).read_bytes() for name in ("implementation.py", "scene.py")
         }
         real_check = review.require_approved_snapshot
+        checks: list[int] = []
 
         def check_then_swap(*args: Any, **kwargs: Any) -> Any:
+            # Submit checks before admission and again while saving its claim;
+            # the bytes change only after that final, captured check.
             snapshot = real_check(*args, **kwargs)
+            checks.append(1)
+            if len(checks) < 2:
+                return snapshot
             for name, data in approved.items():
                 path = bundle / name
                 path.chmod(0o644)
@@ -1062,7 +1071,7 @@ class TestSubmitUsesTheCapturedSnapshot:
 
         monkeypatch.setattr(review, "require_approved_snapshot", check_then_swap)
 
-        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 0
+        assert run_submit(_SubmitArgs("selection", rec.run_id)) == 0
 
         branch = f"apprentice/{rec.run_id}"
         assert (
@@ -1085,7 +1094,7 @@ class TestReviewGateRemediation:
         rec = store.create_run("selection", tier=2)
         store.fail_run(rec, {}, {}, 1.0, "provider down")
 
-        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
+        assert run_submit(_SubmitArgs("selection", rec.run_id)) == 1
 
         assert json.loads(capsys.readouterr().out)["remediation"] == (
             "apprentice build selection --tier 2"
@@ -1098,7 +1107,7 @@ class TestReviewGateRemediation:
         _store_approval_field(store_dir, rec.run_id, "manifest_sha256", "0" * 64)
         capsys.readouterr()
 
-        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
+        assert run_submit(_SubmitArgs("selection", rec.run_id)) == 1
 
         remediation = json.loads(capsys.readouterr().out)["remediation"]
         assert f"apprentice preview --run-id {rec.run_id}" in remediation
@@ -1140,7 +1149,7 @@ class TestStoredApprovalShape:
             store_dir,
             offline_remotes,
             capsys,
-            lambda: _cmd_submit(_SubmitArgs("selection", rec.run_id)),
+            lambda: run_submit(_SubmitArgs("selection", rec.run_id)),
         )
 
         assert out["remediation"] == f"apprentice approve {rec.run_id}"
@@ -1169,7 +1178,7 @@ class TestStoredApprovalShape:
             store_dir,
             offline_remotes,
             capsys,
-            lambda: _cmd_submit(_SubmitArgs("selection", rec.run_id)),
+            lambda: run_submit(_SubmitArgs("selection", rec.run_id)),
         )
 
         assert f"apprentice approve {rec.run_id}" in out["remediation"]
@@ -1201,7 +1210,7 @@ class TestMalformedGateRecords:
         def run() -> int:
             if command == "approve":
                 return _cmd_approve(_ApproveArgs(rec.run_id, approver="other"))
-            return _cmd_submit(_SubmitArgs("selection", rec.run_id))
+            return run_submit(_SubmitArgs("selection", rec.run_id))
 
         out = _refused_without_effects(store_dir, offline_remotes, capsys, run)
 
@@ -1225,7 +1234,7 @@ class TestStoredSubmissionShape:
         def run() -> int:
             if command == "approve":
                 return _cmd_approve(_ApproveArgs(rec.run_id, approver="other"))
-            return _cmd_submit(_SubmitArgs("selection", rec.run_id))
+            return run_submit(_SubmitArgs("selection", rec.run_id))
 
         out = _refused_without_effects(store_dir, offline_remotes, capsys, run)
 
@@ -1244,7 +1253,7 @@ class TestStoredSubmissionShape:
             store_dir,
             offline_remotes,
             capsys,
-            lambda: _cmd_submit(_SubmitArgs("selection", rec.run_id)),
+            lambda: run_submit(_SubmitArgs("selection", rec.run_id)),
         )
 
         assert out["submission"] == {"garbage": True}
@@ -1259,7 +1268,7 @@ class TestStoredSubmissionShape:
         else:
             _damage_record(store_dir, rec.run_id, lambda r: r.update(submission={}))
 
-        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 0
+        assert run_submit(_SubmitArgs("selection", rec.run_id)) == 0
 
         assert SessionStore(store_dir=store_dir).load(rec.run_id).submission["status"] == "complete"
         assert len(offline_remotes.gh_calls()) == 2
@@ -1281,7 +1290,7 @@ class TestUnknownPublicationOutcome:
         offline_remotes.hold_after_receive("no-magic-ai/no-magic", gate)
         capsys.readouterr()
         try:
-            assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
+            assert run_submit(_SubmitArgs("selection", rec.run_id)) == 1
         finally:
             release(gate)
 
@@ -1293,7 +1302,7 @@ class TestUnknownPublicationOutcome:
             (False, ""),
         ]
         assert f"apprentice/{rec.run_id}" in offline_remotes.branches("no-magic-ai/no-magic")
-        assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
+        assert run_submit(_SubmitArgs("selection", rec.run_id)) == 1
         assert offline_remotes.gh_calls() == []
 
 
@@ -1656,13 +1665,14 @@ class TestWritesIntoAStoreThatCannotBeWritten:
         capsys.readouterr()
         store_dir.chmod(0o100)
         try:
-            code = _cmd_submit(_SubmitArgs("selection", rec.run_id))
+            # The child's submit admits a publication cycle first, whose rescan
+            # refuses a store that cannot be listed before anything is written.
+            code = run_submit(_SubmitArgs("selection", rec.run_id))
         finally:
             store_dir.chmod(original)
 
         out = json.loads(_last_json(capsys))
         assert code == 1
-        assert out["run_id"] == rec.run_id
         assert str(store_dir) in out["error"]
         assert record.read_bytes() == data
         assert offline_remotes.gh_calls() == []

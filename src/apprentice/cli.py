@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from apprentice.controls.authority import Authority, Cycle
     from apprentice.controls.errors import ControlDeniedError
     from apprentice.controls.footprint import Footprint
@@ -119,6 +121,22 @@ def main(argv: list[str] | None = None) -> int:
         required=True,
         help="Required: the operator's own declaration of quiescence",
     )
+    reset_parser = controls_sub.add_parser(
+        "reset-circuit",
+        help=(
+            "Close the automated-work circuit after investigating its failures (budgets, holds, "
+            "PR slots, quarantine and approvals are untouched)"
+        ),
+    )
+    reset_parser.add_argument("--operator", type=str, required=True, help="Operator identity")
+    rollback_parser = controls_sub.add_parser(
+        "prepare-rollback",
+        help=(
+            "Suspend continuity before reverting to a version without these controls; nothing "
+            "is admitted until a later `controls adopt-legacy`"
+        ),
+    )
+    rollback_parser.add_argument("--operator", type=str, required=True, help="Operator identity")
 
     dev_parser = subparsers.add_parser("dev", help="Launch ADK dev UI for interactive debugging")
     dev_parser.add_argument("--port", type=int, default=8080, help="Dev UI port (default: 8080)")
@@ -195,7 +213,7 @@ def _dispatch(
     if args.command == "build":
         return _cmd_build(cfg, footprint, args)
     if args.command == "submit":
-        return _cmd_submit(args)
+        return _cmd_submit(cfg, footprint, args)
     if args.command == "approve":
         return _cmd_approve(args)
     if args.command == "suggest":
@@ -349,66 +367,91 @@ def _print_build_failure(result: BuildResult) -> None:
     _print_json(output)
 
 
-def _cmd_submit(args: Any) -> int:
-    """Promote the exact approved bytes of a run; no model or generation runs.
+def _cmd_submit(cfg: ApprenticeConfig, footprint: Footprint, args: Any) -> int:
+    """Promote the exact approved bytes of a run as one controlled publication cycle.
 
-    The attempt is reserved under the run's record lock before any clone, push
-    or pull request, so concurrent or repeated submits publish at most once.
-    Its outcome is recorded only if the stored attempt is still the one this
-    process reserved.
+    No model or generation runs. Before any claim is saved, the approval and
+    the run's attempt history are checked, then one `submit` cycle is
+    admitted together with one PR slot per intended repository (item lease,
+    cooldown, circuit and rolling PR windows in one transaction). Every
+    commit is prepared and measured before the final admission persists the
+    remote-write intent immediately before the first push. An attempt that
+    ended before that intent wrote nothing; the same approved manifest may
+    be submitted again. Its outcome is recorded only if the stored attempt is
+    still the one this process reserved.
     """
-    from datetime import UTC, datetime
-
-    from apprentice.agents.packaging import PackagingError, submit_snapshot
-    from apprentice.core.observability import get_logger
+    from apprentice.agents.packaging import PackagingError, intended_repositories
+    from apprentice.controls.errors import AuthorityError, ControlDeniedError
+    from apprentice.controls.policy import ControlPolicy
+    from apprentice.core.cycles import (
+        classify,
+        describe_error,
+        end_cycle,
+        open_authority,
+        recording_end,
+    )
     from apprentice.core.session_store import SessionStore
 
-    logger = get_logger(__name__)
     store = SessionStore()
-    reservation = _reserve_submission(store, args)
-    if reservation is None:
-        return 1
-    snapshot, approval, reserved = reservation
+    opened: list[Authority] = []
 
-    logger.info("submit started: run %s manifest %s", snapshot.run_id, snapshot.manifest_sha256)
+    def authority_handle() -> Authority:
+        # Opened only once a claim may follow: a refused run gains no cycle,
+        # claim, PR slot or remote effect. (On a fresh installation `main` has
+        # already created the authority itself, before any log, which admits
+        # nothing.)
+        if not opened:
+            opened.append(open_authority(store, footprint))
+        return opened[0]
+
     try:
-        submissions = submit_snapshot(snapshot, approval, Path(reserved["workspace"]))
-    except PackagingError as exc:
-        # A push whose outcome is unknown (None) may have published, so it is partial.
-        pushed = any(effect["pushed"] is not False for effect in exc.effects)
-        outcome = {
-            "status": "partial" if pushed else "failed",
-            "finished_at": datetime.now(tz=UTC).isoformat(),
-            "error": str(exc),
-            "repositories": exc.effects,
-        }
-        recorded = _finish_submission(store, snapshot.run_id, reserved, outcome)
-        if recorded is not None:
-            _print_json({"error": str(exc), "run_id": snapshot.run_id, **recorded})
+        checked = _check_submission(store, args, authority_handle)
+        if checked is None:
+            return 1
+        snapshot, _approval, previous = checked
+        try:
+            repositories = intended_repositories(snapshot)
+        except PackagingError as exc:
+            _print_json({"error": str(exc), "run_id": snapshot.run_id})
+            return 1
+        authority = authority_handle()
+        # Operator stops wait while the admission, the claim and the ends are
+        # committed; the remote work itself stays interruptible (`_publish`).
+        with recording_end():
+            try:
+                cycle = authority.begin_cycle(
+                    "submit",
+                    ControlPolicy.from_config(cfg),
+                    run_id=snapshot.run_id,
+                    publication_claim=(snapshot.manifest_sha256, repositories),
+                )
+            except ControlDeniedError as exc:
+                _print_denial(exc, run_id=snapshot.run_id, approval="kept; nothing was claimed")
+                return 1
+            try:
+                return _publish(store, authority, cycle, args, previous)
+            except BaseException as exc:
+                # Any other end — an uncaught error or interruption — commits
+                # the terminal state, which closes an attempt that never
+                # recorded a write intent as NO_WRITE and releases its slots.
+                end_cycle(cycle, classify(exc), describe_error(exc))
+                raise
+    except AuthorityError as exc:
+        _print_json({"error": f"control authority unavailable: {exc}"})
         return 1
-
-    outcome = {
-        "status": "complete",
-        "finished_at": datetime.now(tz=UTC).isoformat(),
-        "repositories": [submission.to_dict() for submission in submissions],
-    }
-    recorded = _finish_submission(store, snapshot.run_id, reserved, outcome)
-    if recorded is None:
-        return 1
-    _print_json({"run_id": snapshot.run_id, **recorded})
-    return 0
+    finally:
+        for handle in opened:
+            handle.close()
 
 
-def _reserve_submission(
-    store: SessionStore, args: Any
+def _check_submission(
+    store: SessionStore, args: Any, authority: Callable[[], Authority]
 ) -> tuple[BundleSnapshot, dict[str, Any], dict[str, Any]] | None:
-    """Under the record lock, verify the approval and save a pending attempt.
+    """Verify the approval and that the run may start a new attempt; save nothing.
 
-    Returns the one captured snapshot, the approval read under the lock and
-    the reserved attempt, or None after printing why nothing was reserved.
+    Returns the snapshot, the approval and the previous attempt (empty when
+    none), or None after printing why the run cannot be submitted.
     """
-    from datetime import UTC, datetime
-
     from apprentice.core.artifacts import ArtifactError
     from apprentice.gates.review import ApprovalError, require_approved_snapshot
 
@@ -433,31 +476,283 @@ def _reserve_submission(
                     }
                 )
                 return None
-            if record.submission:
-                # One attempt per run: an attempt whose effects may be incomplete
-                # or unknown is never retried, resumed or overwritten.
+            if record.submission and not _proven_unwritten(
+                authority, record.run_id, snapshot.manifest_sha256, record.submission
+            ):
+                # An attempt whose effects may be incomplete or unknown is never
+                # retried, resumed or overwritten.
                 _print_json(
                     {
                         "error": (
-                            f"run {record.run_id} already has a submission attempt; "
-                            "it is not published again"
+                            f"run {record.run_id} already has a submission attempt that may "
+                            "have written remotely; it is not published again"
                         ),
                         "run_id": record.run_id,
                         "submission": record.submission,
                     }
                 )
                 return None
+            return snapshot, dict(record.approval), dict(record.submission)
+    except (FileNotFoundError, ValueError) as exc:
+        _print_json({"error": str(exc)})
+        return None
+    except ArtifactError as exc:
+        _print_json({"error": str(exc), "run_id": args.run_id})
+        return None
+
+
+def _proven_unwritten(
+    authority: Callable[[], Authority],
+    run_id: str,
+    manifest_sha256: str,
+    submission: dict[str, Any],
+) -> bool:
+    """True only if the ledger proves this run's stored attempt wrote nothing remotely.
+
+    The ledger attempt the record names must have ended `NO_WRITE` without a
+    remote-write intent, and it must be an attempt of `run_id` for the
+    approved manifest `manifest_sha256` — the record's own claim of either is
+    not evidence. Reading it commits owner-loss recovery first, so the
+    attempt of a killed process has ended. Attempts written before the
+    ledger (no attempt ID) are never proven.
+    """
+    from apprentice.controls.publication import NO_WRITE
+
+    attempt_id = submission.get("attempt_id")
+    if not isinstance(attempt_id, str) or submission.get("remote_write_intent") is not False:
+        return False
+    stored = authority().publication_attempt(attempt_id)
+    return (
+        stored is not None
+        and stored["state"] == NO_WRITE
+        and not stored["remote_write_intent"]
+        and stored["run_id"] == run_id
+        and stored["manifest_sha256"] == manifest_sha256
+        and submission.get("manifest_sha256") == manifest_sha256
+    )
+
+
+def _publish(
+    store: SessionStore,
+    authority: Authority,
+    cycle: Cycle,
+    args: Any,
+    previous: dict[str, Any],
+) -> int:
+    """Save the pending claim, then prepare, admit and publish; record the outcome once."""
+    from datetime import UTC, datetime
+
+    from apprentice.agents.packaging import PublicationSteps, submit_snapshot
+    from apprentice.controls.errors import AuthorityError, ControlDeniedError
+    from apprentice.controls.publication import COMPLETE, NO_WRITE, WRITE_FAILED
+    from apprentice.core.cycles import end_cycle, interruptible
+    from apprentice.core.observability import get_logger
+
+    logger = get_logger(__name__)
+    assert cycle.publication_attempt is not None
+    attempt_id = cycle.publication_attempt
+    reservation = _reserve_submission(store, authority, args, cycle, previous)
+    if reservation is None:
+        authority.finish_publication(attempt_id, NO_WRITE, "claim not saved")
+        end_cycle(cycle, "denied", "the run's claim could not be saved")
+        return 1
+    snapshot, approval, reserved = reservation
+
+    def admit(prepared: list[Any]) -> None:
+        policy = cycle.policy
+        for submission in prepared:
+            if submission.size.files > policy.max_files_per_pr:
+                raise ControlDeniedError(
+                    "rate_limits.max_files_per_pr",
+                    f"{submission.repository} changes {submission.size.files} files; "
+                    f"at most {policy.max_files_per_pr} per PR",
+                )
+            if submission.size.text_lines > policy.max_lines_per_pr:
+                raise ControlDeniedError(
+                    "rate_limits.max_lines_per_pr",
+                    f"{submission.repository} changes {submission.size.text_lines} text lines; "
+                    f"at most {policy.max_lines_per_pr} per PR",
+                )
+        authority.begin_writes(cycle)
+
+    steps = PublicationSteps(
+        admit=admit, before_step=lambda step: authority.require_writing(cycle, step)
+    )
+    logger.info("submit started: run %s manifest %s", snapshot.run_id, snapshot.manifest_sha256)
+    try:
+        with interruptible():
+            submissions = submit_snapshot(snapshot, approval, Path(reserved["workspace"]), steps)
+    except BaseException as exc:
+        # The live effects, whatever ended the attempt: a step that was started
+        # but not acknowledged is None (may have taken effect).
+        known = [item.to_dict() for item in steps.progress]
+        errors: list[str] = []
+        wrote: bool | None
+        try:
+            stored = authority.publication_attempt(attempt_id)
+            wrote = bool(stored and stored["remote_write_intent"])
+        except AuthorityError as fault:
+            errors.append(f"control authority unavailable: {fault}")
+            # Known effects mean the intent was recorded; without them it may
+            # have been, so the attempt is never taken as unwritten.
+            wrote = True if known else None
+        effects = known if wrote is not False else []
+        outcome: dict[str, Any] = {
+            "finished_at": datetime.now(tz=UTC).isoformat(),
+            "error": str(exc),
+            "remote_write_intent": wrote,
+            "repositories": effects,
+        }
+        end_state: str | None
+        if wrote is False:
+            outcome["status"] = "denied" if isinstance(exc, ControlDeniedError) else "failed"
+            end_state = NO_WRITE
+        else:
+            # A push whose outcome is unknown (None) may have published, so it is partial.
+            pushed = any(effect["pushed"] is not False for effect in effects)
+            outcome["status"] = "partial" if pushed else "failed"
+            outcome["effects_unknown"] = wrote is None or any(
+                e["pushed"] is None or e["pr_url"] is None for e in effects
+            )
+            end_state = WRITE_FAILED if wrote else None
+        cycle_outcome = (
+            "cancelled"
+            if isinstance(exc, KeyboardInterrupt)
+            else "denied"
+            if isinstance(exc, ControlDeniedError)
+            else "failed"
+        )
+        errors += _end_publication(cycle, end_state, str(exc), cycle_outcome)
+        if errors:
+            outcome["authority_errors"] = errors
+        interruption = None if isinstance(exc, Exception) else exc
+        recorded = _finish_submission(store, snapshot.run_id, reserved, outcome, stop=interruption)
+        if interruption is not None:
+            raise
+        if recorded is not None:
+            extra = {"control": exc.control} if isinstance(exc, ControlDeniedError) else {}
+            _print_json({"error": str(exc), "run_id": snapshot.run_id, **extra, **recorded})
+        return 1
+
+    outcome = {
+        "status": "complete",
+        "finished_at": datetime.now(tz=UTC).isoformat(),
+        "remote_write_intent": True,
+        "repositories": [submission.to_dict() for submission in submissions],
+    }
+    errors = _end_publication(cycle, COMPLETE, "", "completed")
+    if errors:
+        outcome["authority_errors"] = errors
+    recorded = _finish_submission(store, snapshot.run_id, reserved, outcome, stop=None)
+    if recorded is None:
+        return 1
+    if errors:
+        _print_json({"error": errors[0], "run_id": snapshot.run_id, **recorded})
+        return 1
+    _print_json({"run_id": snapshot.run_id, **recorded})
+    return 0
+
+
+def _end_publication(cycle: Cycle, state: str | None, detail: str, outcome: str) -> list[str]:
+    """Record the attempt's end (`state`; None when unknown) and the cycle's; return failures.
+
+    A failure is reported, never raised, so the caller still records and
+    prints every known remote effect. Whatever is not committed stays
+    conservative: an unfinished attempt is closed by recovery (written-nothing
+    only without a write intent) and a cycle whose end cannot be committed
+    keeps its lease until this process ends.
+    """
+    from apprentice.controls.errors import AuthorityError
+    from apprentice.core.cycles import end_cycle
+
+    errors: list[str] = []
+    assert cycle.publication_attempt is not None
+    if state is not None:
+        try:
+            cycle.authority.finish_publication(cycle.publication_attempt, state, detail)
+        except AuthorityError as exc:
+            errors.append(f"control authority unavailable: {exc}")
+    try:
+        end_cycle(cycle, outcome, detail)
+    except AuthorityError as exc:
+        errors.append(f"control authority unavailable: {exc}")
+    return errors
+
+
+def _reserve_submission(
+    store: SessionStore,
+    authority: Authority,
+    args: Any,
+    cycle: Cycle,
+    previous: dict[str, Any],
+) -> tuple[BundleSnapshot, dict[str, Any], dict[str, Any]] | None:
+    """Under the record lock, re-verify and save the pending claim of `cycle`'s attempt.
+
+    The run's stored attempt must still be exactly `previous` (none, or one
+    the ledger proves wrote nothing); that attempt is kept in
+    `previous_attempts`. Returns the captured snapshot, the approval read
+    under the lock and the reserved attempt, or None after printing why.
+    """
+    from apprentice.core.artifacts import ArtifactError
+    from apprentice.core.cycles import note_for_stop
+    from apprentice.core.session_store import StoreUnavailableError
+    from apprentice.gates.review import ApprovalError, require_approved_snapshot
+
+    try:
+        with store.record_lock(args.run_id):
+            record = store.load(args.run_id)
+            try:
+                snapshot = require_approved_snapshot(
+                    store, record, algorithm=args.algorithm, tier=args.tier
+                )
+            except ApprovalError as exc:
+                _print_json(
+                    {"error": str(exc), "run_id": record.run_id, "remediation": exc.remediation}
+                )
+                return None
+            if record.submission != previous or (
+                previous
+                and not _proven_unwritten(
+                    lambda: authority, record.run_id, snapshot.manifest_sha256, previous
+                )
+            ):
+                _print_json(
+                    {
+                        "error": f"run {record.run_id} gained another submission attempt",
+                        "run_id": record.run_id,
+                        "submission": record.submission,
+                    }
+                )
+                return None
+            history = list(previous.pop("previous_attempts", [])) if previous else []
+            if previous:
+                history.append(previous)
             workspace = store.allocate_work_root()
-            reserved = {
+            reserved: dict[str, Any] = {
                 "status": "pending",
-                "started_at": datetime.now(tz=UTC).isoformat(),
+                # The ledger's claim instant: never later than the clock of
+                # any later ledger decision that reads this record.
+                "started_at": cycle.admitted_at.isoformat(),
+                "attempt_id": cycle.publication_attempt,
+                "remote_write_intent": False,
                 "manifest_sha256": snapshot.manifest_sha256,
                 "workspace": str(workspace),
                 "branch": f"apprentice/{record.run_id}",
                 "repositories": [],
             }
+            if history:
+                reserved["previous_attempts"] = history
             record.submission = dict(reserved)
-            store.save(record)
+            try:
+                store.save(record)
+            except StoreUnavailableError as exc:
+                # The claim was not stored (the record keeps its previous attempt); an
+                # operator stop deferred until the cycle's end reports it too.
+                note_for_stop(
+                    f"submission record of run {record.run_id} was not updated: "
+                    f"saving the claim (scratch root {workspace}) failed: {exc}"
+                )
+                raise
             return snapshot, dict(record.approval), reserved
     except (FileNotFoundError, ValueError) as exc:
         _print_json({"error": str(exc)})
@@ -468,7 +763,12 @@ def _reserve_submission(
 
 
 def _finish_submission(
-    store: SessionStore, run_id: str, reserved: dict[str, Any], outcome: dict[str, Any]
+    store: SessionStore,
+    run_id: str,
+    reserved: dict[str, Any],
+    outcome: dict[str, Any],
+    *,
+    stop: BaseException | None,
 ) -> dict[str, Any] | None:
     """Record the outcome of the reserved attempt and return the stored attempt.
 
@@ -476,9 +776,12 @@ def _finish_submission(
     still exactly `reserved`; otherwise nothing is saved, and the known
     effects of this process are printed with the discrepancy (returns None).
     `stored` in that output is the attempt read from disk, or None when the
-    record could not be read.
+    record could not be read. `stop` is the interruption the caller raises
+    again afterwards (None when it raises nothing); it is told the record was
+    not updated.
     """
     from apprentice.core.artifacts import ArtifactError
+    from apprentice.core.cycles import note_for_stop
     from apprentice.core.session_store import StoreUnavailableError
 
     stored: object
@@ -499,9 +802,15 @@ def _finish_submission(
                 discrepancy = "the stored submission attempt is not the one this process reserved"
     except (OSError, ValueError, ArtifactError) as exc:
         stored, discrepancy = None, str(exc)
+    unsaved = f"submission record of run {run_id} was not updated: {discrepancy}"
+    # An operator stop deferred until the submit's end is committed reports it too,
+    # and so does the stop that interrupted the publication and is raised again.
+    note_for_stop(unsaved)
+    if stop is not None:
+        stop.add_note(unsaved)
     _print_json(
         {
-            "error": f"submission record of run {run_id} was not updated: {discrepancy}",
+            "error": unsaved,
             "run_id": run_id,
             "reserved": reserved,
             "stored": stored,
@@ -685,7 +994,17 @@ def _suggest_cycle(
             raise
         _print_json(output)
         return 1
-    output = {"tier": args.tier, "candidates": session_state.get("discovery_candidates", "")}
+    candidates = session_state.get("discovery_candidates")
+    if not isinstance(candidates, str) or not candidates.strip():
+        # No model output at all is an admitted infrastructure failure, like a
+        # build without output; an actual answer — even an empty list "[]" —
+        # completes the cycle.
+        output = {"error": "no output generated", "outcome": "failed"}
+        _end_cycle(cycle, "failed", "no output generated", output)
+        authority.close()
+        _print_json(output)
+        return 1
+    output = {"tier": args.tier, "candidates": candidates}
     ended = _end_cycle(cycle, "completed", "", output)
     authority.close()
     _print_json(output)
@@ -813,8 +1132,13 @@ def _cmd_controls(footprint: Footprint, args: Any) -> int:
     authority = _open_authority(SessionStore(), footprint)
     if authority is None:
         return 1
+    actions = {
+        "adopt-legacy": authority.adopt_legacy,
+        "reset-circuit": authority.reset_circuit,
+        "prepare-rollback": authority.prepare_rollback,
+    }
     try:
-        result = authority.adopt_legacy(args.operator)
+        result: dict[str, Any] = dict(actions[args.controls_command](args.operator))
     except ControlDeniedError as exc:
         _print_denial(exc)
         return 1

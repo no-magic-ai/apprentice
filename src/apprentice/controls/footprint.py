@@ -85,12 +85,28 @@ def parse_utc(value: object, field: str, run_id: str, now: datetime) -> datetime
 
 
 @dataclass(frozen=True)
+class SubmissionExposure:
+    """A stored submission attempt: its claim time and what it may have published.
+
+    `pushed` counts repositories whose branch was pushed or may have been
+    (a timed-out push is unknown, not zero); `settled` is False while the
+    attempt is pending/partial or any effect is unknown.
+    """
+
+    attempt_id: str | None
+    started: datetime
+    pushed: int
+    settled: bool
+
+
+@dataclass(frozen=True)
 class RecordExposure:
     """What one stored run record reveals about past model or publication work."""
 
     run_id: str
     started_month: str
     live: bool
+    submission: SubmissionExposure | None
 
 
 def scan_records(store_dir: Path, now: datetime) -> list[RecordExposure]:
@@ -132,12 +148,31 @@ def scan_records(store_dir: Path, now: datetime) -> list[RecordExposure]:
         submission = data.get("submission", {})
         if not isinstance(submission, dict):
             raise AuthorityError(f"run {run_id}: submission is not an object")
-        if submission:
-            parse_utc(submission.get("started_at"), "submission.started_at", run_id, observed)
         live = data.get("status") == "in_progress" or (
             submission.get("status") in _LIVE_SUBMISSION_STATES
         )
         exposures.append(
-            RecordExposure(run_id=run_id, started_month=started.strftime("%Y-%m"), live=live)
+            RecordExposure(
+                run_id=run_id,
+                started_month=started.strftime("%Y-%m"),
+                live=live,
+                submission=_submission(submission, run_id, observed) if submission else None,
+            )
         )
     return exposures
+
+
+def _submission(submission: dict[str, object], run_id: str, now: datetime) -> SubmissionExposure:
+    started = parse_utc(submission.get("started_at"), "submission.started_at", run_id, now)
+    effects = submission.get("repositories", [])
+    if not isinstance(effects, list) or not all(isinstance(e, dict) for e in effects):
+        raise AuthorityError(f"run {run_id}: submission.repositories is not a list of objects")
+    attempt = submission.get("attempt_id")
+    return SubmissionExposure(
+        attempt_id=attempt if isinstance(attempt, str) else None,
+        started=started,
+        pushed=sum(1 for effect in effects if effect.get("pushed") is not False),
+        settled=submission.get("status") not in _LIVE_SUBMISSION_STATES
+        and all(effect.get("pushed") is not None for effect in effects)
+        and all(effect.get("pr_url") is not None for effect in effects),
+    )

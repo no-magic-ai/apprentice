@@ -7,7 +7,7 @@ Agentic Algorithm Factory for [no-magic](https://github.com/no-magic-ai/no-magic
 `apprentice` is implemented software: package version 0.4.0 with a Google ADK pipeline and the CLI below. It is **not activated** for autonomous operation. The umbrella strategy keeps activation deferred until the no-magic catalog reaches at least 60 algorithms and the per-algorithm template is locked (48 catalog scripts today). Meeting that threshold would not be enough on its own: live use also needs separate safety, spend and human approvals, and the following gaps are open in the current code:
 
 - **Execution containment.** The correctness checks run generated code with `subprocess.run` and a 5-second timeout — after every implementation draft (the drafter's validation callback) and again in the correctness gate. That is a timeout, not a sandbox. Packaging pushes branches and opens pull requests with the operator's ambient `git` and `gh` credentials in the same process environment; there is no publisher-credential isolation.
-- **Budgets and limits.** Every model call is reserved before it is sent and settled once from the provider's raw usage in one durable installation ledger: monthly, cycle, stage, role-percentage and per-call token and USD ceilings are enforced across processes and restarts (see [Configuration](docs/configuration.md#budget-enforcement)). A paid route needs an operator-supplied accounting profile; apprentice ships none, so it denies paid calls until one is configured. The rate-limit, cooldown, PR-size and circuit-breaker settings are parsed and displayed but not yet enforced; `core/circuit_breaker.py`, `core/queue.py` and `core/scheduler.py` are empty modules.
+- **Budgets and limits.** Every model call is reserved before it is sent and settled once from the provider's raw usage in one durable installation ledger: monthly, cycle, stage, role-percentage and per-call token and USD ceilings are enforced across processes and restarts (see [Configuration](docs/configuration.md#budget-enforcement)). A paid route needs an operator-supplied accounting profile; apprentice ships none, so it denies paid calls until one is configured. Concurrent items, cooldown, rolling PR day/week windows, per-PR file and text-line limits and the automated-work circuit are enforced at cycle admission and before a submission's first remote write. These controls cover this installation only; older or foreign binaries can bypass them. `core/queue.py` and `core/scheduler.py` are empty modules.
 - **Paper-aware packaging.** Packaging targets `no-magic` and `no-magic-viz` only. Released no-magic v3 also requires a `no-magic-papers` card whose `implementations[]` references the script and an explicit `SCRIPT_TO_PAPER` entry in `no-magic/scripts/generate_catalog.py`; packaging produces neither yet. The M1 catalog extension to that generator defines an additional per-script `SCRIPT_CONTRACTS` record (teaching kind, data source, adaptation note) that released v3 does not contain; when the target no-magic generator revision defines `SCRIPT_CONTRACTS`, packaging must populate it as well.
 
 Approved-byte submission is in place: each run writes its artifacts under its own run-owned root and, on completion, seals them into an immutable bundle whose manifest binds the run identity, every artifact hash and each repository destination. `approve` binds a human approval to that manifest, and `submit` re-verifies the bundle and pushes exactly those bytes to their destinations without calling a model or regenerating anything. A run recorded before sealed bundles existed fails with a rebuild instruction. The approval is a local operator attestation, not a cryptographic identity.
@@ -46,7 +46,7 @@ SequentialAgent("apprentice_pipeline")
 
 `submit` does not run this pipeline: deterministic packaging promotes the approved bundle into PRs in no-magic + no-magic-viz.
 
-Session state flows data between agents via `output_key`. Each role's model is metered at its client against the installation ledger; see [Status](#status) for what is not yet enforced.
+Session state flows data between agents via `output_key`. Each role's model is metered at its client against the installation ledger; see [Status](#status) for what these controls do and do not cover.
 
 ## Setup
 
@@ -112,6 +112,10 @@ apprentice status
 
 # After upgrading over earlier state: declare no earlier apprentice process is running
 apprentice controls adopt-legacy --operator <name> --declare-no-earlier-process-running
+
+# Close a latched circuit after investigating; suspend continuity before a rollback
+apprentice controls reset-circuit --operator <name>
+apprentice controls prepare-rollback --operator <name>
 
 # Display configuration
 apprentice config

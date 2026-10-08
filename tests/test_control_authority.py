@@ -531,10 +531,8 @@ def _hold_unknown_month(config_path: Path) -> None:
 
 
 def _suspend(config_path: Path) -> None:
-    main(["--config", str(config_path), "status"])
-    _execute("UPDATE meta SET value = 'suspended' WHERE key = 'continuity'")(
-        default_store_dir() / "controls" / "accounting.sqlite3"
-    )
+    rollback = ["controls", "prepare-rollback", "--operator", "operator@example.invalid"]
+    assert main(["--config", str(config_path), *rollback]) == 0
 
 
 def _live_legacy(config_path: Path) -> None:
@@ -1098,6 +1096,7 @@ class TestUnusableAuthorityFiles:
                 ["retry", run_id],
                 ["approve", run_id, "--approver", "tester"],
                 ["preview", "--run-id", run_id],
+                ["submit", "selection", "--run-id", run_id],
                 ["history"],
                 ["metrics"],
                 ["status"],
@@ -1110,8 +1109,8 @@ class TestUnusableAuthorityFiles:
 
         captured = capsys.readouterr()
         errors = [out["error"] for out in _json_objects(captured.out)]
-        assert codes == [1] * 7
-        assert len(errors) == 6
+        assert codes == [1] * 8
+        assert len(errors) == 7
         assert all(str(record) in error for error in errors)
         assert str(record) in captured.err
         assert "Traceback" not in captured.err
@@ -1297,11 +1296,19 @@ class TestStatusPolicyConflict:
         server: ResponsesServer,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
+        # Two concurrent items, so the live cycle itself blocks nothing here.
+        config_path = write_config(
+            tmp_path / "two-items.toml",
+            profile=local_profile(tmp_path / "profile.json"),
+            base_url=server.base_url,
+            max_concurrent_items=2,
+        )
         other = write_config(
             tmp_path / "other.toml",
             profile=local_profile(tmp_path / "profile.json"),
             base_url=server.base_url,
             monthly_token_ceiling=1_999_999,
+            max_concurrent_items=2,
         )
         main(["--config", str(config_path), "status"])
         authority = Authority.open(default_store_dir(), _EMPTY)
@@ -1485,6 +1492,43 @@ class TestRecordsWrittenDuringARescan:
 
         assert code == 0, err
         assert json.loads(out)["route"]["structurally_valid"] is True
+
+    @pytest.mark.parametrize("started", ["while-the-records-are-read", "tomorrow"])
+    def test_a_submission_started_after_the_ledger_clock_is_counted_and_a_future_one_refused(
+        self, tmp_path: Path, config_path: Path, server: ResponsesServer, started: str
+    ) -> None:
+        assert main(["--config", str(config_path), "status"]) == 0
+        store = SessionStore()
+        record = store.create_run("selection", 2)
+        stamped: list[str] = []
+
+        def write() -> None:
+            moment = datetime.now(tz=UTC)
+            if started == "tomorrow":
+                moment += timedelta(days=1)
+            stamped.append(moment.isoformat())
+            current = store.load(record.run_id)
+            current.submission = {
+                "status": "complete",
+                "started_at": moment.isoformat(),
+                "repositories": [
+                    {"repository": r, "pushed": True, "pr_url": f"https://github.com/{r}/pull/1"}
+                    for r in ("no-magic-ai/no-magic", "no-magic-ai/no-magic-viz")
+                ],
+            }
+            store.save(current)
+
+        code, _out, err = self._status_while(config_path, tmp_path, write)
+
+        conn = sqlite3.connect(default_store_dir() / "controls" / "accounting.sqlite3")
+        slots = conn.execute("SELECT run_id, at FROM pr_slots WHERE state = 'legacy'").fetchall()
+        conn.close()
+        assert "Traceback" not in err
+        if started == "tomorrow":
+            assert (code, slots) == (1, [])
+        else:
+            assert code == 0, err
+            assert slots == [(record.run_id, stamped[0])] * 2
 
     def test_a_record_stamped_in_the_future_still_fails_closed(
         self, tmp_path: Path, config_path: Path, server: ResponsesServer
