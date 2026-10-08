@@ -1,24 +1,24 @@
-"""Review Agent — programmatic artifact validation via ADK callbacks.
+"""Review Agent — programmatic validation of every generated artifact.
 
-No LLM is used for review — consistency and schema validators run
-as pure Python in an after_agent_callback. The LoopAgent iterates
-only if validation fails and there's a preceding agent to fix artifacts.
-Since artifact agents don't retry, this effectively runs once.
+No model is involved: the consistency and schema validators run once as
+pure Python over the run's artifacts and record `review_verdict`.
 """
 
 from __future__ import annotations
 
 import json
+from pathlib import Path  # noqa: TC003 — pydantic needs it at runtime
 from typing import TYPE_CHECKING, Any
 
-from google.adk.agents import LlmAgent, LoopAgent
+from google.adk.agents import BaseAgent
 
 from apprentice.core.artifacts import write_state_roles
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from collections.abc import AsyncGenerator
 
-    from google.adk.models.lite_llm import LiteLlm
+    from google.adk.agents.invocation_context import InvocationContext
+    from google.adk.events import Event
 
 
 def _validate_all_artifacts(
@@ -51,58 +51,47 @@ def _validate_all_artifacts(
     return {"all_passed": all_passed, "failures": failures, "artifact_paths": paths}
 
 
-def build_review_agent(
-    model: LiteLlm,
-    work_root: Path,
-    algorithm_name: str,
-    max_iterations: int = 2,
-) -> LoopAgent:
-    """Build a review stage that validates artifacts programmatically.
+class ProgrammaticReviewAgent(BaseAgent):
+    """Validates all artifacts in the run's work root and records the verdict."""
 
-    Uses a no-op LlmAgent as a placeholder inside a LoopAgent.
-    The before_agent_callback runs validators and either exits (pass)
-    or continues with feedback (fail). No LLM calls are made.
+    work_root: Path
+    algorithm_name: str
 
-    Args:
-        model: LiteLlm model instance (used for the placeholder agent).
-        work_root: The run's exclusive work root artifacts are validated in.
-        algorithm_name: The run's algorithm, checked for cross-artifact consistency.
-        max_iterations: Maximum review rounds.
-
-    Returns:
-        A configured LoopAgent.
-    """
-
-    async def review_callback(callback_context: Any) -> Any:
+    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
+        from google.adk.events import Event, EventActions
         from google.genai import types
 
-        state = callback_context.state
-        result = _validate_all_artifacts(state, work_root, algorithm_name)
-
+        result = _validate_all_artifacts(
+            dict(ctx.session.state), self.work_root, self.algorithm_name
+        )
         if result["all_passed"]:
-            state["review_verdict"] = "passed"
-            return types.Content(
-                role="model",
-                parts=[types.Part(text="All artifacts validated successfully.")],
-            )
-
-        state["review_verdict"] = "failed: " + "; ".join(result["failures"])
-        return types.Content(
-            role="model",
-            parts=[types.Part(text="Review: " + "; ".join(result["failures"]))],
+            verdict = "passed"
+            message = "All artifacts validated successfully."
+        else:
+            verdict = "failed: " + "; ".join(result["failures"])
+            message = "Review: " + "; ".join(result["failures"])
+        yield Event(
+            invocation_id=ctx.invocation_id,
+            author=self.name,
+            branch=getattr(ctx, "branch", None),
+            content=types.Content(role="model", parts=[types.Part(text=message)]),
+            actions=EventActions(state_delta={"review_verdict": verdict}),
         )
 
-    placeholder = LlmAgent(
-        name="reviewer",
-        model=model,
-        instruction="Artifacts are validated automatically.",
-        output_key="review_verdict",
-    )
 
-    return LoopAgent(
-        name="review_loop",
+def build_review_agent(work_root: Path, algorithm_name: str) -> ProgrammaticReviewAgent:
+    """Build the review stage: one programmatic validation of every artifact.
+
+    Args:
+        work_root: The run's exclusive work root artifacts are validated in.
+        algorithm_name: The run's algorithm, checked for cross-artifact consistency.
+
+    Returns:
+        The review agent; it makes no model call.
+    """
+    return ProgrammaticReviewAgent(
+        name="reviewer",
         description="Validates all artifacts for consistency and schema compliance.",
-        max_iterations=max_iterations,
-        sub_agents=[placeholder],
-        before_agent_callback=review_callback,
+        work_root=work_root,
+        algorithm_name=algorithm_name,
     )

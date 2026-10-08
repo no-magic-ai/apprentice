@@ -4,32 +4,41 @@
 Usage:
     uv run python scripts/integration_test.py
     uv run python scripts/integration_test.py --tier 2 --limit 3
-    uv run python scripts/integration_test.py --backend ollama --model ollama_chat/llama3.3
+    uv run python scripts/integration_test.py --backend local --model openai/<profiled-model>
     uv run python scripts/integration_test.py --report-only
 
-Generates algorithms across tiers, measures success rates and costs,
-and produces a JSON report saved to ~/.apprentice/reports/.
+Generates algorithms across tiers as controlled, metered library cycles,
+measures success rates and produces a JSON report saved to
+~/.apprentice/reports/.
 """
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import sys
-import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+from apprentice.controls.errors import AuthorityError, ControlDeniedError
+from apprentice.controls.policy import ControlPolicy
+from apprentice.core.artifacts import ArtifactError
 from apprentice.core.config import load_config
+from apprentice.core.cycles import bootstrap_installation, open_authority
 from apprentice.core.metrics import PipelineReport, aggregate_runs
 from apprentice.core.observability import get_logger, setup_logging
 from apprentice.core.progress import IntegrationProgress, suppress_noisy_loggers
-from apprentice.core.session_store import RunRecord, SessionStore
-from apprentice.models.work_item import BlockingGateError
+from apprentice.core.session_store import RunRecord, SessionStore, StoreUnavailableError
+from apprentice.metering.pricing import PriceAuthorityError
+from apprentice.metering.profile import ProfileError
+from apprentice.providers.factory import RouteError, resolve_route
+
+if TYPE_CHECKING:
+    from apprentice.controls.authority import Authority
+    from apprentice.providers.factory import ModelRoute
 
 _REPORT_DIR = Path.home() / ".apprentice" / "reports"
 
@@ -81,81 +90,35 @@ def _select_algorithms(
 def _run_single(
     algorithm: str,
     tier: int,
-    cfg: Any,
-    backend: str | None,
-    model: str | None,
     store: SessionStore,
+    authority: Authority,
+    route: ModelRoute,
+    policy: ControlPolicy,
     logger: Any,
 ) -> RunRecord:
-    """Run the pipeline for a single algorithm and return the run record."""
-    from apprentice.core.orchestrator import build_pipeline, get_budget_tracker_from_pipeline
-    from apprentice.providers.factory import create_model, create_model_from_override
+    """Run one controlled library build cycle for an algorithm and return its run record.
 
-    if model:
-        llm_model = create_model_from_override(
-            model_string=model,
-            backend=backend or cfg.provider.backend,
-            local_api_base=cfg.provider.local_api_base,
-        )
-    elif backend:
-        from apprentice.core.config import ProviderConfig
+    Raises:
+        ControlDeniedError: If a control refuses the cycle; no run is created.
+    """
+    from apprentice.core.cycles import run_build
 
-        override_cfg = ProviderConfig(
-            backend=backend,
-            model=cfg.provider.model,
-            fallback_model=cfg.provider.fallback_model,
-            local_api_base=cfg.provider.local_api_base,
-        )
-        llm_model = create_model(override_cfg)
+    logger.info("starting: %s (tier %d)", algorithm, tier)
+    result = run_build(
+        store=store,
+        authority=authority,
+        route=route,
+        policy=policy,
+        request=(algorithm, tier, ""),
+        kind="library",
+    )
+    if result.outcome == "completed":
+        logger.info("completed: %s in %.1fs", algorithm, result.elapsed)
     else:
-        llm_model = create_model(cfg.provider)
-
-    record = store.create_run(algorithm, tier)
-    pipeline = build_pipeline(llm_model, cfg, store.run_scope(record))
-
-    logger.info("starting: %s (tier %d) [%s]", algorithm, tier, record.run_id)
-    start = time.monotonic()
-
-    try:
-        from apprentice.cli import _run_pipeline
-
-        session_state = asyncio.run(_run_pipeline(pipeline, algorithm, tier, ""))
-        elapsed = time.monotonic() - start
-
-        tracker = get_budget_tracker_from_pipeline(pipeline)
-        budget_summary = tracker.to_dict() if tracker else {}
-
-        has_code = bool(session_state.get("generated_code"))
-        if has_code:
-            record = store.complete_run(record, session_state, budget_summary, elapsed)
-            logger.info("completed: %s in %.1fs", algorithm, elapsed)
-        else:
-            record = store.fail_run(
-                record,
-                session_state,
-                budget_summary,
-                elapsed,
-                "no generated_code in session state",
-            )
-            logger.warning("failed: %s in %.1fs — no output", algorithm, elapsed)
-
-    except BlockingGateError as failure:
-        elapsed = time.monotonic() - start
-        tracker = get_budget_tracker_from_pipeline(pipeline)
-        record = store.fail_run(
-            record,
-            failure.persisted_state(),
-            tracker.to_dict() if tracker else {},
-            elapsed,
-            str(failure),
+        logger.error(
+            "%s: %s in %.1fs — %s", result.outcome, algorithm, result.elapsed, result.error
         )
-        logger.error("halted: %s in %.1fs — %s", algorithm, elapsed, failure)
-    except Exception as exc:
-        elapsed = time.monotonic() - start
-        record = store.fail_run(record, {}, {}, elapsed, str(exc))
-        logger.error("error: %s in %.1fs — %s", algorithm, elapsed, exc)
-
-    return record
+    return result.record
 
 
 def _save_report(report: PipelineReport) -> Path:
@@ -170,25 +133,50 @@ def _save_report(report: PipelineReport) -> Path:
 def main() -> int:
     args = _parse_args()
 
-    cfg = load_config(args.config)
+    try:
+        cfg = load_config(args.config)
+    except (ValueError, TypeError, KeyError, FileNotFoundError) as exc:
+        print(f"invalid configuration: {exc}", file=sys.stderr)
+        return 1
+    try:
+        footprint = bootstrap_installation(cfg, None)
+    except StoreUnavailableError as exc:
+        print(f"run store unavailable: {exc}", file=sys.stderr)
+        return 1
+    except (AuthorityError, ArtifactError) as exc:
+        print(f"control authority unavailable: {exc}", file=sys.stderr)
+        return 1
     setup_logging(
         {"log_level": cfg.observability.log_level, "log_path": cfg.observability.log_path}
     )
     suppress_noisy_loggers()
     logger = get_logger("integration_test")
 
-    store = SessionStore()
+    try:
+        store = SessionStore()
+    except StoreUnavailableError as exc:
+        print(f"run store unavailable: {exc}", file=sys.stderr)
+        return 1
 
     if args.report_only:
         try:
-            past_records = store.list_runs(limit=50)
+            past_records = store.list_runs(limit=None)
+        except StoreUnavailableError as exc:
+            print(f"run store unavailable: {exc}", file=sys.stderr)
+            return 1
         except ValueError as exc:
             print(f"Cannot report: {exc}", file=sys.stderr)
             return 1
-        if not past_records:
-            print("No past runs found.")
-            return 0
-        report = aggregate_runs(past_records)
+        try:
+            authority = open_authority(store, footprint)
+            try:
+                usage = authority.usage()
+            finally:
+                authority.close()
+        except AuthorityError as exc:
+            print(f"control authority unavailable: {exc}", file=sys.stderr)
+            return 1
+        report = aggregate_runs(past_records, usage, "installation ledger: every controlled cycle")
         progress = IntegrationProgress(0, "", "")
         progress.print_summary(report)
         return 0
@@ -210,21 +198,46 @@ def main() -> int:
 
     logger.info("starting integration test: %d algorithms", len(algorithms))
 
+    try:
+        route = resolve_route(cfg.provider, backend=args.backend, model=args.model)
+    except (RouteError, ProfileError, PriceAuthorityError) as exc:
+        print(f"Cannot run: {exc}", file=sys.stderr)
+        return 1
+    try:
+        authority = open_authority(store, footprint)
+    except AuthorityError as exc:
+        print(f"control authority unavailable: {exc}", file=sys.stderr)
+        return 1
+    policy = ControlPolicy.from_config(cfg)
     ip = IntegrationProgress(len(algorithms), backend, model_str)
     records: list[RunRecord] = []
 
-    with ip.start():
-        for algorithm, tier in algorithms:
-            ip.on_algorithm_start(algorithm, tier)
-            record = _run_single(algorithm, tier, cfg, args.backend, args.model, store, logger)
-            records.append(record)
-            ip.on_algorithm_complete(
-                algorithm,
-                record.status == "completed",
-                record.elapsed_seconds,
-            )
+    try:
+        with ip.start():
+            for algorithm, tier in algorithms:
+                ip.on_algorithm_start(algorithm, tier)
+                try:
+                    record = _run_single(algorithm, tier, store, authority, route, policy, logger)
+                except ControlDeniedError as exc:
+                    print(f"Stopped: {exc}", file=sys.stderr)
+                    break
+                records.append(record)
+                ip.on_algorithm_complete(
+                    algorithm,
+                    record.status == "completed",
+                    record.elapsed_seconds,
+                )
+        usage = authority.usage({record.run_id for record in records})
+    except StoreUnavailableError as exc:
+        print(f"run store unavailable: {exc}", file=sys.stderr)
+        return 1
+    except AuthorityError as exc:
+        print(f"control authority unavailable: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        authority.close()
 
-    report = aggregate_runs(records)
+    report = aggregate_runs(records, usage, "ledger cycles of the runs in this report")
     report_path = _save_report(report)
 
     ip.print_summary(report)

@@ -22,10 +22,10 @@ apprentice build <algorithm> [--tier N] [--description TEXT] [--backend NAME] [-
 - `algorithm` — algorithm name (e.g. "quicksort")
 - `--tier` — algorithm tier 1-4 (default: 2)
 - `--description` — optional description for the LLM
-- `--backend` — override provider backend (anthropic, openai, gemini, ollama, local)
-- `--model` — override LiteLLM model string (e.g. "ollama_chat/llama3.3")
+- `--backend` — override provider backend (`openai` or `local`)
+- `--model` — override the model; the configured accounting profile must qualify it
 
-Rejects algorithm names other than 1-64 lowercase letters, digits and underscores (starting with a letter) and tiers other than 1-4. Persists the run record to `~/.apprentice/sessions/` and, on completion, seals the final artifacts into the run's immutable bundle (see [Architecture: Run-Owned Artifacts](architecture.md#run-owned-artifacts)).
+Rejects algorithm names other than 1-64 lowercase letters, digits and underscores (starting with a letter) and tiers other than 1-4. Resolves the route before anything is admitted: an unsupported backend, a model the profile does not qualify, a missing or invalid profile, or a pinned SDK/price-data mismatch is reported and nothing is sent. The build then runs as one controlled cycle; every model call is reserved and settled in the installation ledger, and a call a ceiling refuses ends the run with `"outcome": "denied"` and the limiting `control`. Failure output includes the cycle's `accounting` entries. Persists the run record to `~/.apprentice/sessions/` and, on completion, seals the final artifacts into the run's immutable bundle (see [Architecture: Run-Owned Artifacts](architecture.md#run-owned-artifacts)).
 
 ### submit
 
@@ -52,6 +52,8 @@ apprentice suggest [--tier N] [--limit N] [--backend NAME] [--model STRING]
 - `--tier` — target tier (default: 2)
 - `--limit` — max candidates to suggest (default: 5)
 
+Runs as its own controlled `suggest` cycle: discovery calls are metered against the cycle, discovery stage and monthly ceilings like any build. The JSON output includes the cycle's `accounting` entries.
+
 ### retry
 
 Retry a failed pipeline run.
@@ -62,7 +64,7 @@ apprentice retry <run_id> [--backend NAME] [--model STRING]
 
 - `run_id` — ID from `apprentice history` output
 
-Reruns the full pipeline for the same algorithm and tier.
+Reruns the full pipeline for the same algorithm and tier as a new controlled cycle (new cycle ceilings, shared monthly ceilings). It is not a provider retry.
 
 ### history
 
@@ -77,13 +79,13 @@ apprentice history [--status STATUS] [--limit N]
 
 ### metrics
 
-Show aggregated metrics across all recorded runs.
+Show run lifecycle and the ledger's usage by accounting category. Admits no work.
 
 ```
 apprentice metrics
 ```
 
-Reports success rate, per-agent cost/token breakdown, and per-tier statistics.
+Usage comes from the installation ledger and covers every controlled cycle — builds, retries, standalone `suggest` and library cycles — whether or not it left a run record (`usage_scope`); `cycles_by_kind` counts every admitted cycle in that scope, including cycles that ended without any ledger entry (for example refused by a quarantine before a call). Owners of dead cycles are recovered first, so a dispatched call of a killed process appears as an unknown hold. Categories: `historical_estimate` (output-length estimates in run records written before the ledger), `qualified_price_quote`, `nonhosted_reference_capacity`, `known_zero_hosted` and `unknown_held`; calls still in flight are listed separately as `active_reservations`, and reservations that were never sent are not usage. Categories are never added together; quotes and reference capacity are policy amounts, not invoices, and unknown holds count their full reservation. Run lifecycle counts completed, failed and in-progress runs separately; `success_rate` is completed among finished runs. An unavailable or damaged ledger is reported as `control authority unavailable` (exit 1), never as zero usage.
 
 ### approve
 
@@ -112,11 +114,23 @@ Verifies the bundle against its manifest and prints the run identity, manifest d
 
 ### status
 
-Show budget usage and system state.
+Show configured limits, ledger state and route admission. Admits no work.
 
 ```
 apprentice status
 ```
+
+Prints `configured` (the retained limits from the config, USD as nanodollars), `ledger` (this month's entries by basis — `qualified-price-quote`, `zero-hosted`, `sdk-reference-capacity` — and state — settled, unknown, live holds; unknown months; quarantined profiles; live cycles; legacy records awaiting adoption) and `route`. `route.structurally_valid` only says the configured backend, model, profile structure and pinned price data validate; it is not proof that the profile's fees are genuine. `route.admissible` is true only when, in addition, the ledger blocks nothing for that profile now; `route.blocked_by` lists what does (an invalid route, a quarantined profile, an unknown current month, a continuity suspension, legacy records awaiting adoption, or live cycles running under a different effective policy — `controls.policy`, the same refusal an admission would give; status adopts nothing). Each call is still decided by the budgets.
+
+### controls adopt-legacy
+
+Record the operator's declaration that no earlier apprentice process is running.
+
+```
+apprentice controls adopt-legacy --operator NAME --declare-no-earlier-process-running
+```
+
+Run records written without the control authority that may still be in progress (an `in_progress` run or a pending/partial submission) block every cycle until this is recorded. It clears no debit, unknown month or hold. Refused while a cycle is live.
 
 ### config
 

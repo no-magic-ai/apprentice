@@ -1,4 +1,4 @@
-"""WorkItem, StageResult, GateResult, and PipelineContext models."""
+"""WorkItem, GateResult and blocking-gate models."""
 
 from __future__ import annotations
 
@@ -116,36 +116,6 @@ class WorkItem:
 
 
 @dataclass
-class StageResult:
-    """Output of a pipeline stage execution."""
-
-    stage_name: str
-    artifacts: dict[str, str]  # artifact_type -> relative file path
-    tokens_used: int
-    cost_usd: float
-    diagnostics: list[dict[str, Any]] = field(default_factory=list)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "stage_name": self.stage_name,
-            "artifacts": self.artifacts,
-            "tokens_used": self.tokens_used,
-            "cost_usd": self.cost_usd,
-            "diagnostics": self.diagnostics,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> Self:
-        return cls(
-            stage_name=data["stage_name"],
-            artifacts=data["artifacts"],
-            tokens_used=data["tokens_used"],
-            cost_usd=data["cost_usd"],
-            diagnostics=data.get("diagnostics", []),
-        )
-
-
-@dataclass
 class GateResult:
     """Output of a quality gate evaluation."""
 
@@ -172,43 +142,4 @@ class GateResult:
             diagnostics=data.get("diagnostics", {}),
             auto_fixable=data.get("auto_fixable", False),
             fix_suggestion=data.get("fix_suggestion"),
-        )
-
-
-@dataclass
-class PipelineContext:
-    """Carries configuration and state through the pipeline.
-
-    `artifact_root` is the exclusive directory one pipeline invocation writes
-    its artifacts into, allocated by `SessionStore.allocate_work_root()`.
-    Stages refuse to run without it; it is storage isolation only, not
-    execution containment or an approval record.
-    """
-
-    config: dict[str, Any] = field(default_factory=dict)
-    budget_remaining_tokens: int = 0
-    budget_remaining_usd: float = 0.0
-    prompt_registry_path: str = ""
-    convention_schema_path: str = ""
-    artifact_root: str = ""
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "config": self.config,
-            "budget_remaining_tokens": self.budget_remaining_tokens,
-            "budget_remaining_usd": self.budget_remaining_usd,
-            "prompt_registry_path": self.prompt_registry_path,
-            "convention_schema_path": self.convention_schema_path,
-            "artifact_root": self.artifact_root,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> Self:
-        return cls(
-            config=data.get("config", {}),
-            budget_remaining_tokens=data.get("budget_remaining_tokens", 0),
-            budget_remaining_usd=data.get("budget_remaining_usd", 0.0),
-            prompt_registry_path=data.get("prompt_registry_path", ""),
-            convention_schema_path=data.get("convention_schema_path", ""),
-            artifact_root=data.get("artifact_root", ""),
         )

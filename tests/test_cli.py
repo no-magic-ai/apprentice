@@ -13,28 +13,29 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
-import anyio
 import pytest
 
 from apprentice.cli import (
     _cmd_approve,
-    _cmd_build,
     _cmd_preview,
-    _cmd_retry,
     _cmd_submit,
-    _run_pipeline,
     main,
 )
 from apprentice.core.artifacts import canonical_json, manifest_digest
 from apprentice.core.config import load_config
-from apprentice.core.session_store import RunRecord, SessionStore
-from apprentice.models.work_item import BlockingGateError
-from tests.conftest import OfflineFixtureLlm, fixture_outputs
+from apprentice.core.session_store import RunRecord, SessionStore, default_store_dir
+from tests.conftest import fixture_outputs
+from tests.responses_fixture import (
+    ResponsesFixture,
+    ResponsesServer,
+    local_profile,
+    role_of,
+    write_config,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
-    from apprentice.core.artifacts import RunScope
     from tests.conftest import OfflineRemotes
 
 
@@ -91,10 +92,9 @@ _STATE = {
 
 
 @pytest.fixture
-def store_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    directory = tmp_path / "sessions"
-    monkeypatch.setattr("apprentice.core.session_store._DEFAULT_STORE_DIR", directory)
-    return directory
+def store_dir() -> Path:
+    """The default store root under the test's private HOME, used by CLI commands."""
+    return default_store_dir()
 
 
 _CORE_PR = "https://github.com/no-magic-ai/no-magic/pull/offline-1"
@@ -437,26 +437,27 @@ class TestSubmitCommand:
         assert SessionStore(store_dir=store_dir).load(rec.run_id).submission == {}
 
 
-class _BuildArgs:
-    def __init__(self, algorithm: str = "selection", tier: int = 2) -> None:
-        self.algorithm = algorithm
-        self.tier = tier
-        self.description = ""
-        self.backend = None
-        self.model = None
+@pytest.fixture
+def toy_config(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> Iterator[tuple[Path, ResponsesFixture]]:
+    """A complete config whose route is the loopback toy model (zero-hosted profile).
+
+    An indirect parameter (a dict) overrides config limits for that test.
+    """
+    fixture = ResponsesFixture()
+    with ResponsesServer(fixture) as server:
+        config = write_config(
+            tmp_path / "apprentice.toml",
+            profile=local_profile(tmp_path / "profile.json"),
+            base_url=server.base_url,
+            **getattr(request, "param", {}),
+        )
+        yield config, fixture
 
 
-class _RetryArgs:
-    def __init__(self, run_id: str) -> None:
-        self.run_id = run_id
-        self.backend = None
-        self.model = None
-
-
-def _use_model(monkeypatch: pytest.MonkeyPatch, outputs: dict[str, str]) -> OfflineFixtureLlm:
-    llm = OfflineFixtureLlm(model="offline-fixture", outputs=outputs)
-    monkeypatch.setattr("apprentice.cli._resolve_model", lambda cfg, args: llm)
-    return llm
+def _generated_roles(fixture: ResponsesFixture) -> list[str]:
+    return [role_of(body) for body in fixture.generations()]
 
 
 def _only_record(store_dir: Path, exclude: set[str] | None = None) -> RunRecord:
@@ -474,33 +475,39 @@ def _assert_halted_with_diagnostics(store_dir: Path, record: RunRecord, gate: st
     assert stored_verdict == tracked_verdict
     assert (stored_verdict["verdict"], stored_verdict["blocking"]) == ("fail", True)
     assert stored_verdict["diagnostics"]
-    assert record.session_state["generated_code"]
-    assert record.budget_summary["per_agent"]
+    assert record.budget_summary["accounting"]["entries"]
     assert (store.run_scope(record).work_root / "implementation.py").is_file()
     assert record.manifest_sha256 == ""
     assert not store.bundle_dir(record.run_id).exists()
 
 
+@pytest.mark.usefixtures("judged_execution")
 class TestGateHaltRecording:
     def test_build_halted_by_gate_keeps_state_diagnostics_budget_and_work_files(
-        self, store_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+        self,
+        store_dir: Path,
+        toy_config: tuple[Path, ResponsesFixture],
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
-        llm = _use_model(monkeypatch, fixture_outputs(failing_implementation=True))
+        config, fixture = toy_config
+        fixture.outputs = fixture_outputs(failing_implementation=True)
 
-        assert _cmd_build(load_config(None), _BuildArgs()) == 1
+        assert main(["--config", str(config), "build", "selection"]) == 1
 
         out = json.loads(_last_json(capsys))
         record = _only_record(store_dir)
         _assert_halted_with_diagnostics(store_dir, record, "correctness after implementation")
         assert out["gate"]["gate_name"] == "correctness"
-        assert "assessment" not in llm.roles()
+        assert record.session_state["generated_code"] == fixture.outputs["drafter"]
+        assert _generated_roles(fixture) == ["drafter"] * 3
 
     def test_build_with_empty_draft_fails_at_the_correctness_gate(
-        self, store_dir: Path, monkeypatch: pytest.MonkeyPatch
+        self, store_dir: Path, toy_config: tuple[Path, ResponsesFixture]
     ) -> None:
-        _use_model(monkeypatch, fixture_outputs(omit=("drafter",)))
+        config, fixture = toy_config
+        fixture.outputs = fixture_outputs(omit=("drafter",))
 
-        assert _cmd_build(load_config(None), _BuildArgs()) == 1
+        assert main(["--config", str(config), "build", "selection"]) == 1
 
         record = _only_record(store_dir)
         assert record.status == "failed"
@@ -509,34 +516,29 @@ class TestGateHaltRecording:
         }
         assert not SessionStore(store_dir=store_dir).bundle_dir(record.run_id).exists()
 
-    def test_passing_build_completes_and_seals(
-        self, store_dir: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _use_model(monkeypatch, fixture_outputs())
-
-        assert _cmd_build(load_config(None), _BuildArgs()) == 0
-
-        record = _only_record(store_dir)
-        assert record.status == "completed"
-        assert [v["verdict"] for v in record.session_state["gate_verdicts"]] == ["pass"] * 4
-        assert SessionStore(store_dir=store_dir).load_bundle(record).artifacts
-
     def test_retry_halted_by_gate_records_its_state_once(
-        self, store_dir: Path, monkeypatch: pytest.MonkeyPatch
+        self, store_dir: Path, toy_config: tuple[Path, ResponsesFixture]
     ) -> None:
-        store = SessionStore(store_dir=store_dir)
-        previous = store.fail_run(store.create_run("selection", 2), {}, {}, 1.0, "earlier failure")
-        _use_model(monkeypatch, fixture_outputs(failing_implementation=True))
+        config, fixture = toy_config
+        fixture.outputs = fixture_outputs(omit=("drafter",))
+        assert main(["--config", str(config), "build", "selection"]) == 1
+        previous = _only_record(store_dir)
+        fixture.outputs = fixture_outputs(failing_implementation=True)
 
-        assert _cmd_retry(load_config(None), _RetryArgs(previous.run_id)) == 1
+        assert main(["--config", str(config), "retry", previous.run_id]) == 1
 
         record = _only_record(store_dir, exclude={previous.run_id})
         _assert_halted_with_diagnostics(store_dir, record, "correctness after implementation")
 
     def test_integration_runner_records_gate_halt_with_state(
-        self, store_dir: Path, monkeypatch: pytest.MonkeyPatch
+        self, store_dir: Path, toy_config: tuple[Path, ResponsesFixture]
     ) -> None:
         import importlib.util
+
+        from apprentice.controls.footprint import Footprint
+        from apprentice.controls.policy import ControlPolicy
+        from apprentice.core.cycles import open_authority
+        from apprentice.providers.factory import resolve_route
 
         spec = importlib.util.spec_from_file_location(
             "integration_test", Path(__file__).parent.parent / "scripts" / "integration_test.py"
@@ -544,36 +546,25 @@ class TestGateHaltRecording:
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        llm = OfflineFixtureLlm(
-            model="offline-fixture", outputs=fixture_outputs(failing_implementation=True)
-        )
-        monkeypatch.setattr("apprentice.providers.factory.create_model", lambda provider: llm)
+        config, fixture = toy_config
+        fixture.outputs = fixture_outputs(failing_implementation=True)
+        cfg = load_config(config)
         store = SessionStore(store_dir=store_dir)
+        authority = open_authority(store, Footprint(existing=()))
 
         record = module._run_single(
-            "selection", 2, load_config(None), None, None, store, logging.getLogger("t")
+            "selection",
+            2,
+            store,
+            authority,
+            resolve_route(cfg.provider),
+            ControlPolicy.from_config(cfg),
+            logging.getLogger("t"),
         )
 
         _assert_halted_with_diagnostics(
             store_dir, store.load(record.run_id), "correctness after implementation"
         )
-
-
-class TestRunnerStateCarrier:
-    def test_halt_carries_the_stored_session_state(self, scope: RunScope) -> None:
-        from apprentice.core.orchestrator import build_pipeline
-
-        llm = OfflineFixtureLlm(
-            model="offline-fixture", outputs=fixture_outputs(failing_implementation=True)
-        )
-        pipeline = build_pipeline(llm, load_config(None), scope)
-
-        with pytest.raises(BlockingGateError) as excinfo:
-            anyio.run(_run_pipeline, pipeline, "selection", 2, "")
-
-        state = excinfo.value.persisted_state()
-        assert state["generated_code"] == fixture_outputs(failing_implementation=True)["drafter"]
-        assert state["gate_verdicts"][-1] == excinfo.value.verdict
 
 
 def _tree(root: Path) -> dict[str, tuple[bytes | None, int]]:
@@ -830,6 +821,7 @@ def _forbidden_generation_modules() -> set[str]:
         "google.adk",
         "litellm",
         "apprentice.providers",
+        "apprentice.metering.client",
         "apprentice.core.orchestrator",
         "apprentice.core.gate_agent",
     }
@@ -865,13 +857,25 @@ class _CountingHandler(BaseHTTPRequestHandler):
         self.do_POST()
 
 
+# Fixed driver (argv: config, run ID, forbidden modules as JSON).
+_FRESH_SUBMIT = """
+import json, sys
+
+from apprentice.cli import main
+
+config, run_id, forbidden = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
+code = main(["--config", config, "submit", "selection", "--run-id", run_id])
+loaded = sorted(m for m in sys.modules if any(m == f or m.startswith(f + ".") for f in forbidden))
+print("FRESH-SUBMIT " + json.dumps({"code": code, "loaded": loaded}))
+"""
+
+
 class TestFreshSubmitProcess:
     def test_submit_in_a_fresh_interpreter_loads_no_generation_module_and_calls_no_model(
         self, tmp_path: Path, offline_remotes: OfflineRemotes, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         home = tmp_path / "home"
         sessions = home / ".apprentice" / "sessions"
-        monkeypatch.setattr("apprentice.core.session_store._DEFAULT_STORE_DIR", sessions)
         rec = _approved_run(sessions)
         _CountingHandler.requests = []
         server = ThreadingHTTPServer(("127.0.0.1", 0), _CountingHandler)
@@ -885,14 +889,7 @@ class TestFreshSubmitProcess:
         config_path = tmp_path / "apprentice.toml"
         config_path.write_text(config, encoding="utf-8")
         forbidden = sorted(_forbidden_generation_modules())
-        script = (
-            "import json, sys\n"
-            "from apprentice.cli import main\n"
-            f"code = main(['--config', {str(config_path)!r}, 'submit', 'selection', '--run-id', {rec.run_id!r}])\n"
-            f"forbidden = {forbidden!r}\n"
-            "loaded = sorted(m for m in sys.modules if any(m == f or m.startswith(f + '.') for f in forbidden))\n"
-            "print('FRESH-SUBMIT ' + json.dumps({'code': code, 'loaded': loaded}))\n"
-        )
+        argv = [str(config_path), rec.run_id, json.dumps(forbidden)]
         env = {
             "PATH": os.environ["PATH"],
             "HOME": str(home),
@@ -903,7 +900,11 @@ class TestFreshSubmitProcess:
         }
         try:
             result = subprocess.run(
-                [sys.executable, "-c", script], env=env, capture_output=True, text=True, check=False
+                [sys.executable, "-c", _FRESH_SUBMIT, *argv],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
             )
         finally:
             server.shutdown()
@@ -912,7 +913,7 @@ class TestFreshSubmitProcess:
         outcome = json.loads(line.removeprefix("FRESH-SUBMIT "))
         assert outcome == {"code": 0, "loaded": []}, result.stderr[-2000:]
         assert _CountingHandler.requests == []
-        assert {"google.adk", "litellm", "openai", "anthropic"} <= set(forbidden)
+        assert {"google.adk", "litellm", "openai", "httpx"} <= set(forbidden)
         assert offline_remotes.branches("no-magic-ai/no-magic") == [
             f"apprentice/{rec.run_id}",
             "main",
@@ -1293,4 +1294,375 @@ class TestUnknownPublicationOutcome:
         ]
         assert f"apprentice/{rec.run_id}" in offline_remotes.branches("no-magic-ai/no-magic")
         assert _cmd_submit(_SubmitArgs("selection", rec.run_id)) == 1
+        assert offline_remotes.gh_calls() == []
+
+
+@pytest.mark.usefixtures("judged_execution")
+class TestImplementationRetries:
+    @pytest.mark.parametrize(
+        ("retries", "failing", "drafts"),
+        [(1, True, 1), (2, True, 2), (2, False, 1)],
+        ids=["one-failing", "two-failing", "passing-first-draft"],
+    )
+    def test_implementation_is_drafted_at_most_the_configured_number_of_times(
+        self,
+        tmp_path: Path,
+        store_dir: Path,
+        retries: int,
+        failing: bool,
+        drafts: int,
+    ) -> None:
+        fixture = ResponsesFixture(outputs=fixture_outputs(failing_implementation=failing))
+        with ResponsesServer(fixture) as server:
+            config = write_config(
+                tmp_path / "apprentice.toml",
+                profile=local_profile(tmp_path / "profile.json"),
+                base_url=server.base_url,
+                max_tokens_per_stage=100_000,
+                max_implementation_retries=retries,
+            )
+
+            code = main(["--config", str(config), "build", "selection"])
+
+        record = _only_record(store_dir)
+        assert (code, record.status) == ((1, "failed") if failing else (0, "completed"))
+        assert _generated_roles(fixture).count("drafter") == drafts
+
+
+def _stop_at(monkeypatch: pytest.MonkeyPatch, method: str, when: str) -> None:
+    """Deliver a real SIGTERM to this process at the start or end of `SessionStore.<method>`."""
+    import signal as signals
+
+    original = getattr(SessionStore, method)
+
+    def stopped(self: SessionStore, *args: Any, **kwargs: Any) -> Any:
+        if when == "before":
+            os.kill(os.getpid(), signals.SIGTERM)
+        result = original(self, *args, **kwargs)
+        if when == "after":
+            os.kill(os.getpid(), signals.SIGTERM)
+        return result
+
+    monkeypatch.setattr(SessionStore, method, stopped)
+
+
+def _ledger_cycles(store_dir: Path) -> list[tuple[str, str, str | None]]:
+    """Cycle IDs, states and outcomes after a fresh process-style recovery of the ledger."""
+    import sqlite3
+
+    from apprentice.controls.authority import Authority
+    from apprentice.controls.footprint import Footprint
+
+    authority = Authority.open(store_dir, Footprint(existing=()))
+    authority.status()
+    authority.close()
+    conn = sqlite3.connect(store_dir / "controls" / "accounting.sqlite3")
+    try:
+        return conn.execute(
+            "SELECT cycle_id, state, outcome FROM cycles ORDER BY admitted_at"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+# A completing build runs three parallel 15,000-token artifact roles; with the default 20,000-token
+# stage the role admitted last gets the residual adaptive cap and its truncated output halts the build
+# before `complete_run`. Completing cases therefore get an explicit adequate stage.
+_COMPLETING_STAGE = {"max_tokens_per_stage": 100_000}
+
+
+@pytest.mark.usefixtures("judged_execution")
+class TestOperatorStopWhileRecordingTheEnd:
+    @pytest.mark.parametrize(
+        ("method", "when", "failing", "expected", "toy_config"),
+        [
+            ("complete_run", "before", False, "completed", _COMPLETING_STAGE),
+            ("complete_run", "after", False, "completed", _COMPLETING_STAGE),
+            ("fail_run", "before", True, "failed", {}),
+            ("fail_run", "after", True, "failed", {}),
+        ],
+        ids=[
+            "complete_run-before-False-completed",
+            "complete_run-after-False-completed",
+            "fail_run-before-True-failed",
+            "fail_run-after-True-failed",
+        ],
+        indirect=["toy_config"],
+    )
+    def test_stop_during_the_end_record_keeps_the_outcome_reached_and_never_leaves_it_owner_lost(
+        self,
+        store_dir: Path,
+        toy_config: tuple[Path, ResponsesFixture],
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        method: str,
+        when: str,
+        failing: bool,
+        expected: str,
+    ) -> None:
+        config, fixture = toy_config
+        fixture.outputs = fixture_outputs(failing_implementation=failing)
+        _stop_at(monkeypatch, method, when)
+
+        code = main(["--config", str(config), "build", "selection"])
+
+        reported = json.loads(_last_json(capsys))
+        record = _only_record(store_dir)
+        assert code == 143
+        assert record.status == expected
+        assert _ledger_cycles(store_dir) == [(reported["cycle_id"], "terminal", expected)]
+        assert (reported["outcome"], reported["run_id"]) == (expected, record.run_id)
+        if expected == "completed":
+            assert SessionStore(store_dir=store_dir).load_bundle(record).artifacts
+
+    def test_stop_during_the_model_work_still_cancels_the_build(
+        self,
+        store_dir: Path,
+        toy_config: tuple[Path, ResponsesFixture],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        import signal as signals
+
+        config, fixture = toy_config
+        fixture.outputs = fixture_outputs()
+        respond = fixture.respond
+
+        def stop_on_first_generation(path: str, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+            if path == "/v1/responses":
+                fixture.respond = respond  # type: ignore[method-assign]
+                os.kill(os.getpid(), signals.SIGTERM)
+            return respond(path, body)
+
+        fixture.respond = stop_on_first_generation  # type: ignore[method-assign]
+
+        code = main(["--config", str(config), "build", "selection"])
+
+        reported = json.loads(_last_json(capsys))
+        record = _only_record(store_dir)
+        assert code == 143
+        assert record.status == "failed" and record.error == "cancelled"
+        assert _ledger_cycles(store_dir) == [(reported["cycle_id"], "terminal", "cancelled")]
+        assert (reported["outcome"], reported["run_id"]) == ("cancelled", record.run_id)
+
+
+def _generation_states(store_dir: Path) -> list[str]:
+    import sqlite3
+
+    conn = sqlite3.connect(store_dir / "controls" / "accounting.sqlite3")
+    try:
+        rows = conn.execute("SELECT state FROM entries WHERE operation = 'generate'").fetchall()
+    finally:
+        conn.close()
+    return [row[0] for row in rows]
+
+
+@pytest.mark.usefixtures("judged_execution")
+class TestRunRecordThatCannotBeSaved:
+    """The record store root becomes read-only (a real EACCES at the record writer)
+    while the control ledger under `controls/` stays writable."""
+
+    def test_stop_during_the_model_work_still_ends_the_cycle_cancelled(
+        self,
+        store_dir: Path,
+        toy_config: tuple[Path, ResponsesFixture],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        import signal as signals
+
+        config, fixture = toy_config
+        fixture.outputs = fixture_outputs()
+        assert main(["--config", str(config), "status"]) == 0
+        capsys.readouterr()
+        respond = fixture.respond
+        original = store_dir.stat().st_mode & 0o777
+
+        def stop_read_only(path: str, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+            if path == "/v1/responses":
+                fixture.respond = respond  # type: ignore[method-assign]
+                store_dir.chmod(0o500)
+                os.kill(os.getpid(), signals.SIGTERM)
+            return respond(path, body)
+
+        fixture.respond = stop_read_only  # type: ignore[method-assign]
+        try:
+            code = main(["--config", str(config), "build", "selection"])
+        finally:
+            store_dir.chmod(original)
+
+        reported = json.loads(_last_json(capsys))
+        record = _only_record(store_dir)
+        assert code == 128 + signals.SIGTERM
+        assert (reported["outcome"], reported["run_id"]) == ("cancelled", record.run_id)
+        assert str(store_dir) in reported["error"]
+        assert record.status == "in_progress"
+        assert _ledger_cycles(store_dir) == [(reported["cycle_id"], "terminal", "cancelled")]
+        assert _generation_states(store_dir) == ["unknown"]
+
+    @pytest.mark.parametrize(
+        ("failing", "toy_config"),
+        [(True, {}), (False, _COMPLETING_STAGE)],
+        ids=["failed-build", "completed-build"],
+        indirect=["toy_config"],
+    )
+    def test_a_build_whose_record_cannot_be_saved_ends_its_cycle_failed_once(
+        self,
+        store_dir: Path,
+        toy_config: tuple[Path, ResponsesFixture],
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        failing: bool,
+    ) -> None:
+        config, fixture = toy_config
+        fixture.outputs = fixture_outputs(failing_implementation=failing)
+        assert main(["--config", str(config), "status"]) == 0
+        capsys.readouterr()
+        original = store_dir.stat().st_mode & 0o777
+        write = SessionStore._write
+        attempted: list[str] = []
+
+        def write_to_a_read_only_store(self: SessionStore, record: RunRecord) -> None:
+            attempted.append(record.status)
+            store_dir.chmod(0o500)
+            write(self, record)
+
+        monkeypatch.setattr(SessionStore, "_write", write_to_a_read_only_store)
+        try:
+            code = main(["--config", str(config), "build", "selection"])
+        finally:
+            store_dir.chmod(original)
+
+        out = json.loads(_last_json(capsys))
+        record = _only_record(store_dir)
+        assert code == 1
+        # A completed build's end is refused first, then its failed end.
+        assert attempted == (["failed"] if failing else ["completed", "failed"])
+        assert (out["outcome"], out["run_id"]) == ("failed", record.run_id)
+        assert str(store_dir) in out["error"]
+        assert record.status == "in_progress"
+        assert _ledger_cycles(store_dir) == [(out["accounting"]["cycle_id"], "terminal", "failed")]
+
+    def test_a_run_that_cannot_be_created_ends_its_cycle_and_is_reported(
+        self,
+        store_dir: Path,
+        toy_config: tuple[Path, ResponsesFixture],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        config, fixture = toy_config
+        assert main(["--config", str(config), "status"]) == 0
+        original = store_dir.stat().st_mode & 0o777
+        capsys.readouterr()
+        store_dir.chmod(0o500)
+        try:
+            code = main(["--config", str(config), "build", "selection"])
+        finally:
+            store_dir.chmod(original)
+
+        captured = capsys.readouterr()
+        out = json.loads(captured.out[captured.out.rfind("\n{") + 1 :])
+        ((_cycle_id, state, outcome),) = _ledger_cycles(store_dir)
+        assert code == 1
+        assert str(store_dir) in out["error"]
+        assert (state, outcome) == ("terminal", "failed")
+        assert "Traceback" not in captured.err
+        assert fixture.generations() == []
+        assert SessionStore(store_dir=store_dir).list_runs(limit=None) == []
+
+    @pytest.mark.parametrize(
+        ("failing", "writable", "toy_config"),
+        [(True, False, {}), (False, False, _COMPLETING_STAGE), (True, True, {})],
+        ids=["failed-build", "completed-build", "healthy-store"],
+        indirect=["toy_config"],
+    )
+    def test_stop_while_the_end_is_recorded_reports_an_unsaved_record(
+        self,
+        store_dir: Path,
+        toy_config: tuple[Path, ResponsesFixture],
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        failing: bool,
+        writable: bool,
+    ) -> None:
+        import signal as signals
+
+        config, fixture = toy_config
+        fixture.outputs = fixture_outputs(failing_implementation=failing)
+        assert main(["--config", str(config), "status"]) == 0
+        capsys.readouterr()
+        original = store_dir.stat().st_mode & 0o777
+        write = SessionStore._write
+        stopped: list[bool] = []
+        attempted: list[str] = []
+
+        def stop_then_write(self: SessionStore, record: RunRecord) -> None:
+            attempted.append(record.status)
+            # The operator's stop arrives while the run's end is being recorded.
+            if not stopped:
+                stopped.append(True)
+                if not writable:
+                    store_dir.chmod(0o500)
+                os.kill(os.getpid(), signals.SIGTERM)
+            write(self, record)
+
+        monkeypatch.setattr(SessionStore, "_write", stop_then_write)
+        try:
+            code = main(["--config", str(config), "build", "selection"])
+        finally:
+            store_dir.chmod(original)
+
+        reported = json.loads(_last_json(capsys))
+        record = _only_record(store_dir)
+        expected = "failed" if failing or not writable else "completed"
+        assert code == 128 + signals.SIGTERM
+        # A completed build's end is refused first, then its failed end.
+        assert attempted == (["failed"] if failing else ["completed", "failed"])
+        assert (reported["outcome"], reported["run_id"]) == (expected, record.run_id)
+        assert _ledger_cycles(store_dir) == [(reported["cycle_id"], "terminal", expected)]
+        if writable:
+            assert record.status == expected
+            assert str(store_dir) not in reported["error"]
+        else:
+            assert record.status == "in_progress"
+            assert str(store_dir) in reported["error"]
+
+
+class TestWritesIntoAStoreThatCannotBeWritten:
+    def test_approving_a_sealed_run_in_a_search_only_store_is_refused_typed(
+        self, store_dir: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        rec = _make_completed_run(store_dir)
+        record = store_dir / f"{rec.run_id}.json"
+        data, original = record.read_bytes(), store_dir.stat().st_mode & 0o777
+        store_dir.chmod(0o100)
+        try:
+            code = _cmd_approve(_ApproveArgs(rec.run_id))
+        finally:
+            store_dir.chmod(original)
+
+        out = json.loads(_last_json(capsys))
+        assert code == 1
+        assert out["run_id"] == rec.run_id
+        assert str(record) in out["error"]
+        assert record.read_bytes() == data
+
+    def test_submitting_from_a_search_only_store_reserves_and_publishes_nothing(
+        self,
+        store_dir: Path,
+        offline_remotes: OfflineRemotes,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rec = _approved_run(store_dir)
+        record = store_dir / f"{rec.run_id}.json"
+        data, original = record.read_bytes(), store_dir.stat().st_mode & 0o777
+        capsys.readouterr()
+        store_dir.chmod(0o100)
+        try:
+            code = _cmd_submit(_SubmitArgs("selection", rec.run_id))
+        finally:
+            store_dir.chmod(original)
+
+        out = json.loads(_last_json(capsys))
+        assert code == 1
+        assert out["run_id"] == rec.run_id
+        assert str(store_dir) in out["error"]
+        assert record.read_bytes() == data
         assert offline_remotes.gh_calls() == []

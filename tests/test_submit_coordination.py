@@ -38,7 +38,7 @@ import apprentice.core.session_store as session_store
 from apprentice import cli
 
 store_dir, point, reached_fd, go_fd, command, run_id, approver = sys.argv[1:]
-session_store._DEFAULT_STORE_DIR = Path(store_dir)
+session_store.default_store_dir = lambda: Path(store_dir)
 paused = []
 
 
@@ -186,7 +186,11 @@ class _Contender:
 @pytest.fixture
 def store_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     directory = tmp_path / "sessions"
-    monkeypatch.setattr("apprentice.core.session_store._DEFAULT_STORE_DIR", directory)
+    # cycles binds the name at import: patched there first (importing it before the store's
+    # default is replaced), a first import during this test cannot keep this test's store as
+    # every later test's default.
+    monkeypatch.setattr("apprentice.core.cycles.default_store_dir", lambda: directory)
+    monkeypatch.setattr("apprentice.core.session_store.default_store_dir", lambda: directory)
     return directory
 
 

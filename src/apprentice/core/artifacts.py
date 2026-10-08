@@ -11,6 +11,7 @@ bundle bytes against it.
 from __future__ import annotations
 
 import errno
+import fnmatch
 import hashlib
 import json
 import os
@@ -155,6 +156,23 @@ def promoted_destinations(algorithm: str, tier: int) -> dict[str, dict[str, str]
             "path": f"scenes/scene_micro{name}.py",
         },
     }
+
+
+def json_entries(directory: Path) -> list[Path]:
+    """Every `*.json` entry directly in `directory`, sorted by name; a missing directory has none.
+
+    The same entries `directory.glob("*.json")` yields (case-sensitive, hidden
+    names and any file type included), except that a directory which exists
+    but cannot be listed raises instead of yielding nothing.
+
+    Raises:
+        OSError: If `directory` exists but cannot be listed.
+    """
+    try:
+        names = os.listdir(directory)
+    except FileNotFoundError:
+        return []
+    return sorted(directory / name for name in names if fnmatch.fnmatchcase(name, "*.json"))
 
 
 def require_owned_root(root: Path | str) -> Path:

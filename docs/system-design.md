@@ -84,7 +84,7 @@ All algorithms follow the `micro{name}` pattern:
 | **Multi-agent by design** | Each specialist agent has a distinct role, instruction, tool access, and reasoning loop. Agent boundaries correspond to intuitive roles, not arbitrary splits. |
 | **Honest agent boundaries** | Full agents use `LoopAgent` for self-correction. Tool-agents are single `LlmAgent` instances. Validators are `FunctionTool` wrappers. The tier matches the behavioral complexity. |
 | **Framework over reinvention** | Google ADK provides `SequentialAgent`, `ParallelAgent`, `LoopAgent` — battle-tested orchestration primitives. No hand-rolled dispatch loops. |
-| **Provider agnostic** | ADK's `LiteLlm` wrapper supports Anthropic (Claude), OpenAI (GPT), Google (Gemini), and local models (Ollama, llama.cpp). Switch providers via config, not code. |
+| **Metered routes only** | Every model call goes through ADK's `LiteLlm` with a metering client. Only routes with a qualified accounting profile are supported: the standard-tier OpenAI Responses API and genuinely non-hosted servers that implement the counted Responses protocol. The route is chosen in config; nothing switches it automatically. |
 | **Containment first** | Autonomous mode has hard budget caps, rate limits, and mandatory human checkpoints. Agents cannot escalate their own permissions. |
 | **Artifact parity** | Agent-generated entries are structurally indistinguishable from hand-crafted ones. |
 | **Prompt transparency** | All agent instructions are versioned and stored separately from agent logic. |
@@ -107,28 +107,7 @@ Google ADK is an open-source, code-first Python framework for building multi-age
 - **Session state** — shared state across agents via `output_key` / `{variable}` interpolation
 - **Dev web UI** — built-in debugging interface (`adk web`)
 
-**Multi-provider support via LiteLlm:**
-
-```python
-from google.adk.agents import Agent
-from google.adk.models.lite_llm import LiteLlm
-
-# Anthropic Claude
-agent = Agent(model=LiteLlm(model="anthropic/claude-sonnet-4-20250514"), ...)
-
-# OpenAI GPT
-agent = Agent(model=LiteLlm(model="openai/gpt-4.1"), ...)
-
-# Google Gemini (native)
-agent = Agent(model="gemini-2.5-flash", ...)
-
-# Local Ollama
-agent = Agent(model=LiteLlm(model="ollama_chat/llama3.3"), ...)
-
-# Local llama.cpp (via OpenAI-compatible API)
-agent = Agent(model=LiteLlm(model="openai/local-model"), ...)
-# Requires: OPENAI_API_BASE=http://localhost:8080/v1
-```
+**Metered model routes via LiteLlm:** every agent's `LiteLlm` gets a `MeteredResponsesClient` bound to its cycle, stage and role (`metering/client.py`). The client counts each request at `/responses/input_tokens`, reserves its bound in the installation ledger, sends it to `/responses` with the admitted `max_output_tokens`, and settles the raw usage once (see section 7.1).
 
 ### 4.2 Agent Composition
 
@@ -169,13 +148,13 @@ graph TB
 | apprentice concept | ADK primitive | Why |
 |---|---|---|
 | Full pipeline | `SequentialAgent` | Stages run in defined order |
-| Implementation with self-correction | `LoopAgent(max_iterations=3)` | Drafter + self-reviewer iterate until pass or exhaustion |
+| Implementation with self-correction | `LoopAgent(max_iterations=agents.max_implementation_retries)` | Drafter + per-draft validation callback; a checkpoint agent escalates out once a draft passes |
 | Parallel artifact generation | `ParallelAgent` | Instrumentation, visualization, assessment are independent |
-| Review with validation | `LoopAgent(max_iterations=2)` | Review agent validates, provides feedback, may retry |
+| Review with validation | programmatic `BaseAgent` | Runs consistency and schema validators once; no model call |
 | Multi-repo packaging | Deterministic Python, not an agent | Promotes the approved bundle bytes into coordinated PRs across `no-magic` + `no-magic-viz` |
 | Validators (lint, correctness, etc.) | `FunctionTool` | Pure functions called as agent tools |
 | Discovery (standalone) | `LlmAgent` with catalog tools | Multi-step reasoning with dedup tools |
-| Budget tracking | `before_agent_callback` / `after_agent_callback` | Hooks track tokens and cost per agent |
+| Budget enforcement | metering client per role + SQLite ledger | Reserve before dispatch, settle raw usage once (section 7.1) |
 
 ### 4.3 High-Level Architecture
 
@@ -184,7 +163,7 @@ graph TB
     subgraph Control Plane
         CLI[CLI Interface]
         Scheduler[Cycle Scheduler]
-        Budget[Budget Manager]
+        Budget[Control Ledger]
         Queue[Work Queue]
     end
 
@@ -193,7 +172,7 @@ graph TB
         DiscAgent["LlmAgent: Discovery"]
         ImplLoop["LoopAgent: Implementation"]
         ParAgent["ParallelAgent: Artifacts"]
-        RevLoop["LoopAgent: Review"]
+        RevLoop["BaseAgent: Programmatic Review"]
     end
 
     subgraph "FunctionTools (Validators)"
@@ -204,11 +183,9 @@ graph TB
         StdlibVal[stdlib_check]
     end
 
-    subgraph "LiteLlm Providers"
-        Claude[Anthropic Claude]
-        GPT[OpenAI GPT]
-        Gemini[Google Gemini]
-        Local[Ollama / llama.cpp]
+    subgraph "Metered LiteLlm Routes"
+        GPT[OpenAI Responses]
+        Local[Non-hosted counted Responses]
     end
 
     subgraph "Packaging (submit, no model)"
@@ -237,10 +214,12 @@ graph TB
     RevLoop --> ConsistVal
     RevLoop --> SchemaVal
 
-    ImplLoop --> Claude
-    ParAgent --> Claude
-    RevLoop --> Claude
-    DiscAgent --> Claude
+    ImplLoop --> GPT
+    ParAgent --> GPT
+    DiscAgent --> GPT
+    ImplLoop --> Local
+    ParAgent --> Local
+    DiscAgent --> Local
 
     Packager --> GitHub
     Packager --> NoMagic
@@ -260,20 +239,20 @@ sequenceDiagram
     participant Instr as LlmAgent (Instrumentation)
     participant Viz as LlmAgent (Visualization)
     participant Assess as LlmAgent (Assessment)
-    participant Rev as LoopAgent (Review)
+    participant Rev as BaseAgent (Review)
 
     Pipe->>Impl: Execute implementation loop
 
-    loop max_iterations=3
-        Impl->>Draft: Generate code
+    loop max_iterations=agents.max_implementation_retries
+        Impl->>Draft: Generate code (metered call)
         Draft->>Lint: lint_validate(code)
         Lint-->>Draft: ValidationResult
         Draft->>Correct: correctness_validate(code)
         Correct-->>Draft: ValidationResult
         alt All pass
-            Draft->>Draft: exit_loop
+            Impl->>Impl: checkpoint escalates, loop ends
         else Failure
-            Draft->>Draft: Re-prompt with suggestions
+            Draft->>Draft: feedback into the next attempt
         end
     end
 
@@ -288,46 +267,28 @@ sequenceDiagram
     ToolStage-->>Pipe: All artifacts
 
     Pipe->>Rev: Review all artifacts
-    loop max_iterations=2
-        Rev->>Rev: Run consistency + schema validators
-        alt Pass
-            Rev->>Rev: exit_loop
-        else Fail
-            Rev->>Rev: Compile feedback
-        end
-    end
+    Rev->>Rev: Run consistency + schema validators once (no model)
     Rev-->>Pipe: Review verdict
 ```
 
 ### 4.5 Provider Configuration
 
-All agents use `LiteLlm` for provider-agnostic model access. The provider is selected via `config/apprentice.toml`:
+The route is selected via `config/apprentice.toml` and qualified by an operator-supplied accounting profile ([Configuration](configuration.md#accounting-profile)):
 
 ```toml
 [provider]
-backend = "openai"                 # anthropic | openai | gemini | ollama | local | claude_cli
-model = "openai/gpt-5.4"           # LiteLlm model string
-fallback_model = "openai/gpt-5.4-mini"
-local_api_base = ""                # e.g. http://localhost:11434 for ollama/llama.cpp
+backend = "openai"                 # openai | local
+model = "openai/gpt-5.4"           # the profile's requested_model
+local_api_base = ""                # loopback URL, local only
+accounting_profile_path = ""       # empty: every model call is denied
 ```
 
-**Local model support:**
-
-| Backend | Config | Requirements |
+| Backend | Endpoint | Requirements |
 |---|---|---|
-| Ollama | `model = "ollama_chat/llama3.3"`, `local_api_base = "http://localhost:11434"` | Ollama running locally |
-| llama.cpp server | `model = "openai/local-model"`, `local_api_base = "http://localhost:8080/v1"` | llama-server running with `--host 0.0.0.0` |
-| Any OpenAI-compatible | `model = "openai/<model-name>"`, `local_api_base = "http://host:port/v1"` | Server exposing OpenAI-compatible API |
+| `openai` | exactly `https://api.openai.com/v1`, standard tier, `store=false` | `OPENAI_API_KEY`; `openai-standard-responses` profile with the counting-fee bound |
+| `local` | loopback IP `local_api_base` | server implementing `/responses/input_tokens` and `/responses` for the profiled model; `non-hosted-responses` profile |
 
-Environment variables for local models:
-```bash
-# Ollama
-export OLLAMA_API_BASE=http://localhost:11434
-
-# llama.cpp / local OpenAI-compatible
-export OPENAI_API_BASE=http://localhost:8080/v1
-export OPENAI_API_KEY=not-needed   # Required by LiteLlm but unused locally
-```
+The Anthropic, Gemini, Ollama and `claude -p` backends were removed: none is metered by a qualified profile. Plain chat-completions servers (Ollama, llama.cpp) do not qualify as `local` by themselves.
 
 ### 4.6 Component Breakdown
 
@@ -336,16 +297,16 @@ graph LR
     subgraph apprentice
         direction TB
         A[core/] --> A1[orchestrator.py<br/>ADK SequentialAgent pipeline builder]
-        A --> A2[budget.py<br/>Token & cost tracking via callbacks]
+        A --> A2[cycles.py<br/>Controlled, metered work cycles]
         A --> A3[queue.py<br/>Work item management]
         A --> A4[observability.py<br/>Logging, metrics, alerts]
 
         B[agents/] --> B1[discovery.py<br/>LlmAgent with catalog tools]
-        B --> B2[implementation.py<br/>LoopAgent: drafter + self-reviewer]
+        B --> B2[implementation.py<br/>LoopAgent: drafter + validation checkpoint]
         B --> B3[instrumentation.py<br/>LlmAgent: trace hook injection]
         B --> B4[visualization.py<br/>LlmAgent: Manim scene generation]
         B --> B5[assessment.py<br/>LlmAgent: Anki card generation]
-        B --> B6[review.py<br/>LoopAgent: validator + feedback]
+        B --> B6[review.py<br/>Programmatic review, no model]
         B --> B7[packaging.py<br/>Deterministic approved-byte PR creation]
 
         C[validators/] --> C1[lint.py → FunctionTool]
@@ -353,7 +314,7 @@ graph LR
         C --> C3[consistency.py → FunctionTool]
         C --> C4[schema_compliance.py → FunctionTool]
 
-        D[providers/] --> D1[factory.py<br/>LiteLlm model factory]
+        D[providers/] --> D1[factory.py<br/>Qualified route resolution and binding]
 
         E[config/] --> E1[apprentice.toml]
         E --> E2[catalog.toml]
@@ -381,15 +342,11 @@ graph LR
 
 ### 5.2 Implementation Agent — `LoopAgent`
 
-**ADK type**: `LoopAgent(max_iterations=3)` containing:
-1. `LlmAgent("drafter")` — generates stdlib-only Python implementation
-2. `LlmAgent("self_reviewer")` — runs `lint_validate` and `correctness_validate` tools, calls `exit_loop` on pass or re-prompts drafter on failure
+**ADK type**: `LoopAgent(max_iterations=agents.max_implementation_retries)` containing:
+1. `LlmAgent("drafter")` — generates stdlib-only Python implementation; its after-agent callback runs `stdlib_check`, `lint_validate` and `correctness_validate` on every draft (programmatically, not as model tools) and writes `validation_feedback` and `implementation_passed`
+2. `BaseAgent("implementation_checkpoint")` — escalates out of the loop when the latest draft passed
 
-**Tools** (available to self_reviewer):
-- `lint_validate(code_path)` → `FunctionTool` wrapping `LintValidator`
-- `correctness_validate(code_path)` → `FunctionTool` wrapping `CorrectnessValidator`
-- `stdlib_check(code_path)` → `FunctionTool` wrapping AST import analysis
-- `exit_loop` — ADK built-in, signals loop completion
+The drafter's instruction includes `{validation_feedback?}`, so a failed draft's issues reach the next attempt. The loop's iteration count is the total number of drafts, including the first.
 
 **Session state output**: `implementation_path` — path to validated implementation file
 
@@ -421,17 +378,11 @@ graph LR
 **Input**: `{implementation_path}` from session state
 **Output**: `anki_deck_path` in session state
 
-### 5.6 Review Agent — `LoopAgent`
+### 5.6 Review Agent — programmatic `BaseAgent`
 
-**ADK type**: `LoopAgent(max_iterations=2)` containing:
-1. `LlmAgent("reviewer")` — runs `consistency_validate` and `schema_validate` tools on all artifacts, compiles structured feedback, calls `exit_loop` on pass
+**ADK type**: `BaseAgent("reviewer")` — runs `consistency_validate` and `schema_validate` once over all artifacts in the run's work root. It makes no model call and has no budget share.
 
-**Tools**:
-- `consistency_validate(artifacts)` → `FunctionTool` wrapping `ConsistencyValidator`
-- `schema_validate(artifacts)` → `FunctionTool` wrapping `SchemaComplianceValidator`
-- `exit_loop` — ADK built-in
-
-**Session state output**: `review_verdict` — pass/fail with per-artifact diagnostics
+**Session state output**: `review_verdict` — `passed` or `failed: <per-artifact diagnostics>`
 
 ### 5.7 Packaging — deterministic, not an agent
 
@@ -480,30 +431,19 @@ lint_tool = FunctionTool(func=lint_validate)
 
 ## 7. Containment System
 
-**Current implementation (0.4.0).** This section is the target design. Today: correctness validation runs generated code with `subprocess.run` and a 5-second timeout, which is not a sandbox; the shared `BudgetTracker` is built from the per-cycle token/cost limits and logs a warning when exhausted but still dispatches agents; the monthly, per-stage, per-agent and allocation budgets, rate limits and circuit breaker are parsed configuration that no code enforces (`core/circuit_breaker.py`, `core/queue.py` and `core/scheduler.py` are empty modules); the enforced cap is a hard-coded ADK `max_llm_calls` per run. None of this is certified containment.
+**Current implementation.** Budgets are enforced as described in 7.1. Correctness validation runs generated code with `subprocess.run` and a 5-second timeout after every draft and in the correctness gate, which is not a sandbox. Rate limits, cooldown, PR-size limits and the circuit breaker are parsed configuration that no code enforces yet (`core/circuit_breaker.py`, `core/queue.py` and `core/scheduler.py` are empty modules). None of this is certified containment.
 
-### 7.1 Budget Manager (via ADK Callbacks)
+### 7.1 Budget Enforcement (reserve, dispatch, settle)
 
-Budget tracking uses ADK lifecycle callbacks rather than manual accounting:
+Budgets are enforced at each role's model client against one durable installation ledger (`controls/accounting.sqlite3` under the run-record store, with `flock` cycle leases), not by agent callbacks:
 
-```python
-async def before_agent_budget_check(callback_context: CallbackContext):
-    """Reject execution if budget exhausted."""
-    remaining = callback_context.state.get("budget_remaining_tokens", 0)
-    if remaining <= 0:
-        return types.Content(parts=[types.Part(text="Budget exhausted.")])
-    return None
+1. A controlled cycle (`build`, `retry`, `suggest`, library build) is admitted in one ledger transaction and holds a lease until its terminal outcome is committed.
+2. For each call, the counting fee bound is reserved and the complete Responses input is counted; then counted input plus the largest output cap admitted by every scope — UTC month, cycle, stage, role percentage share, single call — is reserved with its worst-case USD quote, and dispatch intent is persisted before the request is sent.
+3. The raw usage is settled exactly once before SDK conversion; unused allowance is refunded. Failure, cancellation or owner loss after dispatch keeps the full bound as unknown; contradictory or above-bound usage is charged and quarantines the profile.
 
+Tokens are input plus all output (cached and reasoning tokens are subsets). USD is an exact policy quote in nanodollars from the pinned price data — a qualified-price quote for the paid route, modelled reference capacity or known-zero hosted cost for non-hosted routes — never an invoice.
 
-async def after_agent_track_cost(callback_context: CallbackContext):
-    """Deduct actual usage from remaining budget."""
-    tokens = callback_context.state.get("last_tokens_used", 0)
-    remaining = callback_context.state.get("budget_remaining_tokens", 0)
-    callback_context.state["budget_remaining_tokens"] = remaining - tokens
-    return None
-```
-
-**Four-level hierarchy**: Global → Cycle → Work Item → Agent.
+**Hierarchy**: month → cycle → stage → role share → call.
 
 ### 7.2 Rate Limiting
 
@@ -585,7 +525,8 @@ apprentice build <algorithm> [--tier N]                 # Full ADK pipeline thro
 apprentice preview [--run-id ID]                        # Verify and inspect a sealed bundle
 apprentice approve <run-id> [--approver NAME]           # Record human-review approval
 apprentice submit <algorithm> --run-id ID [--tier N]    # Promote approved bytes; no model call
-apprentice status                                       # Configured budget/limit values
+apprentice status                                       # Configured limits vs ledger state, route check
+apprentice controls adopt-legacy --operator NAME --declare-no-earlier-process-running
 apprentice metrics                                      # Aggregated run metrics
 apprentice history [--status S] [--limit N]             # Past runs
 apprentice retry <run-id>                               # Re-run a failed pipeline run
@@ -599,7 +540,7 @@ apprentice dev [--port N]                               # ADK dev UI
 
 ## 9. Configuration — `apprentice.toml`
 
-The shipped `config/apprentice.toml`, which `core/config.py` parses; every section below is required. `fallback_model` is parsed and stored but no fallback switching is implemented. Section 7 lists which budget, rate-limit and circuit-breaker settings are enforced today.
+The shipped `config/apprentice.toml`, which `core/config.py` parses; every section below is required and removed keys are rejected ([Configuration](configuration.md#removed-settings)). Section 7 lists which budget, rate-limit and circuit-breaker settings are enforced today.
 
 ```toml
 [budget.global]
@@ -609,7 +550,6 @@ monthly_cost_ceiling_usd = 50.0
 [budget.cycle]
 max_tokens_per_cycle = 100_000
 max_cost_per_cycle_usd = 5.0
-max_algorithms_per_cycle = 3
 
 [budget.stage]
 max_tokens_per_stage = 20_000
@@ -626,17 +566,9 @@ max_lines_per_pr = 2000
 max_tokens_per_agent_call = 20_000
 implementation_budget_pct = 40
 tool_agent_budget_pct = 15
-review_budget_pct = 15
-
-[gates]
-max_lint_retries = 2
-max_correctness_retries = 1
-max_review_rounds = 2
 
 [agents]
 max_implementation_retries = 3
-max_review_rounds = 2
-max_tool_agent_retries = 1
 
 [circuit_breaker]
 failure_threshold = 3
@@ -646,16 +578,14 @@ max_open_cycles_before_manual_reset = 3
 [provider]
 backend = "openai"
 model = "openai/gpt-5.4"
-fallback_model = "openai/gpt-5.4-mini"
 local_api_base = ""
+accounting_profile_path = ""
 
 [observability]
 log_level = "INFO"
 log_format = "json"
 log_path = "${HOME}/.apprentice/logs"
 metrics_enabled = true
-alert_on_circuit_open = true
-alert_webhook = ""
 
 [templates]
 version = "1.0.0"
@@ -759,19 +689,19 @@ no-magic-ai/apprentice/
 │       ├── cli.py                    # CLI entry point
 │       ├── core/
 │       │   ├── orchestrator.py       # ADK pipeline builder (SequentialAgent)
-│       │   ├── budget.py             # Budget callbacks for ADK agents
+│       │   ├── cycles.py             # Controlled, metered work cycles
+│       │   ├── budget.py             # Gate verdicts + ledger reference of a run
 │       │   ├── queue.py              # Work item management (empty placeholder)
 │       │   ├── circuit_breaker.py    # Failure containment (empty placeholder)
 │       │   ├── scheduler.py          # Autonomous cycle scheduling (empty placeholder)
 │       │   └── observability.py      # Structured logging, metrics
 │       ├── agents/
-│       │   ├── base.py               # Shared agent helpers
 │       │   ├── discovery.py          # LlmAgent with catalog tools
-│       │   ├── implementation.py     # LoopAgent: drafter + self-reviewer
+│       │   ├── implementation.py     # LoopAgent: drafter + validation checkpoint
 │       │   ├── instrumentation.py    # LlmAgent (tool-agent)
 │       │   ├── visualization.py      # LlmAgent (tool-agent)
 │       │   ├── assessment.py         # LlmAgent (tool-agent)
-│       │   ├── review.py             # LoopAgent: validator + feedback
+│       │   ├── review.py             # Programmatic review agent (no model)
 │       │   └── packaging.py          # Deterministic approved-byte PR creation
 │       ├── validators/
 │       │   ├── base.py               # ValidationResult, ValidationIssue
@@ -779,8 +709,10 @@ no-magic-ai/apprentice/
 │       │   ├── correctness.py        # → FunctionTool
 │       │   ├── consistency.py        # → FunctionTool
 │       │   └── schema_compliance.py  # → FunctionTool
+│       ├── controls/                 # Installation ledger, leases, policy, footprint
+│       ├── metering/                 # Price authority, accounting profiles, metered client
 │       ├── providers/
-│       │   └── factory.py            # LiteLlm model factory
+│       │   └── factory.py            # Qualified route resolution and binding
 │       ├── prompts/                  # Agent instructions (YAML)
 │       └── models/                   # WorkItem, ArtifactBundle, etc.
 ├── config/
@@ -813,6 +745,4 @@ no-magic-ai/apprentice/
 |---|---|---|
 | 6 | ADK session persistence | ADK supports `InMemorySessionService` and custom backends. Use SQLite-backed session for durable state across runs? |
 | 7 | ADK dev web UI deployment | Run `adk web` locally during development. How to integrate with CI? |
-| 8 | Local model quality threshold | Ollama/llama.cpp models produce lower quality than Claude. Should validators be stricter for local models? |
-| 9 | ADK version pinning | ADK is rapidly evolving. Pin to specific version and test before upgrading? |
-| 10 | Legacy code removal | When to remove `stages/`, `gates/`, custom `Pipeline`? After v1.0 stabilization. |
+| 8 | Local model quality threshold | Non-hosted models may produce lower quality than hosted ones. Should validators be stricter for local models? |

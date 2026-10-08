@@ -5,13 +5,10 @@ from __future__ import annotations
 from datetime import datetime
 
 from apprentice.models.artifact import ArtifactBundle
-from apprentice.models.budget import BudgetLogEntry, CostEstimate
 from apprentice.models.cycle import Cycle
 from apprentice.models.work_item import (
     GateResult,
     GateVerdict,
-    PipelineContext,
-    StageResult,
     WorkItem,
     WorkItemSource,
     WorkItemStatus,
@@ -49,22 +46,6 @@ class TestWorkItemSerialization:
         assert restored.completed_at is None
 
 
-class TestStageResultSerialization:
-    def test_round_trip(self) -> None:
-        result = StageResult(
-            stage_name="implementation",
-            artifacts={"implementation": "path/to/file.py"},
-            tokens_used=5000,
-            cost_usd=0.045,
-            diagnostics=[{"level": "warning", "message": "test"}],
-        )
-        data = result.to_dict()
-        restored = StageResult.from_dict(data)
-        assert restored.stage_name == result.stage_name
-        assert restored.artifacts == result.artifacts
-        assert restored.tokens_used == result.tokens_used
-
-
 class TestGateResultSerialization:
     def test_round_trip(self) -> None:
         result = GateResult(
@@ -93,40 +74,6 @@ class TestArtifactBundleSerialization:
         assert restored.parent_bundle_id == "bundle-0"
 
 
-class TestCostEstimateSerialization:
-    def test_round_trip(self) -> None:
-        est = CostEstimate(
-            estimated_input_tokens=3000,
-            estimated_output_tokens=2000,
-            estimated_cost_usd=0.039,
-        )
-        data = est.to_dict()
-        restored = CostEstimate.from_dict(data)
-        assert restored.estimated_input_tokens == 3000
-        assert restored.estimated_cost_usd == 0.039
-
-
-class TestBudgetLogEntrySerialization:
-    def test_round_trip(self) -> None:
-        entry = BudgetLogEntry(
-            id="log-1",
-            cycle_id="cycle-1",
-            work_item_id="item-1",
-            stage_name="implementation",
-            provider="anthropic",
-            model="claude-sonnet-4-20250514",
-            estimated_tokens=5000,
-            actual_tokens=4800,
-            estimated_cost_usd=0.039,
-            actual_cost_usd=0.037,
-            logged_at=datetime(2025, 6, 1, 12, 0, 0),
-        )
-        data = entry.to_dict()
-        restored = BudgetLogEntry.from_dict(data)
-        assert restored.actual_tokens == 4800
-        assert restored.logged_at.year == 2025
-
-
 class TestCycleSerialization:
     def test_round_trip(self) -> None:
         cycle = Cycle(
@@ -140,16 +87,3 @@ class TestCycleSerialization:
         restored = Cycle.from_dict(data)
         assert restored.items_attempted == 3
         assert restored.ended_at is None
-
-
-class TestPipelineContextSerialization:
-    def test_round_trip(self) -> None:
-        ctx = PipelineContext(
-            config={"key": "value"},
-            budget_remaining_tokens=10000,
-            artifact_root="/owned/root",
-        )
-        data = ctx.to_dict()
-        restored = PipelineContext.from_dict(data)
-        assert restored.budget_remaining_tokens == 10000
-        assert restored.artifact_root == "/owned/root"

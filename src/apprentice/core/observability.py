@@ -11,8 +11,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-_METRICS_LOGGER_NAME = "apprentice.metrics"
-
 
 class _JsonFormatter(logging.Formatter):
     """Formats log records as newline-delimited JSON objects."""
@@ -114,57 +112,3 @@ def get_logger(name: str) -> logging.Logger:
         A ``logging.Logger`` instance.
     """
     return logging.getLogger(name)
-
-
-def log_stage_metrics(
-    stage_name: str,
-    tokens_used: int,
-    cost_usd: float,
-    duration_seconds: float,
-    passed: bool,
-) -> None:
-    """Log a structured metrics event for a stage execution.
-
-    Args:
-        stage_name: Identifier of the pipeline stage (e.g. ``"implementation"``).
-        tokens_used: Total tokens consumed during the stage.
-        cost_usd: Estimated USD cost of the stage.
-        duration_seconds: Wall-clock time the stage took to run.
-        passed: Whether the stage completed successfully.
-    """
-    logger = logging.getLogger(_METRICS_LOGGER_NAME)
-    logger.info(
-        "stage_metrics",
-        extra={
-            "event": "stage_metrics",
-            "stage_name": stage_name,
-            "tokens_used": tokens_used,
-            "cost_usd": cost_usd,
-            "duration_seconds": duration_seconds,
-            "passed": passed,
-        },
-    )
-
-
-def log_gate_result(
-    gate_name: str,
-    verdict: str,
-    diagnostics: dict[str, Any],
-) -> None:
-    """Log a structured metrics event for a gate evaluation.
-
-    Args:
-        gate_name: Identifier of the gate (e.g. ``"lint"``, ``"correctness"``).
-        verdict: Outcome string, typically ``"pass"`` or ``"fail"``.
-        diagnostics: Arbitrary key-value data produced by the gate.
-    """
-    logger = logging.getLogger(_METRICS_LOGGER_NAME)
-    logger.info(
-        "gate_result",
-        extra={
-            "event": "gate_result",
-            "gate_name": gate_name,
-            "verdict": verdict,
-            "diagnostics": diagnostics,
-        },
-    )

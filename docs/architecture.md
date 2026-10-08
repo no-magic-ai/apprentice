@@ -8,18 +8,19 @@ apprentice uses Google ADK to compose agents into a sequential pipeline with par
 SequentialAgent("apprentice_pipeline")
 ├── LoopAgent("implementation_loop")
 │   ├── LlmAgent("drafter")
-│   └── LlmAgent("self_reviewer")
+│   └── BaseAgent("implementation_checkpoint")
+├── GateAgent(correctness), GateAgent(lint)
 ├── ParallelAgent("artifact_generation")
 │   ├── LlmAgent("instrumentation")
 │   ├── LlmAgent("visualization")
 │   └── LlmAgent("assessment")
-└── LoopAgent("review_loop")
-    └── LlmAgent("reviewer")
+├── GateAgent(consistency), GateAgent(schema_compliance)
+└── BaseAgent("reviewer")
 ```
 
 ### Implementation Loop
 
-The drafter generates algorithm code. The self_reviewer validates it using FunctionTool wrappers around the existing validators (lint, correctness, stdlib check). On failure, the reviewer summarizes issues for the drafter to fix. The loop exits when all validators pass or `max_iterations` (default 3) is reached.
+Each iteration is one drafter call followed by its after-agent callback, which writes the draft into the run's work root and runs the stdlib, lint and correctness validators (the correctness validator executes the draft; see the README's containment note). A passing draft sets `implementation_passed`, and the `implementation_checkpoint` agent escalates out of the loop, so no further draft is requested. A failing draft leaves its issues in `validation_feedback`, which the drafter's instruction includes on the next iteration. `agents.max_implementation_retries` is the loop's `max_iterations`: the total number of drafts including the first. When every draft fails, the blocking gates fail the run.
 
 ### Artifact Generation
 
@@ -28,19 +29,19 @@ Three agents run concurrently:
 - **Visualization** generates a Manim animation scene (optionally using a scaffold template)
 - **Assessment** generates Anki flashcards in CSV format
 
-### Review Loop
+### Review
 
-The reviewer runs consistency and schema compliance validators across all artifacts. Exits on pass or after `max_iterations` (default 2) rounds.
+The reviewer is a programmatic agent, not a model: it runs the consistency and schema compliance validators once across all artifacts and records `review_verdict` (`passed` or `failed: …`). It never calls a model, so it has no budget share.
 
 ### Gate Verdicts
 
-Each `GateAgent` computes one verdict entry (gate, stage, verdict, whether the gate blocks, diagnostics). It records the entry in the pipeline's `BudgetTracker` and yields it as an `EventActions.state_delta` appended to `gate_verdicts`, so the session service stores it. PASS, WARN and a FAIL from a non-blocking gate continue. A FAIL from a blocking gate, including a gate that raised, then raises `BlockingGateError`; the error propagates through `SequentialAgent` and the Runner, so no later agent runs. (ADK copies each child's invocation context, so setting a flag on it would not stop the parent.)
+Each `GateAgent` computes one verdict entry (gate, stage, verdict, whether the gate blocks, diagnostics). It records the entry in the run's `BudgetTracker` and yields it as an `EventActions.state_delta` appended to `gate_verdicts`, so the session service stores it. PASS, WARN and a FAIL from a non-blocking gate continue. A FAIL from a blocking gate, including a gate that raised, then raises `BlockingGateError`; the error propagates through `SequentialAgent` and the Runner, so no later agent runs. (ADK copies each child's invocation context, so setting a flag on it would not stop the parent.)
 
-The CLI runner catches only that error, reads the stored session back from the same session service and attaches it. `build`, `retry` and `scripts/integration_test.py` then record the run once as `failed` with that state, the tracker's budget summary, the elapsed time and an error naming the gate; the work-root files stay and nothing is sealed, so the run cannot be approved or submitted. Other exceptions are recorded as before. With an empty draft the correctness gate fails first, so such a run also ends `failed` with the gate's diagnostics.
+The CLI runner catches only that error, reads the stored session back from the same session service and attaches it. `build`, `retry` and `scripts/integration_test.py` (all through `core/cycles.run_build`) then record the run once as `failed` with that state, the budget summary (gate verdicts plus the cycle's ledger reference), the elapsed time and an error naming the gate; the work-root files stay and nothing is sealed, so the run cannot be approved or submitted. Other exceptions are recorded as before. With an empty draft the correctness gate fails first, so such a run also ends `failed` with the gate's diagnostics.
 
 The same recorded verdicts decide whether a run can be sealed and published. `complete_run` refuses to seal a budget summary that holds a blocking FAIL, and `approve` and `submit` refuse a completed run whose `budget_summary.gate_verdicts` include one (runs sealed before the halt existed). Verdicts recorded without the `blocking` flag come from the four pipeline gates, which all block; WARN and non-blocking FAIL verdicts do not.
 
-`wire_agent_callbacks` replaces `before_agent_callback`/`after_agent_callback` on every agent of the assembled pipeline, so the drafter's validation callback, the implementation loop's exit check and the review loop's validation callback do not run there. Those callbacks are exercised directly in tests.
+Metering never replaces agent callbacks: it lives in each role's model client (see [Metered Model Calls](#metered-model-calls)), so the drafter's validation callback and the loop checkpoint run in the assembled pipeline.
 
 ### Packaging
 
@@ -67,7 +68,7 @@ ADK agents communicate through session state. Each agent writes to a key specifi
 | Agent | output_key | Content |
 |---|---|---|
 | drafter | `generated_code` | Python source code |
-| self_reviewer | `review_feedback` | Validation issues or "passed" |
+| drafter callback | `validation_feedback`, `implementation_passed`, `implementation_path` | Issues for the next attempt; whether the draft passed |
 | instrumentation | `instrumented_code` | Python source with trace hooks |
 | visualization | `manim_scene_code` | Manim Scene class |
 | assessment | `anki_deck_content` | CSV flashcard content |
@@ -76,27 +77,25 @@ ADK agents communicate through session state. Each agent writes to a key specifi
 
 Agents read from other agents' keys using `{key_name}` in their instruction templates.
 
-## Budget System
+## Metered Model Calls
 
-`BudgetTracker` in `core/budget.py` tracks tokens and cost per agent:
+Every model-using command runs inside one controlled cycle (`core/cycles.py`): `build`, `retry`, standalone `suggest` and library builds such as `scripts/integration_test.py`. The route (backend, model, accounting profile, pinned SDKs and price data) is resolved before the cycle is admitted (`providers/factory.resolve_route`). Each agent gets its own `LiteLlm` whose `llm_client` is a `MeteredResponsesClient` bound to the cycle, stage and role (`metering/client.py`):
 
-- `before_agent_callback` — records start time, logs dispatch
-- `after_agent_callback` — records completion, accumulates tokens/cost
-- `before_model_callback` / `after_model_callback` — log LLM request/response
+1. streaming, uncountable request fields, non-function tools and non-text input are refused before anything is reserved;
+2. the chat request is transformed into Responses input once; the counting fee bound (a paid profile's, zero for non-hosted) is reserved and dispatch intent persisted before `POST /responses/input_tokens` counts that exact projection;
+3. counted input plus the largest admissible output cap and its worst-case quote are reserved against the month, cycle, stage, role share and call ceilings in one ledger transaction, dispatch intent is persisted, and the same projection is sent to `POST /responses` with that cap, `store=false` and the standard tier;
+4. the raw echoed model, tier and complete usage are checked and settled once before the SDK converts the response.
 
-Budget is configured in `apprentice.toml` under `[budget]`:
-- Global: monthly token/cost ceiling
-- Cycle: per-pipeline-run limits
-- Agent: percentage allocation (implementation 40%, tool agents 15% each, review 15%)
+SDK and HTTP retries are disabled, environment proxies and redirects are ignored, and the paid endpoint is fixed. After dispatch, an error, cancellation, crash or missing usage keeps the full reservation as unknown exposure; inconsistent or above-bound usage is charged and quarantines the profile. The ledger, leases and recovery are described in [Configuration](configuration.md#budget-enforcement). `BudgetTracker` in `core/budget.py` now only collects gate verdicts; the run record's `budget_summary` holds them plus the cycle's ledger entries (`accounting`) as a derived reference — the ledger is the single authority.
 
-Only the cycle token/cost limits are consumed: the pipeline's shared `BudgetTracker` is created from them (`core/orchestrator.py`). When the tracker is exhausted, `before_agent_budget_check` logs a warning and still dispatches the agent, so the limit is observed, not enforced. The monthly, per-stage, per-agent-call and percentage-allocation settings, `[rate_limits]` and `[circuit_breaker]` are parsed and shown by `apprentice config` / `status` but not enforced. The enforced cap is the hard-coded ADK `RunConfig(max_llm_calls=...)` per run in `cli.py`.
+`[rate_limits]` and `[circuit_breaker]` are parsed and validated but not yet enforced. ADK's `RunConfig(max_llm_calls=...)` per run remains an additional cap.
 
 ## Session Persistence
 
 `SessionStore` in `core/session_store.py` persists run records as JSON files in `~/.apprentice/sessions/`. Each record captures:
 
 - Session state (all agent outputs)
-- Budget summary (per-agent token/cost breakdown)
+- Budget summary (gate verdicts and the cycle's ledger entries)
 - Timing, status, and error information
 - The sealed bundle's manifest digest and, once approved, the approval
 
@@ -112,23 +111,17 @@ Run IDs are `<algorithm>-<UTC second>-<uuid>`, created exclusively, so two runs 
 ~/.apprentice/sessions/scratch/<uuid>/         exclusive roots for work without a run record
 ```
 
-Every writer (`GateAgent`, the drafter and review callbacks — which do not run in the assembled pipeline, see [Gate Verdicts](#gate-verdicts) — and the legacy `stages/*`) uses the shared fixed role filenames in `core/artifacts.py` (`implementation.py`, `instrumented.py`, `scene.py`, `cards.csv`, `validation_report.json`, `discovery.json`) and refuses a missing or symlinked root and symlinked or multiply-linked files. No path is derived from the algorithm name, the current directory or a temporary directory.
+Every writer (`GateAgent`, the drafter's validation callback and the reviewer) uses the shared fixed role filenames in `core/artifacts.py` (`implementation.py`, `instrumented.py`, `scene.py`, `cards.csv`, `validation_report.json`, `discovery.json`) and refuses a missing or symlinked root and symlinked or multiply-linked files. No path is derived from the algorithm name, the current directory or a temporary directory.
 
 Completing a run seals its final artifacts into `bundle/` with a `manifest.json`: canonical UTF-8 JSON (sorted keys, fixed separators) with the run ID, algorithm, integer tier and, per artifact, its role, file name, size, SHA-256 and repository destination (`null` when the role is kept but not promoted). The manifest digest is the SHA-256 of that JSON without its own `manifest_sha256` field. `preview`, `approve` and `submit` reload the bundle and reject a malformed or non-canonical manifest, changed identity or destinations, added or removed files, symlinks and any byte change. A run recorded before sealed bundles existed has no bundle; it fails with an instruction to rebuild rather than being regenerated.
 
-The legacy `core/pipeline.Pipeline` takes the same isolation through `PipelineContext.artifact_root`: one fresh `SessionStore.allocate_work_root()` per invocation. `Pipeline.run` refuses an unset, missing, symlinked or already-populated root before any stage runs, and each stage refuses a missing root before calling its provider. This is storage isolation only; it adds no execution containment, budget enforcement or approval record.
+The control authority lives beside the run records in `controls/` (`authority.id`, `accounting.sqlite3`, `leases/<slot>.lock`), outside the `*.json` record glob. A build registers its run ID with its cycle before the record is written; a record that no cycle references is treated as unmetered earlier work.
 
 This enables:
 - `apprentice retry <run-id>` — rerun failed pipelines
 - `apprentice history` — list past runs
-- `apprentice metrics` — aggregate success rates and costs
+- `apprentice metrics` — run lifecycle plus usage by accounting category from the ledger for every controlled cycle, including record-less suggest/library cycles (historical estimates, qualified quotes, reference capacity, known-zero hosted usage and unknown holds, never summed)
 
-## Provider Abstraction
+## Model Routes
 
-`LiteLlm` from ADK provides a unified interface across providers. The factory in `providers/factory.py` handles:
-
-- Environment variable setup per backend
-- API key validation for cloud providers
-- Base URL configuration for local providers (Ollama, OpenAI-compatible)
-
-All agents share the same model instance. Override at runtime with `--backend` and `--model` CLI flags.
+`providers/factory.py` resolves the one qualified route — `openai` (exactly `https://api.openai.com/v1`, `OPENAI_API_KEY`) or `local` (a loopback non-hosted server) — and checks that the accounting profile applies to exactly that backend and model. `--backend`/`--model` overrides go through the same resolution; nothing changes the model or provider automatically and nothing is written to the process environment. The legacy `core/pipeline.Pipeline`, `stages/*`, the unmetered `providers/{anthropic,openai,claude_cli}` adapters and the estimate-based `core/tokens.py`/`models/budget.py` were removed.

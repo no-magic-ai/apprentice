@@ -6,6 +6,8 @@ import os
 import re
 import tomllib
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal, Overflow
 from pathlib import Path
 
 # Pattern matches ${VAR_NAME} and ${VAR_NAME:-default}
@@ -44,6 +46,66 @@ def _interpolate_dict(data: dict[str, object]) -> dict[str, object]:
     return result
 
 
+_NANODOLLARS_PER_USD = Decimal(1_000_000_000)
+
+# Keys that earlier releases accepted but no consumer ever enforced. They are
+# rejected with their migration rather than silently ignored.
+_REMOVED_KEYS: dict[tuple[str, str], str] = {
+    ("provider", "fallback_model"): "apprentice never switches models; delete the key",
+    ("budget.cycle", "max_algorithms_per_cycle"): "one cycle builds one algorithm; delete the key",
+    ("budget.agent", "review_budget_pct"): (
+        "artifact review is programmatic and makes no model call; delete the key"
+    ),
+    ("agents", "max_review_rounds"): (
+        "artifact review is programmatic and runs once; delete the key"
+    ),
+    ("agents", "max_tool_agent_retries"): "tool agents run once per cycle; delete the key",
+    ("gates", "max_lint_retries"): "gates run once; delete the [gates] section",
+    ("gates", "max_correctness_retries"): "gates run once; delete the [gates] section",
+    ("gates", "max_review_rounds"): "gates run once; delete the [gates] section",
+    ("observability", "alert_on_circuit_open"): "no alert transport exists; delete the key",
+    ("observability", "alert_webhook"): "no alert transport exists; delete the key",
+}
+
+SUPPORTED_BACKENDS = ("local", "openai")
+_REMOVED_BACKENDS: dict[str, str] = {
+    "anthropic": "its usage and fees are not metered by a qualified accounting profile",
+    "gemini": "its usage and fees are not metered by a qualified accounting profile",
+    "ollama": (
+        "configure a genuinely non-hosted server that implements the counted Responses "
+        "protocol as backend 'local' with a non-hosted accounting profile"
+    ),
+    "claude_cli": "it is an unmetered hosted subscription process, not a factory model",
+}
+
+
+def backend_problem(backend: str) -> str | None:
+    """Return why `backend` cannot be used, or None if it is supported."""
+    if backend in SUPPORTED_BACKENDS:
+        return None
+    if backend in _REMOVED_BACKENDS:
+        return (
+            f"backend {backend!r} was removed: {_REMOVED_BACKENDS[backend]}; "
+            f"supported backends: {', '.join(SUPPORTED_BACKENDS)}"
+        )
+    return f"unsupported backend {backend!r}; supported backends: {', '.join(SUPPORTED_BACKENDS)}"
+
+
+def _reject_removed_keys(data: dict[str, object]) -> None:
+    found: list[str] = []
+    for (section_path, key), migration in _REMOVED_KEYS.items():
+        current: object = data
+        for part in section_path.split("."):
+            current = current.get(part) if isinstance(current, dict) else None
+        if isinstance(current, dict) and key in current:
+            found.append(f"[{section_path}].{key} was removed: {migration}")
+    gates = data.get("gates")
+    if isinstance(gates, dict) and not gates:
+        found.append("[gates] was removed: gates run once; delete the section")
+    if found:
+        raise ValueError("unsupported configuration: " + "; ".join(found))
+
+
 def _require(section: dict[str, object], key: str, section_name: str) -> object:
     if key not in section:
         raise ValueError(f"Missing required field '{key}' in [{section_name}]")
@@ -52,18 +114,91 @@ def _require(section: dict[str, object], key: str, section_name: str) -> object:
 
 def _require_int(section: dict[str, object], key: str, section_name: str) -> int:
     val = _require(section, key, section_name)
-    if not isinstance(val, int):
+    if not isinstance(val, int) or isinstance(val, bool):
         raise TypeError(f"[{section_name}].{key} must be an integer, got {type(val).__name__}")
     return val
 
 
-def _require_float(section: dict[str, object], key: str, section_name: str) -> float:
-    val = _require(section, key, section_name)
-    if isinstance(val, int):
-        return float(val)
-    if not isinstance(val, float):
-        raise TypeError(f"[{section_name}].{key} must be a number, got {type(val).__name__}")
+def _require_count(section: dict[str, object], key: str, section_name: str, minimum: int) -> int:
+    val = _require_int(section, key, section_name)
+    if val < minimum:
+        raise ValueError(f"[{section_name}].{key} must be at least {minimum}, got {val}")
     return val
+
+
+def _require_decimal(section: dict[str, object], key: str, section_name: str) -> Decimal:
+    """Return an exact finite nonnegative number (TOML floats are parsed as Decimal)."""
+    val = _require(section, key, section_name)
+    if isinstance(val, bool) or not isinstance(val, (int, Decimal)):
+        raise TypeError(f"[{section_name}].{key} must be a number, got {type(val).__name__}")
+    number = Decimal(val)
+    if not number.is_finite() or number < 0:
+        raise ValueError(f"[{section_name}].{key} must be a finite nonnegative number")
+    return number
+
+
+HOUR = timedelta(hours=1)
+MINUTE = timedelta(minutes=1)
+_MICROSECOND = timedelta(microseconds=1)
+
+
+def delay(value: Decimal, unit: timedelta) -> timedelta:
+    """`value` units of `unit` as an exact timedelta (truncated to whole microseconds).
+
+    A delay is added to the ledger's UTC clock, so it must keep that deadline
+    representable: the latest representable UTC instant (`datetime.max`,
+    year 9999) bounds it from the current time. The exact microsecond count
+    is checked against that bound before it becomes an integer, so a huge
+    exponent is refused at once instead of being expanded first.
+
+    Raises:
+        ValueError: If the delay or a deadline that far from now cannot be
+            represented.
+    """
+    now = datetime.now(tz=UTC)
+    latest = (datetime.max.replace(tzinfo=UTC) - now) // _MICROSECOND
+    beyond = (
+        f"{value} x {unit} puts a deadline beyond the latest representable time "
+        f"({datetime.max.year})"
+    )
+    try:
+        microseconds = value * (unit // _MICROSECOND)
+    except Overflow as exc:
+        raise ValueError(beyond) from exc
+    if microseconds > latest:
+        raise ValueError(beyond)
+    return timedelta(microseconds=int(microseconds))
+
+
+def _require_delay(
+    section: dict[str, object], key: str, section_name: str, unit: timedelta
+) -> Decimal:
+    number = _require_decimal(section, key, section_name)
+    try:
+        delay(number, unit)
+    except ValueError as exc:
+        raise ValueError(f"[{section_name}].{key} is too large: {exc}") from exc
+    return number
+
+
+def _require_usd(section: dict[str, object], key: str, section_name: str) -> Decimal:
+    usd = _require_decimal(section, key, section_name)
+    try:
+        nanodollars = usd * _NANODOLLARS_PER_USD
+    except Overflow as exc:
+        raise ValueError(
+            f"[{section_name}].{key} is too large to be counted in nanodollars: {usd}"
+        ) from exc
+    if nanodollars != nanodollars.to_integral_value():
+        raise ValueError(f"[{section_name}].{key} must be a whole number of nanodollars")
+    return usd
+
+
+def _require_percentage(section: dict[str, object], key: str, section_name: str) -> Decimal:
+    pct = _require_decimal(section, key, section_name)
+    if pct > 100:
+        raise ValueError(f"[{section_name}].{key} must be at most 100, got {pct}")
+    return pct
 
 
 def _require_str(section: dict[str, object], key: str, section_name: str) -> str:
@@ -99,14 +234,13 @@ def _get_section(data: dict[str, object], *keys: str) -> dict[str, object]:
 @dataclass(frozen=True)
 class GlobalBudgetConfig:
     monthly_token_ceiling: int
-    monthly_cost_ceiling_usd: float
+    monthly_cost_ceiling_usd: Decimal
 
 
 @dataclass(frozen=True)
 class CycleBudgetConfig:
     max_tokens_per_cycle: int
-    max_cost_per_cycle_usd: float
-    max_algorithms_per_cycle: int
+    max_cost_per_cycle_usd: Decimal
 
 
 @dataclass(frozen=True)
@@ -117,9 +251,8 @@ class StageBudgetConfig:
 @dataclass(frozen=True)
 class AgentBudgetConfig:
     max_tokens_per_agent_call: int
-    implementation_budget_pct: int
-    tool_agent_budget_pct: int
-    review_budget_pct: int
+    implementation_budget_pct: Decimal
+    tool_agent_budget_pct: Decimal
 
 
 @dataclass(frozen=True)
@@ -135,31 +268,32 @@ class RateLimitsConfig:
     max_prs_per_day: int
     max_prs_per_week: int
     max_concurrent_items: int
-    cooldown_hours: int
+    cooldown_hours: Decimal
     max_files_per_pr: int
     max_lines_per_pr: int
 
 
 @dataclass(frozen=True)
-class GatesConfig:
-    max_lint_retries: int
-    max_correctness_retries: int
-    max_review_rounds: int
-
-
-@dataclass(frozen=True)
 class CircuitBreakerConfig:
     failure_threshold: int
-    half_open_probe_after_minutes: int
+    half_open_probe_after_minutes: Decimal
     max_open_cycles_before_manual_reset: int
 
 
 @dataclass(frozen=True)
 class ProviderConfig:
+    """Model route: backend, model and the accounting profile qualifying them.
+
+    `accounting_profile_path` is the absolute path of the version-1 accounting
+    profile (relative values resolve against the config file's directory), or
+    "" when none is configured, in which case every model call is denied
+    before any request.
+    """
+
     backend: str
     model: str
-    fallback_model: str
     local_api_base: str
+    accounting_profile_path: str
 
 
 @dataclass(frozen=True)
@@ -168,8 +302,6 @@ class ObservabilityConfig:
     log_format: str
     log_path: str
     metrics_enabled: bool
-    alert_on_circuit_open: bool
-    alert_webhook: str
 
 
 @dataclass(frozen=True)
@@ -181,15 +313,12 @@ class TemplatesConfig:
 @dataclass(frozen=True)
 class AgentsConfig:
     max_implementation_retries: int
-    max_review_rounds: int
-    max_tool_agent_retries: int
 
 
 @dataclass(frozen=True)
 class ApprenticeConfig:
     budget: BudgetConfig
     rate_limits: RateLimitsConfig
-    gates: GatesConfig
     agents: AgentsConfig
     circuit_breaker: CircuitBreakerConfig
     provider: ProviderConfig
@@ -204,85 +333,87 @@ def _parse_budget(data: dict[str, object]) -> BudgetConfig:
     stage_raw = _get_section(raw, "stage")
 
     global_budget = GlobalBudgetConfig(
-        monthly_token_ceiling=_require_int(global_raw, "monthly_token_ceiling", "budget.global"),
-        monthly_cost_ceiling_usd=_require_float(
+        monthly_token_ceiling=_require_count(
+            global_raw, "monthly_token_ceiling", "budget.global", 0
+        ),
+        monthly_cost_ceiling_usd=_require_usd(
             global_raw, "monthly_cost_ceiling_usd", "budget.global"
         ),
     )
     cycle = CycleBudgetConfig(
-        max_tokens_per_cycle=_require_int(cycle_raw, "max_tokens_per_cycle", "budget.cycle"),
-        max_cost_per_cycle_usd=_require_float(cycle_raw, "max_cost_per_cycle_usd", "budget.cycle"),
-        max_algorithms_per_cycle=_require_int(
-            cycle_raw, "max_algorithms_per_cycle", "budget.cycle"
-        ),
+        max_tokens_per_cycle=_require_count(cycle_raw, "max_tokens_per_cycle", "budget.cycle", 0),
+        max_cost_per_cycle_usd=_require_usd(cycle_raw, "max_cost_per_cycle_usd", "budget.cycle"),
     )
     stage = StageBudgetConfig(
-        max_tokens_per_stage=_require_int(stage_raw, "max_tokens_per_stage", "budget.stage"),
+        max_tokens_per_stage=_require_count(stage_raw, "max_tokens_per_stage", "budget.stage", 0),
     )
     agent_raw = _get_section(raw, "agent")
     agent = AgentBudgetConfig(
-        max_tokens_per_agent_call=_require_int(
-            agent_raw, "max_tokens_per_agent_call", "budget.agent"
+        max_tokens_per_agent_call=_require_count(
+            agent_raw, "max_tokens_per_agent_call", "budget.agent", 0
         ),
-        implementation_budget_pct=_require_int(
+        implementation_budget_pct=_require_percentage(
             agent_raw, "implementation_budget_pct", "budget.agent"
         ),
-        tool_agent_budget_pct=_require_int(agent_raw, "tool_agent_budget_pct", "budget.agent"),
-        review_budget_pct=_require_int(agent_raw, "review_budget_pct", "budget.agent"),
+        tool_agent_budget_pct=_require_percentage(
+            agent_raw, "tool_agent_budget_pct", "budget.agent"
+        ),
     )
+    allocated = agent.implementation_budget_pct + 3 * agent.tool_agent_budget_pct
+    if allocated > 100:
+        raise ValueError(
+            "[budget.agent] implementation_budget_pct plus three tool_agent_budget_pct "
+            f"allocations must not exceed 100, got {allocated}"
+        )
     return BudgetConfig(global_budget=global_budget, cycle=cycle, stage=stage, agent=agent)
 
 
 def _parse_rate_limits(data: dict[str, object]) -> RateLimitsConfig:
     raw = _get_section(data, "rate_limits")
     return RateLimitsConfig(
-        max_prs_per_day=_require_int(raw, "max_prs_per_day", "rate_limits"),
-        max_prs_per_week=_require_int(raw, "max_prs_per_week", "rate_limits"),
-        max_concurrent_items=_require_int(raw, "max_concurrent_items", "rate_limits"),
-        cooldown_hours=_require_int(raw, "cooldown_hours", "rate_limits"),
-        max_files_per_pr=_require_int(raw, "max_files_per_pr", "rate_limits"),
-        max_lines_per_pr=_require_int(raw, "max_lines_per_pr", "rate_limits"),
-    )
-
-
-def _parse_gates(data: dict[str, object]) -> GatesConfig:
-    raw = _get_section(data, "gates")
-    return GatesConfig(
-        max_lint_retries=_require_int(raw, "max_lint_retries", "gates"),
-        max_correctness_retries=_require_int(raw, "max_correctness_retries", "gates"),
-        max_review_rounds=_require_int(raw, "max_review_rounds", "gates"),
+        max_prs_per_day=_require_count(raw, "max_prs_per_day", "rate_limits", 0),
+        max_prs_per_week=_require_count(raw, "max_prs_per_week", "rate_limits", 0),
+        max_concurrent_items=_require_count(raw, "max_concurrent_items", "rate_limits", 1),
+        cooldown_hours=_require_delay(raw, "cooldown_hours", "rate_limits", HOUR),
+        max_files_per_pr=_require_count(raw, "max_files_per_pr", "rate_limits", 0),
+        max_lines_per_pr=_require_count(raw, "max_lines_per_pr", "rate_limits", 0),
     )
 
 
 def _parse_agents(data: dict[str, object]) -> AgentsConfig:
     raw = _get_section(data, "agents")
     return AgentsConfig(
-        max_implementation_retries=_require_int(raw, "max_implementation_retries", "agents"),
-        max_review_rounds=_require_int(raw, "max_review_rounds", "agents"),
-        max_tool_agent_retries=_require_int(raw, "max_tool_agent_retries", "agents"),
+        max_implementation_retries=_require_count(raw, "max_implementation_retries", "agents", 1),
     )
 
 
 def _parse_circuit_breaker(data: dict[str, object]) -> CircuitBreakerConfig:
     raw = _get_section(data, "circuit_breaker")
     return CircuitBreakerConfig(
-        failure_threshold=_require_int(raw, "failure_threshold", "circuit_breaker"),
-        half_open_probe_after_minutes=_require_int(
-            raw, "half_open_probe_after_minutes", "circuit_breaker"
+        failure_threshold=_require_count(raw, "failure_threshold", "circuit_breaker", 1),
+        half_open_probe_after_minutes=_require_delay(
+            raw, "half_open_probe_after_minutes", "circuit_breaker", MINUTE
         ),
-        max_open_cycles_before_manual_reset=_require_int(
-            raw, "max_open_cycles_before_manual_reset", "circuit_breaker"
+        max_open_cycles_before_manual_reset=_require_count(
+            raw, "max_open_cycles_before_manual_reset", "circuit_breaker", 1
         ),
     )
 
 
-def _parse_provider(data: dict[str, object]) -> ProviderConfig:
+def _parse_provider(data: dict[str, object], config_dir: Path) -> ProviderConfig:
     raw = _get_section(data, "provider")
+    backend = _require_str(raw, "backend", "provider")
+    problem = backend_problem(backend)
+    if problem:
+        raise ValueError(f"[provider].backend: {problem}")
+    profile = _require_str(raw, "accounting_profile_path", "provider")
+    if profile:
+        profile = str((config_dir / Path(profile).expanduser()).absolute())
     return ProviderConfig(
-        backend=_require_str(raw, "backend", "provider"),
+        backend=backend,
         model=_require_str(raw, "model", "provider"),
-        fallback_model=_require_str(raw, "fallback_model", "provider"),
-        local_api_base=str(raw.get("local_api_base", "")),
+        local_api_base=_require_str(raw, "local_api_base", "provider"),
+        accounting_profile_path=profile,
     )
 
 
@@ -293,8 +424,6 @@ def _parse_observability(data: dict[str, object]) -> ObservabilityConfig:
         log_format=_require_str(raw, "log_format", "observability"),
         log_path=_require_str(raw, "log_path", "observability"),
         metrics_enabled=_require_bool(raw, "metrics_enabled", "observability"),
-        alert_on_circuit_open=_require_bool(raw, "alert_on_circuit_open", "observability"),
-        alert_webhook=_require_str(raw, "alert_webhook", "observability"),
     )
 
 
@@ -309,26 +438,29 @@ def _parse_templates(data: dict[str, object]) -> TemplatesConfig:
 def load_config(path: Path | None = None) -> ApprenticeConfig:
     """Load and validate config from a TOML file.
 
-    Defaults to config/apprentice.toml relative to the project root.
-    Raises ValueError on missing required fields, TypeError on wrong types,
-    KeyError on unresolved required environment variables.
+    Defaults to config/apprentice.toml relative to the project root. Numbers
+    are exact (TOML floats parse as Decimal). Only pure parsing happens here:
+    nothing is created on disk.
+    Raises ValueError on missing required fields, removed keys or backends and
+    out-of-range limits, TypeError on wrong types, KeyError on unresolved
+    required environment variables.
     """
     config_path = path if path is not None else _DEFAULT_CONFIG_PATH
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
     with config_path.open("rb") as f:
-        raw: dict[str, object] = tomllib.load(f)
+        raw: dict[str, object] = tomllib.load(f, parse_float=Decimal)
 
     data = _interpolate_dict(raw)
+    _reject_removed_keys(data)
 
     return ApprenticeConfig(
         budget=_parse_budget(data),
         rate_limits=_parse_rate_limits(data),
-        gates=_parse_gates(data),
         agents=_parse_agents(data),
         circuit_breaker=_parse_circuit_breaker(data),
-        provider=_parse_provider(data),
+        provider=_parse_provider(data, config_path.absolute().parent),
         observability=_parse_observability(data),
         templates=_parse_templates(data),
     )

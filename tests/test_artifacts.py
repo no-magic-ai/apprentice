@@ -24,7 +24,7 @@ from apprentice.core.artifacts import (
     seal_bundle,
     write_role,
 )
-from tests.conftest import OfflineFixtureLlm, fixture_outputs
+from tests.conftest import fixture_outputs
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -301,12 +301,24 @@ class _CallbackContext:
         self.state = state
 
 
-class TestOwnedRootCallbacks:
-    """The drafter and review callbacks write only into the run's own root.
+async def _run_agent(agent: Any, state: dict[str, Any]) -> dict[str, Any]:
+    from google.adk.runners import Runner
+    from google.adk.sessions import InMemorySessionService
+    from google.genai import types
 
-    Budget wiring replaces these callbacks on the assembled pipeline, so they
-    are exercised directly here.
-    """
+    service = InMemorySessionService()  # type: ignore[no-untyped-call]
+    runner = Runner(agent=agent, app_name="t", session_service=service)
+    session = await service.create_session(app_name="t", user_id="u", state=state)
+    message = types.Content(role="user", parts=[types.Part(text="Review the artifacts.")])
+    async for _ in runner.run_async(user_id="u", session_id=session.id, new_message=message):
+        pass
+    stored = await service.get_session(app_name="t", user_id="u", session_id=session.id)
+    assert stored is not None
+    return dict(stored.state)
+
+
+class TestOwnedRootCallbacks:
+    """The drafter callback and the programmatic reviewer write only into the run's own root."""
 
     @pytest.fixture
     def shared_temp(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -328,25 +340,18 @@ class TestOwnedRootCallbacks:
         assert context.state["validation_feedback"] == ""
         assert list(shared_temp.iterdir()) == []
 
-    def test_review_callback_validates_in_the_run_root(
-        self, scope: RunScope, shared_temp: Path
-    ) -> None:
+    def test_review_validates_in_the_run_root(self, scope: RunScope, shared_temp: Path) -> None:
         outputs = fixture_outputs()
-        context = _CallbackContext(
-            {
-                "generated_code": outputs["drafter"],
-                "instrumented_code": outputs["instrumentation"],
-                "manim_scene_code": outputs["visualization"],
-                "anki_deck_content": outputs["assessment"],
-            }
-        )
-        agent = build_review_agent(
-            OfflineFixtureLlm(model="offline-fixture"), scope.work_root, scope.algorithm
-        )
+        state = {
+            "generated_code": outputs["drafter"],
+            "instrumented_code": outputs["instrumentation"],
+            "manim_scene_code": outputs["visualization"],
+            "anki_deck_content": outputs["assessment"],
+        }
 
-        anyio.run(agent.before_agent_callback, context)  # type: ignore[arg-type]
+        final = anyio.run(_run_agent, build_review_agent(scope.work_root, scope.algorithm), state)
 
-        assert context.state["review_verdict"] == "passed"
+        assert final["review_verdict"] == "passed"
         assert sorted(p.name for p in scope.work_root.iterdir()) == [
             "cards.csv",
             "implementation.py",
