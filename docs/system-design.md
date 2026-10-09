@@ -431,7 +431,7 @@ lint_tool = FunctionTool(func=lint_validate)
 
 ## 7. Containment System
 
-**Current implementation.** Budgets are enforced as described in 7.1. Correctness validation runs generated code with `subprocess.run` and a 5-second timeout after every draft and in the correctness gate, which is not a sandbox. Rate limits, cooldown, PR-size limits and the circuit breaker are parsed configuration that no code enforces yet (`core/circuit_breaker.py`, `core/queue.py` and `core/scheduler.py` are empty modules). None of this is certified containment.
+**Current implementation.** Budgets are enforced as described in 7.1. Correctness validation runs generated code with `subprocess.run` and a 5-second timeout after every draft and in the correctness gate, which is not a sandbox. Concurrent items, cooldown, rolling PR windows, per-PR file/text-line limits and the automated-work circuit are enforced by the same ledger at cycle admission and before a submission's first remote write ([Configuration](configuration.md#rate_limits)). `core/queue.py` and `core/scheduler.py` are empty modules. None of this is certified containment, and older or foreign binaries can bypass application guards.
 
 ### 7.1 Budget Enforcement (reserve, dispatch, settle)
 
@@ -447,27 +447,28 @@ Tokens are input plus all output (cached and reasoning tokens are subsets). USD 
 
 ### 7.2 Rate Limiting
 
-| Limit | Default | Configurable |
+| Limit | Default | Enforced at |
 |---|---|---|
-| Max PRs per day | 2 | Yes |
-| Max PRs per week | 5 | Yes |
-| Max algorithms per cycle | 3 | Yes |
-| Max concurrent work items | 1 | Yes |
-| Cooldown between cycles | 4 hours | Yes |
-| Max implementation loop iterations | 3 | No (hard cap) |
-| Max review loop iterations | 2 | No (hard cap) |
+| Max PRs per day / week (`rate_limits.max_prs_per_day`/`_week`) | 2 / 5 | submit cycle admission: one slot per repository PR, rolling 24h/168h |
+| Max files / text lines per PR | 10 / 2000 | final admission before the first push, from the prepared commits |
+| Max concurrent work items | 1 | every cycle admission (build, retry, suggest, library, submit) |
+| Cooldown between cycles | 4 hours | every cycle admission, from the latest admission |
+| Implementation attempts (`agents.max_implementation_retries`) | 3 | `LoopAgent` iterations, including the first |
 
 ### 7.3 Circuit Breaker
 
 ```mermaid
 stateDiagram-v2
     [*] --> Closed: System healthy
-    Closed --> Open: 3 consecutive shelved work items<br/>OR cycle budget exceeded
-    Open --> HalfOpen: Cooldown elapsed
-    HalfOpen --> Closed: Next work item completes
-    HalfOpen --> Open: Next work item fails
-    Open --> [*]: Manual reset required
+    Closed --> Open: failure_threshold consecutive failed cycles
+    Open --> HalfOpen: deadline passed, one probe cycle admitted
+    HalfOpen --> Closed: probe cycle completes
+    HalfOpen --> Open: probe cycle fails
+    HalfOpen --> Latched: max consecutive opens reached
+    Latched --> Closed: controls reset-circuit
 ```
+
+Failed cycles (post-dispatch transport/usage errors, blocking quality failures, owner loss, other infrastructure errors, publication transport failures) count once; completed cycles reset the count; limit/config/price/approval denials and cancellation are neutral.
 
 ### 7.4 Input Sanitization
 
@@ -534,7 +535,7 @@ apprentice config                                       # Display apprentice.tom
 apprentice dev [--port N]                               # ADK dev UI
 ```
 
-`build --from-issue` and `reset-circuit` are not implemented.
+`build --from-issue` is not implemented. `apprentice controls reset-circuit|prepare-rollback --operator NAME` are the operator actions on the circuit and rollback continuity.
 
 ---
 
@@ -692,7 +693,6 @@ no-magic-ai/apprentice/
 │       │   ├── cycles.py             # Controlled, metered work cycles
 │       │   ├── budget.py             # Gate verdicts + ledger reference of a run
 │       │   ├── queue.py              # Work item management (empty placeholder)
-│       │   ├── circuit_breaker.py    # Failure containment (empty placeholder)
 │       │   ├── scheduler.py          # Autonomous cycle scheduling (empty placeholder)
 │       │   └── observability.py      # Structured logging, metrics
 │       ├── agents/
@@ -709,7 +709,7 @@ no-magic-ai/apprentice/
 │       │   ├── correctness.py        # → FunctionTool
 │       │   ├── consistency.py        # → FunctionTool
 │       │   └── schema_compliance.py  # → FunctionTool
-│       ├── controls/                 # Installation ledger, leases, policy, footprint
+│       ├── controls/                 # Ledger, leases, policy, footprint, limits, publication
 │       ├── metering/                 # Price authority, accounting profiles, metered client
 │       ├── providers/
 │       │   └── factory.py            # Qualified route resolution and binding

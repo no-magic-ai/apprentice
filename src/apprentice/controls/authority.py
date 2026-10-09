@@ -30,9 +30,10 @@ import stat
 import uuid
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
+from apprentice.controls import limits, publication
 from apprentice.controls.errors import AuthorityError, ControlDeniedError
 from apprentice.controls.footprint import Footprint, scan_records
 from apprentice.controls.policy import ControlPolicy
@@ -42,11 +43,13 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 CONTROLS_DIR = "controls"
 MARKER = "authority.id"
 DATABASE = "accounting.sqlite3"
 LEASES = "leases"
+# How long one ledger decision waits for another process's transaction.
+BUSY_TIMEOUT_SECONDS = 60
 
 ACTIVE = "active"
 TERMINAL = "terminal"
@@ -117,11 +120,11 @@ RELEASED = "released"
 _CONTINUITY = frozenset({"continuous", "suspended"})
 
 
-def _expected_columns() -> dict[str, list[tuple[str, str, int]]]:
-    """Column (name, type, not-null) lists of every table this schema version defines."""
+def _expected_columns(script: str) -> dict[str, list[tuple[str, str, int]]]:
+    """Column (name, type, not-null) lists of every table `script` defines."""
     probe = sqlite3.connect(":memory:")
     try:
-        probe.executescript(_SCHEMA)
+        probe.executescript(script)
         tables = [
             r[0] for r in probe.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         ]
@@ -133,7 +136,12 @@ def _expected_columns() -> dict[str, list[tuple[str, str, int]]]:
         probe.close()
 
 
-_COLUMNS = _expected_columns()
+# Schema 1 (written by earlier versions, migrated in place) and schema 2.
+_COLUMNS = {
+    1: _expected_columns(_SCHEMA),
+    2: _expected_columns(_SCHEMA + publication.HISTORICAL_SCHEMA_V2),
+    SCHEMA_VERSION: _expected_columns(_SCHEMA + publication.SCHEMA_V3),
+}
 
 
 def _meta_value(conn: sqlite3.Connection, key: str) -> str:
@@ -173,18 +181,31 @@ def _stored_policy(conn: sqlite3.Connection) -> ControlPolicy | None:
         ) from exc
 
 
-def _validate_ledger(conn: sqlite3.Connection) -> None:
-    """Require the exact supported structure and readable required metadata.
+def _validate_ledger(conn: sqlite3.Connection, version: int) -> None:
+    """Require the exact structure and readable required metadata of schema `version`.
+
+    Schemas 2 and 3 additionally require the circuit, cooldown and window metadata.
 
     Raises:
-        AuthorityError: On page corruption, a missing or altered table or
-            column, or missing/garbled required metadata. Nothing is repaired.
+        AuthorityError: On page corruption, a missing, extra or altered table
+            or column, or missing/garbled required metadata. Nothing is repaired.
     """
+    columns = _COLUMNS[version]
     (check,) = conn.execute("PRAGMA quick_check").fetchone()
     if check != "ok":
         raise AuthorityError(f"control ledger is damaged: integrity check reports {check!r}")
-    present = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-    for table, expected in _COLUMNS.items():
+    present = {
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        )
+    }
+    unexpected = sorted(present - set(columns))
+    if unexpected:
+        raise AuthorityError(
+            f"control ledger is damaged: schema {version} has no table(s) {unexpected}"
+        )
+    for table, expected in columns.items():
         if table not in present:
             raise AuthorityError(f"control ledger is damaged: table {table!r} is missing")
         actual = [(c[1], c[2], c[3]) for c in conn.execute(f"PRAGMA table_info({table})")]
@@ -202,6 +223,38 @@ def _validate_ledger(conn: sqlite3.Connection) -> None:
     if not isinstance(footprint, list) or not all(isinstance(p, str) for p in footprint):
         raise AuthorityError("control ledger is damaged: the footprint is not a list of paths")
     _stored_policy(conn)
+    if version >= 2:
+        if continuity == "suspended":
+            _suspension(conn)
+        limits.validate_meta(conn)
+
+
+def _require_undamaged(conn: sqlite3.Connection, database: Path, version: int) -> None:
+    """`_validate_ledger`, naming the remedy for real damage: restore from backup."""
+    try:
+        _validate_ledger(conn, version)
+    except AuthorityError as exc:
+        raise AuthorityError(f"{exc} ({database}); restore it from backup") from exc
+
+
+def _suspension(conn: sqlite3.Connection) -> dict[str, str]:
+    """The first rollback suspension (operator and instant) of a suspended ledger."""
+    try:
+        suspended = json.loads(_meta_value(conn, "suspended"))
+        record = {"by": str(suspended["by"]), "at": suspended["at"]}
+        moment = datetime.fromisoformat(record["at"])
+    except (ValueError, KeyError, TypeError) as exc:
+        raise AuthorityError(
+            f"control ledger is damaged: the suspension is unreadable: {exc}"
+        ) from exc
+    if moment.tzinfo is None:
+        raise AuthorityError("control ledger is damaged: the suspension instant has no timezone")
+    return record
+
+
+def utc_now() -> datetime:
+    """The UTC clock every ledger decision reads (once per transaction)."""
+    return datetime.now(tz=UTC)
 
 
 def utc_month(moment: datetime) -> str:
@@ -272,34 +325,66 @@ class Authority:
                     f"control authority marker {marker} is unreadable: {exc}"
                 ) from exc
             try:
-                conn = sqlite3.connect(database, isolation_level=None, timeout=60)
+                conn = sqlite3.connect(database, isolation_level=None, timeout=BUSY_TIMEOUT_SECONDS)
             except sqlite3.DatabaseError as exc:
                 raise AuthorityError(f"control ledger {database} cannot be opened: {exc}") from exc
             try:
-                conn.execute("PRAGMA foreign_keys = ON")
-                conn.execute("PRAGMA synchronous = FULL")
-                meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+                cls._check_and_upgrade(conn, database, authority_id, store)
             except sqlite3.DatabaseError as exc:
                 conn.close()
                 raise AuthorityError(f"control ledger {database} is unreadable: {exc}") from exc
-            if meta.get("schema_version") != str(SCHEMA_VERSION):
+            except AuthorityError:
                 conn.close()
-                raise AuthorityError(
-                    f"control ledger {database} has unsupported schema "
-                    f"{meta.get('schema_version')!r}; this version reads {SCHEMA_VERSION}"
-                )
-            if meta.get("authority_id") != authority_id:
-                conn.close()
-                raise AuthorityError(f"control ledger {database} belongs to another authority")
-            try:
-                _validate_ledger(conn)
-            except sqlite3.DatabaseError as exc:
-                conn.close()
-                raise AuthorityError(f"control ledger {database} is unreadable: {exc}") from exc
-            except AuthorityError as exc:
-                conn.close()
-                raise AuthorityError(f"{exc} ({database}); restore it from backup") from exc
+                raise
             return cls(store, conn, authority_id)
+
+    @classmethod
+    def _check_and_upgrade(
+        cls, conn: sqlite3.Connection, database: Path, authority_id: str, store: Path
+    ) -> None:
+        """Validate the ledger as the schema it is; migrate a valid schema-1 or -2 ledger to 3.
+
+        Each supported version has one exact structure: 1 (the control
+        authority without publication state), 2 (publication state with
+        run-level `known_submissions`) and 3 (submission-identity
+        `known_submissions`). An older ledger is validated as its own version
+        first, migrated in one transaction that keeps every row, then
+        validated as the current version.
+
+        Raises:
+            AuthorityError: On a foreign, unsupported or damaged ledger, or a
+                failed migration (which leaves the ledger at its version).
+        """
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA synchronous = FULL")
+        meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+        found = meta.get("schema_version")
+        if found not in {str(v) for v in _COLUMNS}:
+            raise AuthorityError(
+                f"control ledger {database} has unsupported schema {found!r}; this version "
+                f"reads 1 and 2 (migrated) and {SCHEMA_VERSION}"
+            )
+        if meta.get("authority_id") != authority_id:
+            raise AuthorityError(f"control ledger {database} belongs to another authority")
+        version = int(found)
+        if version != SCHEMA_VERSION:
+            _require_undamaged(conn, database, version)
+            try:
+                if version == 1:
+                    cls._migrate_v1(conn)
+                else:
+                    cls._migrate_v2(conn, store)
+            except sqlite3.DatabaseError as exc:
+                # A valid ledger whose upgrade could not complete (read-only
+                # file, a lock held by another process, an I/O fault): the
+                # transaction rolled back and every row is as it was.
+                raise AuthorityError(
+                    f"upgrading control ledger {database} to schema {SCHEMA_VERSION} did not "
+                    f"complete: {exc}; it was rolled back and is unchanged (still schema "
+                    f"{version}) — nothing needs restoring; clear the cause (file permissions, "
+                    "another apprentice process using the ledger) and run the command again"
+                ) from exc
+        _require_undamaged(conn, database, SCHEMA_VERSION)
 
     @classmethod
     def ensure_installation(cls, store_dir: Path, footprint: Footprint) -> None:
@@ -347,9 +432,58 @@ class Authority:
         finally:
             os.close(guard)
 
+    @staticmethod
+    def _migrate_v1(conn: sqlite3.Connection) -> None:
+        """Add the publication and circuit state of schema 2 to a schema-1 ledger.
+
+        One transaction: every schema-1 row is kept as it is, nothing is
+        credited or reset. Any failure (including the commit) rolls back
+        and propagates the original error.
+        """
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for statement in publication.SCHEMA_V3.split(";"):
+                if statement.strip():
+                    conn.execute(statement)
+            conn.executemany("INSERT INTO meta VALUES (?, ?)", limits.CIRCUIT_DEFAULTS.items())
+            conn.execute(
+                "UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(SCHEMA_VERSION),)
+            )
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                with suppress(sqlite3.Error):
+                    conn.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def _migrate_v2(conn: sqlite3.Connection, store: Path) -> None:
+        """Turn schema-2 run-level `known_submissions` rows into schema-3 identities.
+
+        One transaction: every other table and value is kept as it is, every
+        schema-2 row is carried over (`publication.migrate_known_submissions_v2`),
+        nothing is credited or reset. Any failure rolls back and propagates.
+        """
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            exposures = scan_records(store, utc_now())
+            conn.execute("ALTER TABLE known_submissions RENAME TO known_submissions_v2")
+            conn.execute(publication.KNOWN_SUBMISSIONS_V3)
+            publication.migrate_known_submissions_v2(conn, exposures)
+            conn.execute("DROP TABLE known_submissions_v2")
+            conn.execute(
+                "UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(SCHEMA_VERSION),)
+            )
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                with suppress(sqlite3.Error):
+                    conn.execute("ROLLBACK")
+            raise
+
     @classmethod
     def _bootstrap(cls, store: Path, controls: Path, footprint: Footprint) -> None:
-        now = datetime.now(tz=UTC)
+        now = utc_now()
         authority_id = uuid.uuid4().hex
         staging = controls / f".{DATABASE}.{authority_id}.tmp"
         try:
@@ -369,7 +503,7 @@ class Authority:
     ) -> None:
         conn = sqlite3.connect(staging, isolation_level=None)
         try:
-            conn.executescript(_SCHEMA)
+            conn.executescript(_SCHEMA + publication.SCHEMA_V3)
             conn.execute("BEGIN IMMEDIATE")
             meta = {
                 "schema_version": str(SCHEMA_VERSION),
@@ -380,6 +514,7 @@ class Authority:
                 "footprint": json.dumps(list(footprint.existing)),
             }
             conn.executemany("INSERT INTO meta VALUES (?, ?)", meta.items())
+            conn.executemany("INSERT INTO meta VALUES (?, ?)", limits.CIRCUIT_DEFAULTS.items())
             if not footprint.empty:
                 conn.execute(
                     "INSERT INTO unknown_months VALUES (?, ?, ?)",
@@ -390,11 +525,13 @@ class Authority:
                         now.isoformat(),
                     ),
                 )
-                for exposure in scan_records(store, now):
+                exposures = scan_records(store, now)
+                for exposure in exposures:
                     conn.execute(
                         "INSERT INTO known_records VALUES (?, 'legacy', ?, ?, NULL, NULL)",
                         (exposure.run_id, int(exposure.live), now.isoformat()),
                     )
+                publication.register_exposures(conn, now, exposures)
             conn.execute("COMMIT")
         finally:
             conn.close()
@@ -411,7 +548,7 @@ class Authority:
         except sqlite3.DatabaseError as exc:
             raise AuthorityError(f"control ledger is unavailable: {exc}") from exc
         try:
-            now = datetime.now(tz=UTC)
+            now = utc_now()
             last = _meta_instant(conn, "last_clock").isoformat()
             if now < datetime.fromisoformat(last):
                 raise AuthorityError(
@@ -472,11 +609,24 @@ class Authority:
             "updated_at = ? WHERE cycle_id = ? AND state = ?",
             (RELEASED, now.isoformat(), cycle_id, RESERVED),
         )
+        row = conn.execute(
+            "SELECT policy FROM cycles WHERE cycle_id = ? AND state = ?", (cycle_id, ACTIVE)
+        ).fetchone()
+        if row is None:
+            return
         conn.execute(
             "UPDATE cycles SET state = ?, outcome = ?, detail = ?, finished_at = ? "
-            "WHERE cycle_id = ? AND state = ?",
-            (TERMINAL, outcome, detail, now.isoformat(), cycle_id, ACTIVE),
+            "WHERE cycle_id = ?",
+            (TERMINAL, outcome, detail, now.isoformat(), cycle_id),
         )
+        try:
+            policy = ControlPolicy.from_json(row[0])
+        except (ValueError, KeyError, TypeError, ArithmeticError) as exc:
+            raise AuthorityError(
+                f"control ledger is damaged: the policy of cycle {cycle_id} is unreadable: {exc}"
+            ) from exc
+        publication.settle_on_terminal(conn, now, cycle_id, outcome)
+        limits.record_outcome(conn, now, cycle_id, outcome, policy)
 
     def _acquire_slot(self, conn: sqlite3.Connection) -> tuple[int, int]:
         used = {
@@ -502,7 +652,9 @@ class Authority:
         known |= {
             row[0] for row in conn.execute("SELECT run_id FROM cycles WHERE run_id IS NOT NULL")
         }
-        for exposure in scan_records(self.store_dir, now):
+        exposures = scan_records(self.store_dir, now)
+        publication.register_exposures(conn, now, exposures)
+        for exposure in exposures:
             if exposure.run_id in known:
                 continue
             conn.execute(
@@ -557,8 +709,20 @@ class Authority:
 
     # -- cycles --------------------------------------------------------------
 
-    def begin_cycle(self, kind: str, policy: ControlPolicy, *, run_id: str | None = None) -> Cycle:
-        """Admit one controlled work cycle and take its lease.
+    def begin_cycle(
+        self,
+        kind: str,
+        policy: ControlPolicy,
+        *,
+        run_id: str | None = None,
+        publication_claim: tuple[str, tuple[str, ...]] | None = None,
+    ) -> Cycle:
+        """Admit one controlled work cycle (one item) and take its lease.
+
+        Concurrent items, cooldown and the circuit are checked in the same
+        transaction that records the admission. `publication_claim`
+        (manifest digest, repositories) additionally reserves one PR slot per
+        repository for a submit cycle of `run_id`.
 
         Raises:
             ControlDeniedError: If a control refuses the cycle (nothing is held).
@@ -571,17 +735,115 @@ class Authority:
                 self.recover(conn, now)
                 self.require_admissible(conn)
                 self.adopt_policy(conn, policy)
-                slot, fd = self._acquire_slot(conn)
+                limits.admit_items(conn, policy)
+                limits.admit_cooldown(conn, now, policy)
                 cycle_id = uuid.uuid4().hex
+                limits.admit_circuit(conn, now, cycle_id)
+                if publication_claim is not None:
+                    limits.admit_pr_slots(conn, now, policy, len(publication_claim[1]))
+                slot, fd = self._acquire_slot(conn)
                 conn.execute(
                     "INSERT INTO cycles VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)",
                     (cycle_id, kind, run_id, slot, now.isoformat(), policy.to_json(), ACTIVE),
                 )
+                attempt_id = None
+                if publication_claim is not None:
+                    if run_id is None:
+                        raise AuthorityError("a publication claim needs the run it publishes")
+                    attempt_id = publication.claim(
+                        conn, now, cycle_id, run_id, publication_claim[0], publication_claim[1]
+                    )
         except BaseException:
             if fd is not None:
                 os.close(fd)
             raise
-        return Cycle(self, cycle_id, kind, policy, run_id, fd)
+        return Cycle(self, cycle_id, kind, policy, run_id, fd, attempt_id, now)
+
+    def begin_writes(self, cycle: Cycle) -> None:
+        """Final admission immediately before the first remote write of `cycle`'s attempt."""
+        if cycle.publication_attempt is None:
+            raise AuthorityError(f"cycle {cycle.cycle_id} claimed no publication attempt")
+        with self.transaction() as (conn, now):
+            self.recover(conn, now)
+            cycle.require_live(conn)
+            publication.begin_writes(conn, now, cycle.cycle_id, cycle.publication_attempt)
+
+    def require_writing(self, cycle: Cycle, step: str) -> None:
+        """Before one remote step of a begun publication: the cycle must still own its attempt.
+
+        Checks the durable cycle row, the cycle's own lease (same inode as the
+        lease file) and that its attempt is still writing. The circuit is not
+        re-checked: an admitted publication finishes or fails on its own.
+
+        Raises:
+            AuthorityError: If the cycle, its lease or its attempt is no longer live.
+        """
+        if cycle.publication_attempt is None:
+            raise AuthorityError(f"cycle {cycle.cycle_id} claimed no publication attempt")
+        with self.transaction() as (conn, _now):
+            cycle.require_live(conn)
+            (slot,) = conn.execute(
+                "SELECT slot FROM cycles WHERE cycle_id = ?", (cycle.cycle_id,)
+            ).fetchone()
+            cycle.require_lease(self.controls / LEASES / f"{slot}.lock")
+            stored = publication.attempt(conn, cycle.publication_attempt)
+            if stored is None or stored["state"] != publication.WRITING:
+                raise AuthorityError(
+                    f"publication attempt {cycle.publication_attempt} is "
+                    f"{stored['state'] if stored else 'missing'}; {step} is not started"
+                )
+
+    def finish_publication(self, attempt_id: str, state: str, detail: str) -> dict[str, Any]:
+        with self.transaction() as (conn, now):
+            return publication.finish(conn, now, attempt_id, state, detail)
+
+    def publication_attempt(self, attempt_id: str) -> dict[str, Any] | None:
+        """The stored attempt after owner-loss recovery has been committed.
+
+        A cycle whose owner died is settled first, so a claimed attempt of a
+        killed process reads as ended (`NO_WRITE` without a write intent,
+        its slots released once) rather than as possibly still writing. An
+        attempt of a live owner is returned as it is.
+        """
+        with self.transaction() as (conn, now):
+            self.recover(conn, now)
+            return publication.attempt(conn, attempt_id)
+
+    def reset_circuit(self, operator: str) -> dict[str, str]:
+        """Close the circuit after investigation; refused while any cycle is live."""
+        self.refresh()
+        with self.transaction() as (conn, now):
+            self.recover(conn, now)
+            return limits.reset_circuit(conn, now, operator)
+
+    def prepare_rollback(self, operator: str) -> dict[str, str]:
+        """Suspend continuity before guarded code is removed; nothing is admitted until re-adoption.
+
+        Debits, holds, slots, receipts and records are kept. After a later
+        upgrade, `adopt_legacy` re-establishes continuity and holds the
+        unmetered interval as unknown.
+        """
+        self.refresh()
+        with self.transaction() as (conn, now):
+            self.recover(conn, now)
+            (live,) = conn.execute(
+                "SELECT COUNT(*) FROM cycles WHERE state = ?", (ACTIVE,)
+            ).fetchone()
+            if live:
+                raise ControlDeniedError("controls.prepare-rollback", f"{live} cycle(s) are live")
+            if _meta_value(conn, "continuity") == "suspended":
+                # Repeating it keeps the first suspension: the unmetered
+                # interval that re-adoption holds unknown starts there.
+                first = _suspension(conn)
+            else:
+                first = {"by": operator, "at": now.isoformat()}
+                conn.execute("UPDATE meta SET value = 'suspended' WHERE key = 'continuity'")
+                conn.execute("INSERT INTO meta VALUES ('suspended', ?)", (json.dumps(first),))
+        return {
+            "continuity": "suspended",
+            "suspended_by": first["by"],
+            "suspended_at": first["at"],
+        }
 
     def refresh(self) -> None:
         """Commit owner-loss recovery and newly found unreferenced records.
@@ -615,7 +877,33 @@ class Authority:
                 "UPDATE known_records SET live = 0, adopted_at = ?, adopted_by = ? WHERE live = 1",
                 (now.isoformat(), operator),
             )
-        return {"adopted_records": adopted, "adopted_by": operator, "adopted_at": now.isoformat()}
+            restored = self._restore_continuity(conn, now)
+            if adopted or restored:
+                # Earlier publication may have happened at any time up to now.
+                limits.fill_windows(conn, now)
+        return {
+            "adopted_records": adopted,
+            "continuity_restored": restored,
+            "adopted_by": operator,
+            "adopted_at": now.isoformat(),
+        }
+
+    @staticmethod
+    def _restore_continuity(conn: sqlite3.Connection, now: datetime) -> bool:
+        """End a rollback suspension: hold every month of the unmetered interval as unknown."""
+        if _meta_value(conn, "continuity") == "continuous":
+            return False
+        since = datetime.fromisoformat(_suspension(conn)["at"])
+        month = since.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        while utc_month(month) <= utc_month(now):
+            conn.execute(
+                "INSERT OR IGNORE INTO unknown_months VALUES (?, ?, ?)",
+                (utc_month(month), "unmetered interval after prepare-rollback", now.isoformat()),
+            )
+            month = (month + timedelta(days=32)).replace(day=1)
+        conn.execute("UPDATE meta SET value = 'continuous' WHERE key = 'continuity'")
+        conn.execute("DELETE FROM meta WHERE key = 'suspended'")
+        return True
 
     def status(self) -> dict[str, Any]:
         """Report ledger-derived state; configuration values are reported separately."""
@@ -630,10 +918,11 @@ class Authority:
         `profile_sha256` is the configured profile's digest, or None when no
         valid profile is configured; `policy` is the loaded configuration's
         policy. Blockers are continuity suspension, live legacy records, an
-        unknown current month, a quarantined profile and live cycles running
+        unknown current month, a quarantined profile, live cycles running
         under a different effective policy (the admission's `controls.policy`
-        refusal, checked without adopting anything); budgets and limits still
-        decide each individual call.
+        refusal, checked without adopting anything) and what would refuse a
+        new cycle under `policy` now (concurrent items, cooldown, circuit);
+        budgets still decide each individual call.
         """
         with self.transaction() as (conn, now):
             self.recover(conn, now)
@@ -666,6 +955,7 @@ class Authority:
                         "reason": f"{conflicting} live cycle(s) run under a different effective policy",
                     }
                 )
+            blocked.extend(limits.cycle_blockers(conn, now, policy))
             return {"month": utc_month(now), "blocked_by": blocked}
 
     def usage(self, run_ids: set[str] | None = None) -> LedgerUsage:
@@ -717,6 +1007,7 @@ class Authority:
 
     def describe(self, conn: sqlite3.Connection, now: datetime) -> dict[str, Any]:
         month = utc_month(now)
+        anchor = limits.cooldown_anchor(conn)
         policy = _stored_policy(conn)
         totals = conn.execute(
             "SELECT basis, state, COUNT(*), SUM(bound_tokens), SUM(bound_nanodollars), "
@@ -760,6 +1051,22 @@ class Authority:
             "legacy_records_awaiting_adoption": [
                 r[0] for r in conn.execute("SELECT run_id FROM known_records WHERE live = 1")
             ],
+            "circuit": {
+                "state": limits.get(conn, "circuit_state"),
+                "consecutive_failures": int(limits.get(conn, "circuit_failures")),
+                "consecutive_opens": int(limits.get(conn, "circuit_open_streak")),
+                "open_until": limits.get(conn, "circuit_open_until") or None,
+                "probe_cycle": limits.get(conn, "circuit_probe") or None,
+            },
+            "cooldown_anchor": anchor.isoformat() if anchor else None,
+            "pr_windows": limits.window_usage(conn, now),
+            "publication_attempts": [
+                {"attempt_id": a, "run_id": r, "state": st, "remote_write_intent": bool(w)}
+                for a, r, st, w in conn.execute(
+                    "SELECT attempt_id, run_id, state, remote_write_intent "
+                    "FROM publication_attempts ORDER BY claimed_at DESC LIMIT 20"
+                )
+            ],
         }
 
 
@@ -774,12 +1081,18 @@ class Cycle:
         policy: ControlPolicy,
         run_id: str | None,
         lease_fd: int,
+        publication_attempt: str | None,
+        admitted_at: datetime,
     ) -> None:
         self.authority = authority
         self.cycle_id = cycle_id
         self.kind = kind
         self.policy = policy
         self.run_id = run_id
+        self.publication_attempt = publication_attempt
+        # The ledger instant of admission (and of the publication claim):
+        # every later ledger decision reads a clock at least this late.
+        self.admitted_at = admitted_at
         self._lease_fd: int | None = lease_fd
 
     @property
@@ -792,6 +1105,18 @@ class Cycle:
         ).fetchone()
         if self._lease_fd is None or row is None or row[0] != ACTIVE:
             raise AuthorityError(f"cycle {self.cycle_id} is not live")
+
+    def require_lease(self, path: Path) -> None:
+        """The cycle still holds the lease file at `path` (same inode, not replaced)."""
+        if self._lease_fd is None:
+            raise AuthorityError(f"cycle {self.cycle_id} released its lease")
+        try:
+            current = os.stat(path)
+        except OSError as exc:
+            raise AuthorityError(f"lease of cycle {self.cycle_id} is gone: {exc}") from exc
+        held = os.fstat(self._lease_fd)
+        if (held.st_dev, held.st_ino) != (current.st_dev, current.st_ino):
+            raise AuthorityError(f"lease file of cycle {self.cycle_id} was replaced")
 
     def finish(self, outcome: str, detail: str = "") -> None:
         """Commit the terminal outcome, then release the lease.

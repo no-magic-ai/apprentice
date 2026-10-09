@@ -210,10 +210,14 @@ def fixture_outputs(
 class OfflineRemotes:
     """Local bare repositories standing in for the supported GitHub repositories.
 
-    `https://github.com/no-magic-ai/<repo>.git` is rewritten to these bare
-    repositories through an isolated GIT_CONFIG_GLOBAL, git may only use the
-    file transport (GIT_ALLOW_PROTOCOL=file), and `gh` on PATH is a recording
-    stand-in, so packaging runs real git without any remote effect.
+    The product's supported-URL map (`packaging._REPOSITORY_URLS`, the only
+    destination authority) is replaced in-process by these bare repositories'
+    file URLs — a declared test seam, not a claim of GitHub identity; child
+    interpreters apply the same map from OFFLINE_REPOSITORY_URLS through
+    `apply_offline_repository_urls`. Git config is isolated (no URL
+    rewrites), git may only use the file transport (GIT_ALLOW_PROTOCOL=file),
+    and `gh` on PATH is a recording stand-in, so packaging runs real git
+    without any remote effect.
     """
 
     bare: dict[str, Path]
@@ -332,8 +336,8 @@ with open({log!r}, encoding="utf-8") as handle:
 if os.environ.get("OFFLINE_GH_FAIL_ON") == str(number):
     sys.stderr.write("offline gh stand-in: configured failure\\n")
     sys.exit(1)
-repo = sys.argv[sys.argv.index("--repo") + 1]
-print(f"https://github.com/{{repo}}/pull/offline-{{number}}")
+host, _, repo = sys.argv[sys.argv.index("--repo") + 1].partition("/")
+print(f"https://{{host}}/{{repo}}/pull/offline-{{number}}")
 """
 
 
@@ -347,11 +351,10 @@ def offline_remotes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> OfflineR
     for repository in ("no-magic-ai/no-magic", "no-magic-ai/no-magic-viz"):
         name = repository.split("/")[1]
         bare[repository] = root / f"{name}.git"
-        lines += [
-            f'[url "{bare[repository].as_uri()}"]',
-            f"\tinsteadOf = https://github.com/{repository}.git",
-        ]
     gitconfig.write_text("\n".join(lines) + "\n")
+    urls = {repository: path.as_uri() for repository, path in bare.items()}
+    monkeypatch.setattr("apprentice.agents.packaging._REPOSITORY_URLS", urls)
+    monkeypatch.setenv("OFFLINE_REPOSITORY_URLS", json.dumps(urls))
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(gitconfig))
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file")
@@ -377,3 +380,40 @@ def offline_remotes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> OfflineR
     gh.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
     return OfflineRemotes(bare=bare, gh_log=gh_log)
+
+
+def apply_offline_repository_urls() -> None:
+    """In a test's child interpreter: use the parent's offline supported-URL map."""
+    import apprentice.agents.packaging as packaging
+
+    packaging._REPOSITORY_URLS = json.loads(os.environ["OFFLINE_REPOSITORY_URLS"])
+
+
+def submit_test_config() -> Path:
+    """The shipped config with explicit offline publication-test limits.
+
+    Cooldown 0, four concurrent items and 20/50 PR slots let one test submit
+    several runs and race contenders; limits are tested where they are the
+    subject. Written under the test's private HOME.
+    """
+    text = (Path(__file__).parent.parent / "config" / "apprentice.toml").read_text(encoding="utf-8")
+    for old, new in (
+        ("cooldown_hours = 4", "cooldown_hours = 0"),
+        ("max_concurrent_items = 1", "max_concurrent_items = 4"),
+        ("max_prs_per_day = 2", "max_prs_per_day = 20"),
+        ("max_prs_per_week = 5", "max_prs_per_week = 50"),
+    ):
+        assert old in text
+        text = text.replace(old, new)
+    path = Path.home() / "submit-test.toml"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def run_submit(args: Any, config: Path | None = None) -> int:
+    """Run the CLI submit command with `config` (default: `submit_test_config()`)."""
+    from apprentice.cli import _cmd_submit
+    from apprentice.controls.footprint import Footprint
+    from apprentice.core.config import load_config
+
+    return _cmd_submit(load_config(config or submit_test_config()), Footprint(existing=()), args)
