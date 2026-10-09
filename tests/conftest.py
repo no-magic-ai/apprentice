@@ -1,4 +1,4 @@
-"""Shared fixtures: store-owned run scopes, an offline in-process ADK model and offline packaging remotes."""
+"""Shared fixtures: store-owned run scopes, trusted role outputs and offline packaging remotes."""
 
 from __future__ import annotations
 
@@ -9,19 +9,57 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import pytest
-from google.adk.models import BaseLlm, LlmRequest, LlmResponse
-from google.genai import types
-from pydantic import Field
 
 from apprentice.core.session_store import SessionStore
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
-
     from apprentice.core.artifacts import RunScope
+
+
+@pytest.fixture(autouse=True)
+def private_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Every test gets its own empty HOME and no hosted-provider environment.
+
+    The default store/log roots and the installation footprint then never
+    see the real user's `~/.apprentice`, and no hosted credential or base URL
+    reaches a route.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    for name in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE"):
+        monkeypatch.delenv(name, raising=False)
+    return home
+
+
+@pytest.fixture
+def judged_execution(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Replace generated-code execution in validators and gates with a non-executing judge.
+
+    Model output (even from the loopback fixture) is never run: the judge
+    reads the file and passes it unless it contains the fixture's deliberate
+    failure marker. Returns the judged paths in order.
+    """
+    judged: list[str] = []
+
+    def judge(
+        args: list[str], *positional: Any, **keyword: Any
+    ) -> subprocess.CompletedProcess[str]:
+        path = Path(args[-1])
+        judged.append(str(path))
+        failing = "fixture: deliberate failure" in path.read_text(encoding="utf-8")
+        return subprocess.CompletedProcess(
+            args, 1 if failing else 0, "", "AssertionError: fixture" if failing else ""
+        )
+
+    judged_subprocess = SimpleNamespace(run=judge, TimeoutExpired=subprocess.TimeoutExpired)
+    monkeypatch.setattr("apprentice.validators.correctness.subprocess", judged_subprocess)
+    monkeypatch.setattr("apprentice.gates.correctness.subprocess", judged_subprocess)
+    return judged
 
 
 @pytest.fixture
@@ -146,14 +184,6 @@ _CARDS = (
     '"Selection sort vs insertion sort swaps?","At most n-1 swaps ({variant})",selection,comparison\n'
 )
 
-_ROLE_MARKERS = {
-    "expert algorithm implementer": "drafter",
-    "algorithm instrumentation": "instrumentation",
-    "expert Manim animator": "visualization",
-    "spaced-repetition card author": "assessment",
-    "Artifacts are validated automatically.": "reviewer",
-}
-
 
 def fixture_outputs(
     variant: str = "A", *, failing_implementation: bool = False, omit: tuple[str, ...] = ()
@@ -174,26 +204,6 @@ def fixture_outputs(
     for role in omit:
         outputs[role] = ""
     return outputs
-
-
-class OfflineFixtureLlm(BaseLlm):
-    """In-process ADK model: answers each agent from fixtures and records requests."""
-
-    outputs: dict[str, str] = Field(default_factory=dict)
-    requests: list[tuple[str, str]] = Field(default_factory=list)
-
-    async def generate_content_async(
-        self, llm_request: LlmRequest, stream: bool = False
-    ) -> AsyncGenerator[LlmResponse, None]:
-        instruction = str(llm_request.config.system_instruction or "")
-        role = next((r for marker, r in _ROLE_MARKERS.items() if marker in instruction), "unknown")
-        self.requests.append((role, instruction))
-        yield LlmResponse(
-            content=types.Content(role="model", parts=[types.Part(text=self.outputs[role])])
-        )
-
-    def roles(self) -> list[str]:
-        return [role for role, _ in self.requests]
 
 
 @dataclass

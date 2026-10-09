@@ -1,113 +1,38 @@
-# Local Model Setup
+# Local (Non-Hosted) Models
 
-apprentice supports local LLMs via Ollama and any OpenAI-compatible API server.
+A local model is used through `backend = "local"` only when it is metered exactly like a hosted one: every request is counted, reserved, sent and settled through the installation ledger. Ollama's chat API, llama.cpp's server and other plain OpenAI-compatible chat endpoints do not qualify by themselves; the earlier `ollama` backend and its environment-variable configuration were removed. apprentice never falls back to another model or provider.
 
-## Ollama
+## Server requirements
 
-### Install
+The server must:
 
-```bash
-# macOS
-brew install ollama
+- listen on a loopback IP address (`127.0.0.1` or `::1`); `local_api_base` carries no credentials, query or fragment, and requests ignore environment proxies and redirects;
+- implement `POST <local_api_base>/responses/input_tokens` and `POST <local_api_base>/responses` (the OpenAI Responses protocol) for the same complete input — instructions, input items and function tools — counted by the model's own tokenizer;
+- honour `max_output_tokens` as a cap on all generated output, including any hidden reasoning;
+- echo the requested model ID and report complete usage: `input_tokens`, `output_tokens`, `total_tokens`, plus `input_tokens_details.cached_tokens` and `output_tokens_details.reasoning_tokens` when the profile declares those subsets.
 
-# Linux
-curl -fsSL https://ollama.com/install.sh | sh
-```
+A server that lacks any of this is refused before a request is sent, or — if it answers with an unqualified model or incomplete usage — its reservation is kept as unknown usage and its profile is quarantined.
 
-### Pull a model
-
-Minimum recommended model size for acceptable quality: **8B parameters** (e.g. llama3.1:8b).
-For better results: **70B parameters** (e.g. llama3.3:70b).
-
-```bash
-ollama pull llama3.3
-ollama pull llama3.1:8b    # smaller, faster, lower quality
-```
-
-### Configure apprentice
-
-```toml
-[provider]
-backend = "ollama"
-model = "ollama_chat/llama3.3"
-fallback_model = "ollama_chat/llama3.1:8b"
-local_api_base = "http://localhost:11434"
-```
-
-### Run
-
-```bash
-# Start Ollama server (if not running as service)
-ollama serve
-
-# Build with Ollama
-apprentice build "insertion_sort" --tier 1
-
-# Or override at runtime
-apprentice build "insertion_sort" --backend ollama --model ollama_chat/llama3.3
-```
-
-## OpenAI-compatible servers (llama.cpp, vLLM, etc.)
-
-Any server exposing an OpenAI-compatible API works with the `local` backend.
-
-### llama.cpp server
-
-```bash
-# Start llama.cpp server
-./llama-server -m models/llama-3.3-70b.gguf --port 8000 --host 0.0.0.0
-```
-
-### Configure apprentice
+## Configure apprentice
 
 ```toml
 [provider]
 backend = "local"
-model = "openai/local-model"
-fallback_model = "openai/local-model"
-local_api_base = "http://localhost:8000/v1"
+model = "openai/<the server's model ID>"
+local_api_base = "http://127.0.0.1:8080/v1"
+accounting_profile_path = "local-profile.json"
 ```
 
-The `local` backend automatically sets `OPENAI_API_KEY=not-needed` and `OPENAI_API_BASE` from `local_api_base`.
+`local-profile.json` is a `non-hosted-responses` profile (see [Configuration](configuration.md#non-hosted-route-non-hosted-responses)). In it the operator declares that the server is genuinely non-hosted and states the model's own context window and output maximum; no GPT context or tokenizer is assumed. Choose the cost policy:
 
-## Quality expectations
+- `zero-hosted` — hosted cost is known to be zero; tokens still count against every token ceiling;
+- `sdk-reference-capacity` with `reference_rate_model` — USD ceilings are charged at a separate priced model's pinned rates as modelled capacity, reported apart from hosted spend.
 
-Local models produce lower quality output than cloud models. The validators apply the same thresholds regardless of model — expect higher failure rates with smaller models:
+## Run
 
-| Model size | Expected success rate | Recommended tier |
-|---|---|---|
-| 8B | 60-70% | Tier 1 only |
-| 13B | 70-80% | Tier 1-2 |
-| 70B | 80-90% | Tier 1-3 |
-| Cloud (Claude/GPT) | 95%+ | All tiers |
-
-The implementation loop retries up to 3 times. With a 70B model, most tier 1-2 algorithms succeed within 2 attempts.
-
-## Troubleshooting
-
-### Ollama connection refused
-
-Verify the server is running:
 ```bash
-curl http://localhost:11434/api/tags
+apprentice status                      # route validity/admission and ledger state
+apprentice build "insertion_sort" --tier 1
 ```
 
-### Model too slow
-
-Reduce token budget in `apprentice.toml`:
-```toml
-[budget.cycle]
-max_tokens_per_cycle = 50_000
-```
-
-Or use a quantized model:
-```bash
-ollama pull llama3.1:8b-q4_0
-```
-
-### Out of memory
-
-Use a smaller model or enable GPU offloading:
-```bash
-OLLAMA_NUM_GPU=999 ollama serve
-```
+Small local models fail validation more often; each failed draft is retried up to `agents.max_implementation_retries` attempts in total, and every attempt is metered.

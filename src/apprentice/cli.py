@@ -5,17 +5,21 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import signal
 import sys
-import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from apprentice.controls.authority import Authority, Cycle
+    from apprentice.controls.errors import ControlDeniedError
+    from apprentice.controls.footprint import Footprint
     from apprentice.core.artifacts import BundleSnapshot
     from apprentice.core.config import ApprenticeConfig
-    from apprentice.core.session_store import RunRecord, SessionStore
-    from apprentice.models.work_item import BlockingGateError
+    from apprentice.core.cycles import BuildResult
+    from apprentice.core.session_store import SessionStore
+    from apprentice.providers.factory import ModelRoute
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -40,12 +44,7 @@ def main(argv: list[str] | None = None) -> int:
     build_parser.add_argument(
         "--description", type=str, default="", help="Optional algorithm description"
     )
-    build_parser.add_argument(
-        "--backend", type=str, default=None, help="Override provider backend (e.g. ollama)"
-    )
-    build_parser.add_argument(
-        "--model", type=str, default=None, help="Override model (e.g. ollama_chat/llama3.3)"
-    )
+    _add_route_overrides(build_parser)
 
     submit_parser = subparsers.add_parser(
         "submit", help="Open PRs with the exact approved bytes of a run (no regeneration)"
@@ -76,19 +75,19 @@ def main(argv: list[str] | None = None) -> int:
     suggest_parser = subparsers.add_parser("suggest", help="Discover candidate algorithms")
     suggest_parser.add_argument("--tier", type=int, default=2, help="Target tier (default: 2)")
     suggest_parser.add_argument("--limit", type=int, default=5, help="Max candidates (default: 5)")
-    suggest_parser.add_argument("--backend", type=str, default=None, help="Override backend")
-    suggest_parser.add_argument("--model", type=str, default=None, help="Override model")
+    _add_route_overrides(suggest_parser)
 
     retry_parser = subparsers.add_parser("retry", help="Retry a failed pipeline run")
     retry_parser.add_argument("run_id", help="Run ID to retry (from 'apprentice history')")
-    retry_parser.add_argument("--backend", type=str, default=None, help="Override backend")
-    retry_parser.add_argument("--model", type=str, default=None, help="Override model")
+    _add_route_overrides(retry_parser)
 
     history_parser = subparsers.add_parser("history", help="List past pipeline runs")
     history_parser.add_argument("--status", type=str, default=None, help="Filter by status")
     history_parser.add_argument("--limit", type=int, default=20, help="Max entries (default: 20)")
 
-    subparsers.add_parser("metrics", help="Show aggregated pipeline metrics")
+    subparsers.add_parser(
+        "metrics", help="Show run lifecycle and ledger usage by accounting category"
+    )
 
     preview_parser = subparsers.add_parser(
         "preview", help="Inspect the sealed artifact bundle of a completed run"
@@ -99,8 +98,27 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Run ID to preview (default: most recently started completed run)",
     )
-    subparsers.add_parser("status", help="Show budget usage and queue state")
+    subparsers.add_parser(
+        "status", help="Show configured limits, ledger state and route validity/admission"
+    )
     subparsers.add_parser("config", help="Display current configuration")
+
+    controls_parser = subparsers.add_parser("controls", help="Operator actions on durable controls")
+    controls_sub = controls_parser.add_subparsers(dest="controls_command", required=True)
+    adopt_parser = controls_sub.add_parser(
+        "adopt-legacy",
+        help=(
+            "Declare that no earlier apprentice process is running, so run records written "
+            "without the control authority stop blocking admission (holds are kept)"
+        ),
+    )
+    adopt_parser.add_argument("--operator", type=str, required=True, help="Operator identity")
+    adopt_parser.add_argument(
+        "--declare-no-earlier-process-running",
+        action="store_true",
+        required=True,
+        help="Required: the operator's own declaration of quiescence",
+    )
 
     dev_parser = subparsers.add_parser("dev", help="Launch ADK dev UI for interactive debugging")
     dev_parser.add_argument("--port", type=int, default=8080, help="Dev UI port (default: 8080)")
@@ -111,26 +129,89 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 1
 
-    cfg = _load_cfg(args.config)
+    from apprentice.controls.errors import AuthorityError
+    from apprentice.core.artifacts import ArtifactError
+    from apprentice.core.config import load_config
+    from apprentice.core.cycles import (
+        OperatorTermination,
+        bootstrap_installation,
+        clear_operator_stop,
+        operator_stop,
+        reached_end,
+    )
+    from apprentice.core.observability import setup_logging
+    from apprentice.core.session_store import StoreUnavailableError
 
+    try:
+        cfg = load_config(args.config)
+    except (ValueError, TypeError, KeyError, FileNotFoundError) as exc:
+        _print_json({"error": f"invalid configuration: {exc}"})
+        return 1
+    # The authority is created from the earlier footprint before logging (or
+    # any command) can create state of its own, whatever the command is.
+    try:
+        footprint = bootstrap_installation(cfg, None)
+    except StoreUnavailableError as exc:
+        _print_json({"error": f"run store unavailable: {exc}"})
+        return 1
+    except (AuthorityError, ArtifactError) as exc:
+        _print_json({"error": f"control authority unavailable: {exc}"})
+        return 1
+    setup_logging(
+        {"log_level": cfg.observability.log_level, "log_path": cfg.observability.log_path}
+    )
+
+    # SIGTERM to this CLI process is an operator cancellation, handled like
+    # Ctrl-C (only for the duration of this command), except that it waits
+    # while a cycle's admission or end records are being committed. It is
+    # reported with the outcome this command's cycle committed (for example
+    # `completed` when it arrived while that end was being recorded), and
+    # with no outcome when no cycle ended.
+    def terminate(signum: int, frame: object) -> None:
+        operator_stop()
+
+    clear_operator_stop()
+    previous = signal.signal(signal.SIGTERM, terminate)
+    try:
+        return _dispatch(cfg, footprint, args, parser)
+    except StoreUnavailableError as exc:
+        # Raised where a command opens or reads the store before any admission, or
+        # when a build's run cannot be created (its cycle has already ended).
+        _print_json({"error": f"run store unavailable: {exc}"})
+        return 1
+    except OperatorTermination as stop:
+        # Notes name what could not be saved on the way out (for example the run record).
+        error = "; ".join(["terminated by the operator (SIGTERM)", *getattr(stop, "__notes__", [])])
+        _print_json({"error": error, **reached_end()})
+        return 128 + signal.SIGTERM
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+        clear_operator_stop()
+
+
+def _dispatch(
+    cfg: ApprenticeConfig, footprint: Footprint, args: Any, parser: argparse.ArgumentParser
+) -> int:
     if args.command == "build":
-        return _cmd_build(cfg, args)
+        return _cmd_build(cfg, footprint, args)
     if args.command == "submit":
         return _cmd_submit(args)
     if args.command == "approve":
         return _cmd_approve(args)
     if args.command == "suggest":
-        return _cmd_suggest(cfg, args)
+        return _cmd_suggest(cfg, footprint, args)
     if args.command == "retry":
-        return _cmd_retry(cfg, args)
+        return _cmd_retry(cfg, footprint, args)
     if args.command == "history":
         return _cmd_history(args)
     if args.command == "metrics":
-        return _cmd_metrics()
+        return _cmd_metrics(footprint)
     if args.command == "preview":
         return _cmd_preview(args)
     if args.command == "status":
-        return _cmd_status(cfg)
+        return _cmd_status(cfg, footprint)
+    if args.command == "controls":
+        return _cmd_controls(footprint, args)
     if args.command == "config":
         return _cmd_config(cfg)
     if args.command == "dev":
@@ -140,123 +221,132 @@ def main(argv: list[str] | None = None) -> int:
     return 1
 
 
-def _load_cfg(config_path: Path | None) -> ApprenticeConfig:
-    from apprentice.core.config import load_config
-    from apprentice.core.observability import setup_logging
+def _add_route_overrides(parser: argparse.ArgumentParser) -> None:
+    from apprentice.core.config import SUPPORTED_BACKENDS
 
-    cfg = load_config(config_path)
-    setup_logging(
-        {
-            "log_level": cfg.observability.log_level,
-            "log_path": cfg.observability.log_path,
-        }
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default=None,
+        help=f"Override provider backend ({', '.join(SUPPORTED_BACKENDS)})",
     )
-    return cfg
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Override model; the accounting profile must qualify it",
+    )
 
 
-def _resolve_model(cfg: ApprenticeConfig, args: Any) -> Any:
-    """Resolve the LiteLlm model from config with optional CLI overrides."""
-    from apprentice.providers.factory import create_model, create_model_from_override
+def _resolve_route(cfg: ApprenticeConfig, args: Any) -> ModelRoute | None:
+    """Resolve the qualified route, or print why it cannot be used (nothing is admitted)."""
+    from apprentice.metering.pricing import PriceAuthorityError
+    from apprentice.metering.profile import ProfileError
+    from apprentice.providers.factory import RouteError, resolve_route
 
-    backend_override = getattr(args, "backend", None)
-    model_override = getattr(args, "model", None)
-
-    if model_override:
-        backend = backend_override or cfg.provider.backend
-        return create_model_from_override(
-            model_string=model_override,
-            backend=backend,
-            local_api_base=cfg.provider.local_api_base,
+    try:
+        return resolve_route(
+            cfg.provider,
+            backend=getattr(args, "backend", None),
+            model=getattr(args, "model", None),
         )
-    if backend_override:
-        from apprentice.core.config import ProviderConfig
-
-        override_cfg = ProviderConfig(
-            backend=backend_override,
-            model=cfg.provider.model,
-            fallback_model=cfg.provider.fallback_model,
-            local_api_base=cfg.provider.local_api_base,
-        )
-        return create_model(override_cfg)
-
-    return create_model(cfg.provider)
+    except (RouteError, ProfileError, PriceAuthorityError) as exc:
+        _print_json({"error": str(exc), "denied_before": "any cycle admission or request"})
+        return None
 
 
-def _cmd_build(cfg: ApprenticeConfig, args: Any) -> int:
-    from apprentice.core.artifacts import ArtifactError
-    from apprentice.core.orchestrator import build_pipeline, get_budget_tracker_from_pipeline
+def _open_authority(store: SessionStore, footprint: Footprint) -> Authority | None:
+    from apprentice.controls.errors import AuthorityError
+    from apprentice.core.cycles import open_authority
+
+    try:
+        return open_authority(store, footprint)
+    except AuthorityError as exc:
+        _print_json({"error": f"control authority unavailable: {exc}"})
+        return None
+
+
+def _print_denial(exc: ControlDeniedError, **extra: object) -> None:
+    _print_json({"error": str(exc), "control": exc.control, "outcome": "denied", **extra})
+
+
+def _cmd_build(cfg: ApprenticeConfig, footprint: Footprint, args: Any) -> int:
     from apprentice.core.progress import PipelineProgress, suppress_noisy_loggers
-    from apprentice.core.session_store import SessionStore
-    from apprentice.models.work_item import BlockingGateError
 
     suppress_noisy_loggers()
-
-    store = SessionStore()
-    try:
-        record = store.create_run(args.algorithm, args.tier)
-    except ArtifactError as exc:
-        _print_json({"error": str(exc)})
-        return 1
-
-    model = _resolve_model(cfg, args)
-    pipeline = build_pipeline(model, cfg, store.run_scope(record))
-
     progress = PipelineProgress(args.algorithm, args.tier)
-    start = time.monotonic()
-    try:
-        session_state = asyncio.run(
-            _run_pipeline_with_progress(
-                pipeline, args.algorithm, args.tier, args.description, progress
-            )
-        )
-        elapsed = time.monotonic() - start
-
-        tracker = get_budget_tracker_from_pipeline(pipeline)
-        budget_summary = tracker.to_dict() if tracker else {}
-
-        has_output = bool(session_state.get("generated_code"))
-        if has_output:
-            store.complete_run(record, session_state, budget_summary, elapsed)
-            progress.finish(True, elapsed)
-        else:
-            store.fail_run(record, session_state, budget_summary, elapsed, "no output generated")
-            progress.finish(False, elapsed)
-
-    except BlockingGateError as failure:
-        elapsed = time.monotonic() - start
-        _record_gate_halt(store, record, pipeline, failure, elapsed)
-        progress.finish(False, elapsed)
-        _print_json({"error": str(failure), "run_id": record.run_id, "gate": failure.verdict})
+    result = _controlled_build(
+        cfg, footprint, args, (args.algorithm, args.tier, args.description), "build", progress
+    )
+    if result is None:
         return 1
-    except Exception as exc:
-        elapsed = time.monotonic() - start
-        store.fail_run(record, {}, {}, elapsed, str(exc))
-        progress.finish(False, elapsed)
-        _print_json({"error": str(exc), "run_id": record.run_id})
+    progress.finish(result.outcome == "completed", result.elapsed)
+    if result.outcome != "completed":
+        _print_build_failure(result)
         return 1
-
-    progress.print_result(session_state, record.run_id)
+    progress.print_result(result.session_state, result.record.run_id)
     return 0
 
 
-def _record_gate_halt(
-    store: SessionStore,
-    record: RunRecord,
-    pipeline: Any,
-    failure: BlockingGateError,
-    elapsed: float,
-) -> RunRecord:
-    """Record a run halted by a blocking gate once, with its persisted state and real budget."""
-    from apprentice.core.orchestrator import get_budget_tracker_from_pipeline
+def _controlled_build(
+    cfg: ApprenticeConfig,
+    footprint: Footprint,
+    args: Any,
+    request: tuple[str, int, str],
+    kind: str,
+    progress: Any,
+) -> BuildResult | None:
+    """Run one controlled build cycle, or print why none was admitted."""
+    from apprentice.controls.errors import AuthorityError, ControlDeniedError
+    from apprentice.controls.policy import ControlPolicy
+    from apprentice.core.artifacts import ArtifactError
+    from apprentice.core.cycles import run_build
+    from apprentice.core.session_store import SessionStore
 
-    tracker = get_budget_tracker_from_pipeline(pipeline)
-    return store.fail_run(
-        record,
-        failure.persisted_state(),
-        tracker.to_dict() if tracker else {},
-        elapsed,
-        str(failure),
-    )
+    try:
+        SessionStore.new_run_id(request[0], request[1])
+    except (ArtifactError, ValueError) as exc:
+        _print_json({"error": str(exc)})
+        return None
+    route = _resolve_route(cfg, args)
+    if route is None:
+        return None
+    store = SessionStore()
+    authority = _open_authority(store, footprint)
+    if authority is None:
+        return None
+    try:
+        return run_build(
+            store=store,
+            authority=authority,
+            route=route,
+            policy=ControlPolicy.from_config(cfg),
+            request=request,
+            kind=kind,
+            progress=progress,
+        )
+    except ControlDeniedError as exc:
+        _print_denial(exc)
+        return None
+    except AuthorityError as exc:
+        _print_json({"error": f"control authority unavailable: {exc}"})
+        return None
+    finally:
+        authority.close()
+
+
+def _print_build_failure(result: BuildResult) -> None:
+    output: dict[str, Any] = {
+        "error": result.error,
+        "run_id": result.record.run_id,
+        "outcome": result.outcome,
+        "accounting": result.accounting,
+    }
+    if result.gate is not None:
+        output["gate"] = result.gate
+    if result.controls:
+        output["control"] = result.controls[0]
+    _print_json(output)
 
 
 def _cmd_submit(args: Any) -> int:
@@ -389,6 +479,7 @@ def _finish_submission(
     record could not be read.
     """
     from apprentice.core.artifacts import ArtifactError
+    from apprentice.core.session_store import StoreUnavailableError
 
     stored: object
     try:
@@ -398,7 +489,7 @@ def _finish_submission(
                 latest.submission = {**reserved, **outcome}
                 try:
                     store.save(latest)
-                except OSError as exc:
+                except StoreUnavailableError as exc:
                     # The atomic replace did not happen: the record still holds `reserved`.
                     stored, discrepancy = reserved, f"saving the outcome failed: {exc}"
                 else:
@@ -529,166 +620,96 @@ def _cmd_approve(args: Any) -> int:
     return 0
 
 
-def _cmd_suggest(cfg: ApprenticeConfig, args: Any) -> int:
+def _cmd_suggest(cfg: ApprenticeConfig, footprint: Footprint, args: Any) -> int:
+    """Run discovery as one controlled `suggest` cycle (its own cycle, sharing monthly usage)."""
+    from apprentice.core.cycles import recording_end
     from apprentice.core.observability import get_logger
-    from apprentice.core.orchestrator import build_discovery_pipeline
+    from apprentice.core.session_store import SessionStore
 
     logger = get_logger(__name__)
     logger.info("suggesting algorithms for tier %d (limit %d)", args.tier, args.limit)
 
-    model = _resolve_model(cfg, args)
-    discovery = build_discovery_pipeline(model)
+    route = _resolve_route(cfg, args)
+    if route is None:
+        return 1
+    store = SessionStore()
+    authority = _open_authority(store, footprint)
+    if authority is None:
+        return 1
+    with recording_end():
+        return _suggest_cycle(authority, cfg, route, args)
 
-    session_state = asyncio.run(
-        _run_agent(discovery, f"Suggest {args.limit} algorithms for tier {args.tier}")
+
+def _suggest_cycle(
+    authority: Authority, cfg: ApprenticeConfig, route: ModelRoute, args: Any
+) -> int:
+    """Admit, run and end one `suggest` cycle (operator stops deferred outside the model work)."""
+    from apprentice.controls.errors import AuthorityError, ControlDeniedError
+    from apprentice.controls.policy import ControlPolicy
+    from apprentice.core.cycles import (
+        classify,
+        denied_controls,
+        describe_error,
+        interruptible,
+        run_agent,
     )
-
-    _print_json(
-        {
-            "tier": args.tier,
-            "candidates": session_state.get("discovery_candidates", ""),
-        }
-    )
-    return 0
-
-
-async def _run_pipeline(
-    pipeline: Any,
-    algorithm: str,
-    tier: int,
-    description: str,
-) -> dict[str, Any]:
-    """Run the ADK pipeline and return the final session state."""
-    return await _run_pipeline_with_progress(pipeline, algorithm, tier, description, None)
-
-
-async def _run_pipeline_with_progress(
-    pipeline: Any,
-    algorithm: str,
-    tier: int,
-    description: str,
-    progress: Any,
-) -> dict[str, Any]:
-    """Run the ADK pipeline via Runner with optional progress tracking."""
-    from google.adk.agents import RunConfig
-    from google.adk.artifacts import InMemoryArtifactService
-    from google.adk.runners import Runner
-    from google.adk.sessions import InMemorySessionService
-    from google.genai import types
-
-    from apprentice.models.work_item import BlockingGateError
-
-    session_service = InMemorySessionService()  # type: ignore[no-untyped-call]
-    artifact_service = InMemoryArtifactService()
-
-    runner = Runner(
-        agent=pipeline,
-        app_name="apprentice",
-        session_service=session_service,
-        artifact_service=artifact_service,
-    )
-
-    user_id = "cli"
-    session = await session_service.create_session(
-        app_name="apprentice",
-        user_id=user_id,
-        state={
-            "algorithm_name": algorithm,
-            "algorithm_tier": tier,
-            "description": description,
-        },
-    )
-
-    user_message = types.Content(
-        role="user",
-        parts=[
-            types.Part(
-                text=(
-                    f"Build a complete implementation of the {algorithm} algorithm "
-                    f"(tier {tier}). Description: {description or 'N/A'}"
-                )
-            )
-        ],
-    )
-
-    run_config = RunConfig(max_llm_calls=50)
+    from apprentice.core.orchestrator import build_discovery_pipeline
 
     try:
-        if progress is not None:
-            with progress.start():
-                async for event in runner.run_async(
-                    user_id=user_id,
-                    session_id=session.id,
-                    new_message=user_message,
-                    run_config=run_config,
-                ):
-                    progress.on_event(event)
-        else:
-            async for _event in runner.run_async(
-                user_id=user_id,
-                session_id=session.id,
-                new_message=user_message,
-                run_config=run_config,
-            ):
-                pass
-    except BlockingGateError as failure:
-        # The gate's verdict delta is already stored; read the session back
-        # from this same service so the halted run keeps its outputs.
-        stored = await session_service.get_session(
-            app_name="apprentice", user_id=user_id, session_id=session.id
-        )
-        if stored is None:
-            raise RuntimeError(f"session {session.id} vanished after {failure}") from failure
-        failure.session_state = dict(stored.state)
-        raise
+        cycle = authority.begin_cycle("suggest", ControlPolicy.from_config(cfg))
+    except ControlDeniedError as exc:
+        authority.close()
+        _print_denial(exc)
+        return 1
+    except AuthorityError as exc:
+        authority.close()
+        _print_json({"error": f"control authority unavailable: {exc}"})
+        return 1
+    try:
+        discovery = build_discovery_pipeline(route, cycle)
+        with interruptible():
+            session_state = asyncio.run(
+                run_agent(discovery, f"Suggest {args.limit} algorithms for tier {args.tier}")
+            )
+    except BaseException as exc:
+        outcome = classify(exc)
+        output: dict[str, Any] = {"error": describe_error(exc), "outcome": outcome}
+        controls = denied_controls(exc)
+        if controls:
+            output["control"] = controls[0]
+        ended = _end_cycle(cycle, outcome, describe_error(exc), output)
+        authority.close()
+        if outcome == "cancelled":
+            if not ended:
+                _print_json(output)
+            raise
+        _print_json(output)
+        return 1
+    output = {"tier": args.tier, "candidates": session_state.get("discovery_candidates", "")}
+    ended = _end_cycle(cycle, "completed", "", output)
+    authority.close()
+    _print_json(output)
+    return 0 if ended else 1
 
-    updated_session = await session_service.get_session(
-        app_name="apprentice", user_id=user_id, session_id=session.id
-    )
-    return dict(updated_session.state) if updated_session else {}
 
+def _end_cycle(cycle: Cycle, outcome: str, detail: str, output: dict[str, Any]) -> bool:
+    """Commit the cycle's terminal outcome and add its ledger rows to `output`.
 
-async def _run_agent(agent: Any, prompt: str) -> dict[str, Any]:
-    """Run a single ADK agent via Runner and return session state."""
-    from google.adk.agents import RunConfig
-    from google.adk.artifacts import InMemoryArtifactService
-    from google.adk.runners import Runner
-    from google.adk.sessions import InMemorySessionService
-    from google.genai import types
+    If the ledger cannot record it, `output` names the unavailable authority
+    instead; the cycle's lease then stays held until this process ends and
+    recovery keeps any dispatched bound as unknown. Returns whether it ended.
+    """
+    from apprentice.controls.errors import AuthorityError
+    from apprentice.core.cycles import end_cycle
 
-    session_service = InMemorySessionService()  # type: ignore[no-untyped-call]
-    artifact_service = InMemoryArtifactService()
-
-    runner = Runner(
-        agent=agent,
-        app_name="apprentice",
-        session_service=session_service,
-        artifact_service=artifact_service,
-    )
-
-    user_id = "cli"
-    session = await session_service.create_session(
-        app_name="apprentice",
-        user_id=user_id,
-    )
-
-    user_message = types.Content(
-        role="user",
-        parts=[types.Part(text=prompt)],
-    )
-
-    async for _event in runner.run_async(
-        user_id=user_id,
-        session_id=session.id,
-        new_message=user_message,
-        run_config=RunConfig(max_llm_calls=30),
-    ):
-        pass
-
-    updated_session = await session_service.get_session(
-        app_name="apprentice", user_id=user_id, session_id=session.id
-    )
-    return dict(updated_session.state) if updated_session else {}
+    try:
+        end_cycle(cycle, outcome, detail)
+        output["accounting"] = cycle.summary()
+    except AuthorityError as exc:
+        output["error"] = f"control authority unavailable: {exc}"
+        output["outcome"] = outcome
+        return False
+    return True
 
 
 def _cmd_preview(args: Any) -> int:
@@ -734,28 +755,75 @@ def _cmd_preview(args: Any) -> int:
     return 0
 
 
-def _cmd_status(cfg: ApprenticeConfig) -> int:
+def _cmd_status(cfg: ApprenticeConfig, footprint: Footprint) -> int:
+    """Report configured limits, ledger state and route admission separately; admits no work.
+
+    `route.structurally_valid` only says the configured backend, model,
+    profile structure and pinned price data validate — not that the profile's
+    fees or capabilities are genuine. `route.admissible` additionally
+    requires that the ledger blocks nothing for that profile now (no
+    quarantine, no unknown current month, no suspension or live legacy
+    record); each call is still decided by the budgets.
+    """
+    from apprentice.controls.errors import AuthorityError
+    from apprentice.controls.policy import ControlPolicy
+    from apprentice.core.session_store import SessionStore
+    from apprentice.metering.pricing import PriceAuthorityError
+    from apprentice.metering.profile import ProfileError
+    from apprentice.providers.factory import RouteError, resolve_route
+
+    profile_sha256: str | None = None
+    try:
+        resolved = resolve_route(cfg.provider)
+        route: dict[str, Any] = {"structurally_valid": True, **resolved.describe()}
+        profile_sha256 = resolved.profile.sha256
+    except (RouteError, ProfileError, PriceAuthorityError) as exc:
+        route = {"structurally_valid": False, "error": str(exc)}
+    store = SessionStore()
+    authority = _open_authority(store, footprint)
+    if authority is None:
+        return 1
+    try:
+        ledger = authority.status()
+        readiness = authority.readiness(profile_sha256, ControlPolicy.from_config(cfg))
+        blocked = list(readiness["blocked_by"])
+        if not route["structurally_valid"]:
+            blocked.insert(0, {"control": "provider", "reason": route["error"]})
+        route["admissible"] = not blocked
+        route["blocked_by"] = blocked
+    except AuthorityError as exc:
+        _print_json({"error": f"control authority unavailable: {exc}"})
+        return 1
+    finally:
+        authority.close()
     _print_json(
         {
-            "budget": {
-                "monthly_token_ceiling": cfg.budget.global_budget.monthly_token_ceiling,
-                "monthly_cost_ceiling_usd": cfg.budget.global_budget.monthly_cost_ceiling_usd,
-                "cycle_token_cap": cfg.budget.cycle.max_tokens_per_cycle,
-                "stage_token_cap": cfg.budget.stage.max_tokens_per_stage,
-            },
-            "rate_limits": {
-                "max_prs_per_day": cfg.rate_limits.max_prs_per_day,
-                "max_prs_per_week": cfg.rate_limits.max_prs_per_week,
-            },
-            "circuit_breaker": {
-                "failure_threshold": cfg.circuit_breaker.failure_threshold,
-            },
-            "provider": {
-                "backend": cfg.provider.backend,
-                "model": cfg.provider.model,
-            },
+            "configured": json.loads(ControlPolicy.from_config(cfg).to_json()),
+            "ledger": ledger,
+            "route": route,
         }
     )
+    return 0
+
+
+def _cmd_controls(footprint: Footprint, args: Any) -> int:
+    from apprentice.controls.errors import AuthorityError, ControlDeniedError
+    from apprentice.core.session_store import SessionStore
+
+    authority = _open_authority(SessionStore(), footprint)
+    if authority is None:
+        return 1
+    try:
+        result = authority.adopt_legacy(args.operator)
+    except ControlDeniedError as exc:
+        _print_denial(exc)
+        return 1
+    except AuthorityError as exc:
+        _print_json({"error": f"control authority unavailable: {exc}"})
+        return 1
+    finally:
+        authority.close()
+    _print_json(result)
     return 0
 
 
@@ -782,18 +850,14 @@ def _cmd_dev(cfg: ApprenticeConfig, args: Any) -> int:
     return 0
 
 
-def _cmd_retry(cfg: ApprenticeConfig, args: Any) -> int:
-    from apprentice.core.artifacts import ArtifactError
+def _cmd_retry(cfg: ApprenticeConfig, footprint: Footprint, args: Any) -> int:
+    """Retry a failed run as a new controlled cycle (not a provider retry)."""
     from apprentice.core.observability import get_logger
-    from apprentice.core.orchestrator import build_pipeline, get_budget_tracker_from_pipeline
     from apprentice.core.session_store import SessionStore
-    from apprentice.models.work_item import BlockingGateError
 
     logger = get_logger(__name__)
-    store = SessionStore()
-
     try:
-        old_record = store.load(args.run_id)
+        old_record = SessionStore().load(args.run_id)
     except (FileNotFoundError, ValueError) as exc:
         _print_json({"error": str(exc)})
         return 1
@@ -805,47 +869,14 @@ def _cmd_retry(cfg: ApprenticeConfig, args: Any) -> int:
     algorithm = old_record.algorithm_name
     tier = old_record.tier
     logger.info("retrying: %s (tier %d) from run %s", algorithm, tier, args.run_id)
-
-    try:
-        new_record = store.create_run(algorithm, tier)
-    except ArtifactError as exc:
-        _print_json({"error": str(exc)})
+    result = _controlled_build(cfg, footprint, args, (algorithm, tier, ""), "retry", None)
+    if result is None:
         return 1
-
-    model = _resolve_model(cfg, args)
-    pipeline = build_pipeline(model, cfg, store.run_scope(new_record))
-
-    start = time.monotonic()
-
-    try:
-        session_state = asyncio.run(_run_pipeline(pipeline, algorithm, tier, ""))
-        elapsed = time.monotonic() - start
-
-        tracker = get_budget_tracker_from_pipeline(pipeline)
-        budget_summary = tracker.to_dict() if tracker else {}
-
-        has_output = bool(session_state.get("generated_code"))
-        if has_output:
-            store.complete_run(new_record, session_state, budget_summary, elapsed)
-        else:
-            store.fail_run(
-                new_record, session_state, budget_summary, elapsed, "no output generated"
-            )
-
-    except BlockingGateError as failure:
-        elapsed = time.monotonic() - start
-        _record_gate_halt(store, new_record, pipeline, failure, elapsed)
-        logger.error("retry failed: %s", failure)
-        _print_json({"error": str(failure), "run_id": new_record.run_id, "gate": failure.verdict})
+    if result.outcome != "completed":
+        logger.error("retry failed: %s", result.error)
+        _print_build_failure(result)
         return 1
-    except Exception as exc:
-        elapsed = time.monotonic() - start
-        store.fail_run(new_record, {}, {}, elapsed, str(exc))
-        logger.error("retry failed: %s", exc)
-        _print_json({"error": str(exc), "run_id": new_record.run_id})
-        return 1
-
-    _print_build_result(algorithm, tier, session_state, elapsed, new_record.run_id)
+    _print_build_result(algorithm, tier, result)
     return 0
 
 
@@ -875,45 +906,48 @@ def _cmd_history(args: Any) -> int:
     return 0
 
 
-def _cmd_metrics() -> int:
+def _cmd_metrics(footprint: Footprint) -> int:
+    """Report run lifecycle and the ledger's usage of every controlled cycle; admits no work."""
+    from apprentice.controls.errors import AuthorityError
     from apprentice.core.metrics import aggregate_runs
     from apprentice.core.session_store import SessionStore
 
     store = SessionStore()
     try:
-        records = store.list_runs(limit=100)
+        records = store.list_runs(limit=None)
     except ValueError as exc:
         _print_json({"error": str(exc)})
         return 1
-
-    if not records:
-        _print_json({"error": "No run records found. Run 'apprentice build' first."})
-        return 0
-
-    report = aggregate_runs(records)
+    authority = _open_authority(store, footprint)
+    if authority is None:
+        return 1
+    try:
+        usage = authority.usage()
+    except AuthorityError as exc:
+        _print_json({"error": f"control authority unavailable: {exc}"})
+        return 1
+    finally:
+        authority.close()
+    report = aggregate_runs(records, usage, "installation ledger: every controlled cycle")
     _print_json(report.to_dict())
     return 0
 
 
-def _print_build_result(
-    algorithm: str,
-    tier: int,
-    session_state: dict[str, Any],
-    elapsed: float,
-    run_id: str = "",
-) -> None:
+def _print_build_result(algorithm: str, tier: int, result: BuildResult) -> None:
+    state = result.session_state
     _print_json(
         {
-            "run_id": run_id,
+            "run_id": result.record.run_id,
             "algorithm": algorithm,
             "tier": tier,
-            "session_state_keys": list(session_state.keys()),
-            "generated_code": bool(session_state.get("generated_code")),
-            "instrumented_code": bool(session_state.get("instrumented_code")),
-            "manim_scene_code": bool(session_state.get("manim_scene_code")),
-            "anki_deck_content": bool(session_state.get("anki_deck_content")),
-            "review_verdict": session_state.get("review_verdict", ""),
-            "duration_seconds": round(elapsed, 2),
+            "session_state_keys": list(state.keys()),
+            "generated_code": bool(state.get("generated_code")),
+            "instrumented_code": bool(state.get("instrumented_code")),
+            "manim_scene_code": bool(state.get("manim_scene_code")),
+            "anki_deck_content": bool(state.get("anki_deck_content")),
+            "review_verdict": state.get("review_verdict", ""),
+            "duration_seconds": round(result.elapsed, 2),
+            "accounting": result.accounting,
         }
     )
 

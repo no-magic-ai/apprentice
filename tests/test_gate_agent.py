@@ -189,7 +189,7 @@ class TestGateAgentInRealPipeline:
     def test_non_blocking_outcomes_continue_and_persist_the_verdict(
         self, scope: RunScope, verdict: GateVerdict, blocking: bool
     ) -> None:
-        tracker = BudgetTracker(total_tokens=1000, total_usd=1.0)
+        tracker = BudgetTracker()
         sentinel = _Sentinel(name="after_gate")
         gate = GateAgent.after(
             _StubGate(verdict, blocking=blocking), "implementation", scope, tracker=tracker
@@ -207,7 +207,7 @@ class TestGateAgentInRealPipeline:
     def test_blocking_fail_stops_later_agents_and_persists_diagnostics(
         self, scope: RunScope
     ) -> None:
-        tracker = BudgetTracker(total_tokens=1000, total_usd=1.0)
+        tracker = BudgetTracker()
         sentinel = _Sentinel(name="publisher")
         first = GateAgent.after(
             _StubGate(GateVerdict.PASS), "implementation", scope, tracker=tracker

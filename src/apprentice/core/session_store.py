@@ -26,6 +26,7 @@ from apprentice.core.artifacts import (
     BundleSnapshot,
     RunScope,
     _open_single_link_file,
+    json_entries,
     load_snapshot,
     require_owned_root,
     seal_bundle,
@@ -37,7 +38,6 @@ from apprentice.core.artifacts import (
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-_DEFAULT_STORE_DIR = Path.home() / ".apprentice" / "sessions"
 _FAIL = "fail"
 
 _RUN_ID = re.compile(r"[a-z][a-z0-9_]{0,63}-\d{8}T\d{6}Z-[0-9a-f]{32}")
@@ -157,25 +157,69 @@ def describe_gate_failures(failures: list[dict[str, Any]]) -> str:
     return f"blocking gate failed: {names}"
 
 
+def default_store_dir() -> Path:
+    """Return the store root used when none is given: `~/.apprentice/sessions`."""
+    return Path.home() / ".apprentice" / "sessions"
+
+
+class StoreUnavailableError(ArtifactError):
+    """Raised when the run-record store root cannot be created or used as a directory."""
+
+
 class SessionStore:
     """Persists run records and allocates the artifact roots each run owns."""
 
     def __init__(self, store_dir: Path | None = None) -> None:
-        self._dir = (store_dir if store_dir is not None else _DEFAULT_STORE_DIR).absolute()
-        self._dir.mkdir(parents=True, exist_ok=True)
+        self._dir = (store_dir if store_dir is not None else default_store_dir()).absolute()
+        try:
+            self._dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            # Missing permission or a file where the store belongs: nothing is
+            # created over it.
+            raise StoreUnavailableError(f"run store {self._dir} cannot be used: {exc}") from exc
 
     @property
     def store_dir(self) -> Path:
         return self._dir
 
-    def create_run(self, algorithm_name: str, tier: int) -> RunRecord:
-        """Create a run with a unique ID, its exclusive work root and an in-progress record."""
+    @staticmethod
+    def new_run_id(algorithm_name: str, tier: int) -> str:
+        """Validate a run's identity and return a fresh run ID for it; nothing is written.
+
+        A controlled cycle registers the ID before `create_run` writes the
+        record, so the record is never seen unreferenced.
+        """
         validate_algorithm_name(algorithm_name)
         tier_directory(tier)
         now = datetime.now(tz=UTC)
-        run_id = f"{algorithm_name}-{now.strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex}"
+        return f"{algorithm_name}-{now.strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex}"
+
+    def create_run(self, algorithm_name: str, tier: int, run_id: str | None = None) -> RunRecord:
+        """Create a run, its exclusive work root and an in-progress record.
+
+        `run_id` is an ID from `new_run_id` (a fresh one is generated when
+        omitted). A record written outside a controlled cycle is unreferenced
+        by the control authority, which then holds its month as unknown usage.
+
+        Raises:
+            ValueError: If the identity or `run_id` is not valid.
+            ArtifactError: If the runs root is not a plain owned directory or
+                the run's root already exists.
+            StoreUnavailableError: If the run's root or record cannot be created.
+        """
+        if run_id is None:
+            run_id = self.new_run_id(algorithm_name, tier)
+        validate_algorithm_name(algorithm_name)
+        tier_directory(tier)
+        if not _RUN_ID.fullmatch(run_id) or not run_id.startswith(f"{algorithm_name}-"):
+            raise ValueError(f"run ID {run_id!r} is not a new run ID of {algorithm_name!r}")
+        now = datetime.now(tz=UTC)
         run_dir = self._allocate(self._dir / "runs", run_id)
-        (run_dir / "work").mkdir(mode=0o700)
+        work = run_dir / "work"
+        try:
+            work.mkdir(mode=0o700)
+        except OSError as exc:
+            raise self._unwritable(f"cannot create {work}", exc) from exc
         record = RunRecord(
             run_id=run_id,
             algorithm_name=algorithm_name,
@@ -200,7 +244,12 @@ class SessionStore:
         return self._run_dir(run_id) / "bundle"
 
     def allocate_work_root(self) -> Path:
-        """Allocate a fresh exclusive root for work that has no run record of its own."""
+        """Allocate a fresh exclusive root for work that has no run record of its own.
+
+        Raises:
+            ArtifactError: If the scratch root is not a plain owned directory.
+            StoreUnavailableError: If the root cannot be created.
+        """
         return self._allocate(self._dir / "scratch", uuid.uuid4().hex)
 
     def complete_run(
@@ -215,6 +264,8 @@ class SessionStore:
         Raises:
             ArtifactError: If a blocking gate failed (such a run is never sealed)
                 or the gate verdicts in `budget_summary` are malformed.
+            StoreUnavailableError: If the store cannot be written (the record
+                keeps its previous state).
         """
         try:
             failures = blocking_gate_failures(budget_summary)
@@ -247,7 +298,12 @@ class SessionStore:
         elapsed: float,
         error: str,
     ) -> RunRecord:
-        """Mark a run as failed, preserving all completed agent outputs."""
+        """Mark a run as failed, preserving all completed agent outputs.
+
+        Raises:
+            StoreUnavailableError: If the store cannot be written (the record
+                keeps its previous state).
+        """
         record.status = "failed"
         record.session_state = session_state
         record.budget_summary = budget_summary
@@ -292,24 +348,35 @@ class SessionStore:
             ValueError: If `run_id` is not a supported run ID or the stored
                 record is not a valid run record.
             FileNotFoundError: If the run record does not exist.
+            StoreUnavailableError: If whether it exists cannot be determined or
+                it cannot be read.
         """
-        path = self._record_path(run_id)
-        if not path.exists():
-            raise FileNotFoundError(f"No run record found: {run_id}")
+        path = self._existing_record_path(run_id)
         record = _read_record(path)
         if record.run_id != run_id:
             raise ValueError(f"run record {path} carries a different run ID {record.run_id!r}")
         return record
 
-    def list_runs(self, status: str | None = None, limit: int = 20) -> list[RunRecord]:
+    def list_runs(self, status: str | None = None, limit: int | None = 20) -> list[RunRecord]:
         """List run records, optionally filtered by status, newest `started_at` first.
+
+        `limit=None` lists every record.
 
         Raises:
             ValueError: If any stored record is not a valid run record or its
                 `started_at` is not an ISO 8601 timestamp; no record is skipped.
+            StoreUnavailableError: If the store cannot be listed or any stored
+                record cannot be read.
         """
+        try:
+            paths = json_entries(self._dir)
+        except OSError as exc:
+            raise StoreUnavailableError(
+                f"run store {self._dir} cannot be used: cannot list its run records: {exc}; "
+                "restore the owner's read permission on it (nothing was changed)"
+            ) from exc
         keyed = []
-        for path in self._dir.glob("*.json"):
+        for path in paths:
             record = _read_record(path)
             try:
                 started = datetime.fromisoformat(record.started_at)
@@ -321,7 +388,12 @@ class SessionStore:
         return matching[:limit]
 
     def save(self, record: RunRecord) -> RunRecord:
-        """Persist an updated run record, preserving identity."""
+        """Persist an updated run record, preserving identity.
+
+        Raises:
+            StoreUnavailableError: If the store cannot be written (the record
+                keeps its previous state).
+        """
         self._write(record)
         return record
 
@@ -338,15 +410,20 @@ class SessionStore:
         Raises:
             ValueError: If `run_id` is not a supported run ID.
             FileNotFoundError: If the run has no record (no lock file is created).
+            StoreUnavailableError: If whether the record exists cannot be
+                determined, or the runs root cannot be created (no lock file
+                is created).
             ArtifactError: If the lock path is a symlink, not a regular file or
                 has more than one link.
         """
         import fcntl
 
-        if not self._record_path(run_id).exists():
-            raise FileNotFoundError(f"No run record found: {run_id}")
+        self._existing_record_path(run_id)
         runs = self._dir / "runs"
-        runs.mkdir(parents=True, exist_ok=True)
+        try:
+            runs.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise self._unwritable(f"cannot create {runs}", exc) from exc
         path = require_owned_root(runs) / f"{run_id}.lock"
         fd = _open_single_link_file(path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
@@ -368,35 +445,93 @@ class SessionStore:
             raise ValueError(f"invalid run ID {run_id!r}")
         return self._dir / f"{run_id}.json"
 
+    def _existing_record_path(self, run_id: str) -> Path:
+        """Return the path of `run_id`'s record, which must exist.
+
+        Raises:
+            ValueError: If `run_id` is not a supported run ID.
+            FileNotFoundError: If the run has no record.
+            StoreUnavailableError: If whether the record exists cannot be
+                determined (for example a store root without search
+                permission); nothing is changed.
+        """
+        path = self._record_path(run_id)
+        try:
+            exists = path.exists()
+        except OSError as exc:
+            raise StoreUnavailableError(
+                f"run store {self._dir} cannot be used: cannot check run record {path}: {exc}; "
+                "restore the owner's search permission on it (nothing was changed)"
+            ) from exc
+        if not exists:
+            raise FileNotFoundError(f"No run record found: {run_id}")
+        return path
+
     def _run_dir(self, run_id: str) -> Path:
         self._record_path(run_id)
         return self._dir / "runs" / run_id
 
     def _allocate(self, parent: Path, name: str) -> Path:
         """Create `parent/name` exclusively; an existing root is never reused."""
-        parent.mkdir(parents=True, exist_ok=True)
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise self._unwritable(f"cannot create {parent}", exc) from exc
         root = require_owned_root(parent) / name
         try:
             root.mkdir(mode=0o700)
         except FileExistsError:
             raise ArtifactError(f"artifact root already exists: {root}") from None
+        except OSError as exc:
+            raise self._unwritable(f"cannot create {root}", exc) from exc
         return root
 
     def _write_new(self, record: RunRecord) -> None:
         path = self._record_path(record.run_id)
-        with path.open("x", encoding="utf-8") as handle:
-            handle.write(json.dumps(record.to_dict(), indent=2, default=str))
+        try:
+            with path.open("x", encoding="utf-8") as handle:
+                handle.write(json.dumps(record.to_dict(), indent=2, default=str))
+        except FileExistsError:
+            raise ArtifactError(f"run record already exists: {path}") from None
+        except OSError as exc:
+            raise self._unwritable(f"cannot write run record {path}", exc) from exc
 
     def _write(self, record: RunRecord) -> None:
+        """Replace the stored record atomically; on failure the stored record is unchanged."""
         path = self._record_path(record.run_id)
         staging = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-        staging.write_text(json.dumps(record.to_dict(), indent=2, default=str), encoding="utf-8")
-        staging.replace(path)
+        text = json.dumps(record.to_dict(), indent=2, default=str)
+        try:
+            staging.write_text(text, encoding="utf-8")
+            staging.replace(path)
+        except OSError as exc:
+            raise self._unwritable(f"cannot write run record {path}", exc) from exc
+
+    def _unwritable(self, action: str, exc: OSError) -> StoreUnavailableError:
+        """The typed failure of a write into this store (permission, missing or misplaced path)."""
+        return StoreUnavailableError(
+            f"run store {self._dir} cannot be used: {action}: {exc}; restore the owner's write "
+            "permission on it (a stored run record keeps its previous state)"
+        )
 
 
 def _read_record(path: Path) -> RunRecord:
-    """Parse one stored run record, naming the file if it is not a valid record."""
+    """Parse one stored run record, naming the file if it is not a valid record.
+
+    Raises:
+        ValueError: If the record is not a valid run record.
+        FileNotFoundError: If the record does not exist.
+        StoreUnavailableError: If the record cannot be read (for example no
+            read permission); nothing is changed.
+    """
     try:
         return RunRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
     except ValueError as exc:
         raise ValueError(f"corrupt run record {path}: {exc}") from exc
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise StoreUnavailableError(
+            f"run store {path.parent} cannot be used: cannot read run record {path}: {exc}; "
+            "restore the owner's read permission on it (nothing was changed)"
+        ) from exc

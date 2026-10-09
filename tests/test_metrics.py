@@ -1,141 +1,213 @@
-"""Tests for metrics aggregation."""
+"""Metrics: run lifecycle from records, cycles and usage only from the ledger."""
 
 from __future__ import annotations
 
-from apprentice.core.metrics import AgentMetrics, PipelineReport, aggregate_runs
+import io
+from decimal import Decimal
+from typing import TYPE_CHECKING, Any
+
+from rich.console import Console
+
+from apprentice.controls.authority import LedgerUsage
+from apprentice.core import progress
+from apprentice.core.metrics import aggregate_runs
 from apprentice.core.session_store import RunRecord
 
+if TYPE_CHECKING:
+    import pytest
 
-def _make_record(
+
+def _record(
     name: str = "quicksort",
     tier: int = 2,
     status: str = "completed",
-    elapsed: float = 10.0,
-    error: str = "",
-    budget: dict | None = None,
+    budget: dict[str, Any] | None = None,
 ) -> RunRecord:
     return RunRecord(
         run_id=f"{name}-test",
         algorithm_name=name,
         tier=tier,
         status=status,
-        session_state={"generated_code": "code"} if status == "completed" else {},
         budget_summary=budget or {},
-        started_at="2026-01-01T00:00:00",
-        completed_at="2026-01-01T00:01:00",
-        elapsed_seconds=elapsed,
-        error=error,
+        started_at="2026-01-01T00:00:00+00:00",
+        elapsed_seconds=10.0,
     )
 
 
-class TestAgentMetrics:
-    def test_avg_tokens_per_call(self) -> None:
-        m = AgentMetrics(agent_name="test", total_calls=10, total_tokens=1000)
-        assert m.avg_tokens_per_call == 100.0
-
-    def test_avg_tokens_zero_calls(self) -> None:
-        m = AgentMetrics(agent_name="test")
-        assert m.avg_tokens_per_call == 0.0
-
-    def test_to_dict(self) -> None:
-        m = AgentMetrics(agent_name="test", total_calls=5, total_tokens=500, total_cost_usd=0.05)
-        d = m.to_dict()
-        assert d["agent_name"] == "test"
-        assert d["avg_tokens_per_call"] == 100.0
-
-
-class TestPipelineReport:
-    def test_success_rate_all_pass(self) -> None:
-        report = PipelineReport(total_runs=10, successful_runs=10)
-        assert report.success_rate == 1.0
-
-    def test_success_rate_partial(self) -> None:
-        report = PipelineReport(total_runs=10, successful_runs=8, failed_runs=2)
-        assert report.success_rate == 0.8
-
-    def test_success_rate_zero_runs(self) -> None:
-        report = PipelineReport()
-        assert report.success_rate == 0.0
-
-    def test_avg_cost(self) -> None:
-        report = PipelineReport(total_runs=5, total_cost_usd=10.0)
-        assert report.avg_cost_per_algorithm == 2.0
+def _entry(
+    state: str, basis: str = "zero-hosted", kind: str = "build", **amounts: int
+) -> dict[str, Any]:
+    return {
+        "cycle_id": amounts.pop("cycle", 1),
+        "kind": kind,
+        "run_id": None,
+        "month": "2026-10",
+        "stage": "implementation",
+        "role": "implementation",
+        "operation": "generate",
+        "basis": basis,
+        "state": state,
+        "bound_tokens": amounts.get("bound_tokens", 0),
+        "bound_nanodollars": amounts.get("bound_nanodollars", 0),
+        "charged_tokens": amounts.get("charged_tokens"),
+        "charged_nanodollars": amounts.get("charged_nanodollars"),
+    }
 
 
-class TestAggregateRuns:
-    def test_empty(self) -> None:
-        report = aggregate_runs([])
-        assert report.total_runs == 0
-        assert report.success_rate == 0.0
+def _usage(entries: list[dict[str, Any]], *entryless: tuple[int, str]) -> LedgerUsage:
+    """The ledger read of `entries`' cycles plus admitted cycles that wrote no entry."""
+    cycles = {e["cycle_id"]: e["kind"] for e in entries} | dict(entryless)
+    return LedgerUsage(
+        cycles=[
+            {"cycle_id": c, "kind": k, "run_id": None, "state": "terminal", "outcome": "completed"}
+            for c, k in cycles.items()
+        ],
+        entries=entries,
+    )
 
-    def test_single_completed(self) -> None:
-        records = [_make_record(status="completed", elapsed=10.0)]
-        report = aggregate_runs(records)
-        assert report.total_runs == 1
-        assert report.successful_runs == 1
-        assert report.failed_runs == 0
-        assert report.success_rate == 1.0
 
-    def test_mixed_statuses(self) -> None:
+class TestLifecycle:
+    def test_in_progress_runs_are_neither_failed_nor_finished(self) -> None:
         records = [
-            _make_record("algo1", status="completed"),
-            _make_record("algo2", status="failed", error="boom"),
-            _make_record("algo3", status="completed"),
+            _record("a", status="completed"),
+            _record("b", status="failed"),
+            _record("c", status="in_progress"),
         ]
-        report = aggregate_runs(records)
-        assert report.total_runs == 3
-        assert report.successful_runs == 2
-        assert report.failed_runs == 1
 
-    def test_per_tier_breakdown(self) -> None:
-        records = [
-            _make_record("algo1", tier=1, status="completed"),
-            _make_record("algo2", tier=1, status="failed"),
-            _make_record("algo3", tier=2, status="completed"),
+        report = aggregate_runs(records, _usage([]), "test")
+
+        assert (report.successful_runs, report.failed_runs, report.in_progress_runs) == (1, 1, 1)
+        assert report.success_rate == 0.5
+        assert report.per_tier[2] == {"total": 3, "success": 1, "fail": 1, "in_progress": 1}
+
+
+class TestLedgerUsage:
+    def test_record_less_cycles_and_unsealed_runs_are_counted_from_the_ledger(self) -> None:
+        entries = [
+            _entry("settled", kind="suggest", cycle=1, charged_tokens=40, charged_nanodollars=0),
+            _entry("unknown", kind="build", cycle=2, bound_tokens=5974, bound_nanodollars=0),
+            _entry(
+                "settled",
+                basis="qualified-price-quote",
+                kind="library",
+                cycle=3,
+                charged_tokens=100,
+                charged_nanodollars=5_010_000,
+            ),
         ]
-        report = aggregate_runs(records)
-        assert report.per_tier[1]["total"] == 2
-        assert report.per_tier[1]["success"] == 1
-        assert report.per_tier[2]["total"] == 1
 
-    def test_per_agent_budget(self) -> None:
-        budget = {
-            "per_agent": {
-                "drafter": {
-                    "tokens_used": 1000,
-                    "cost_usd": 0.01,
-                    "calls": 1,
-                    "duration_seconds": 5.0,
-                },
-                "self_reviewer": {
-                    "tokens_used": 500,
-                    "cost_usd": 0.005,
-                    "calls": 1,
-                    "duration_seconds": 3.0,
-                },
-            }
+        report = aggregate_runs([_record(status="in_progress")], _usage(entries), "test")
+
+        assert report.usage["known_zero_hosted"].tokens == 40
+        assert report.usage["unknown_held"].tokens == 5974
+        assert report.usage["qualified_price_quote"].nanodollars == 5_010_000
+        assert report.cycles_by_kind == {"suggest": 1, "build": 1, "library": 1}
+
+    def test_admitted_cycles_without_entries_are_counted_and_add_no_usage(self) -> None:
+        entries = [
+            _entry("settled", kind="suggest", cycle=1, charged_tokens=40, charged_nanodollars=0)
+        ]
+        with_entries_only = aggregate_runs([], _usage(entries), "test")
+
+        report = aggregate_runs([], _usage(entries, (2, "suggest"), (3, "build")), "test")
+
+        assert report.cycles_by_kind == {"suggest": 2, "build": 1}
+        assert report.to_dict()["usage"] == with_entries_only.to_dict()["usage"]
+        assert report.active_reservations.entries == 0
+
+    def test_released_reservations_are_not_usage_and_in_flight_holds_stay_separate(self) -> None:
+        entries = [
+            _entry("released", cycle=1, bound_tokens=900, bound_nanodollars=0),
+            _entry("dispatched", cycle=2, bound_tokens=700, bound_nanodollars=0),
+        ]
+
+        report = aggregate_runs([], _usage(entries), "test")
+
+        assert all(category.entries == 0 for category in report.usage.values())
+        assert (report.active_reservations.entries, report.active_reservations.tokens) == (1, 700)
+
+    def test_record_snapshots_are_not_counted_again_and_estimates_stay_historical(self) -> None:
+        # A sealed record's accounting snapshot (with any estimates beside it)
+        # is a derived copy of ledger rows: only the ledger counts its usage.
+        snapshot = {
+            "accounting": {
+                "entries": [_entry("settled", charged_tokens=99, charged_nanodollars=0)]
+            },
+            "per_agent": {"drafter": {"tokens_used": 5000, "cost_usd": 9.0, "calls": 9}},
         }
-        records = [_make_record(budget=budget)]
-        report = aggregate_runs(records)
-        assert "drafter" in report.per_agent
-        assert report.per_agent["drafter"].total_tokens == 1000
-        assert report.total_tokens == 1500
+        legacy = {"per_agent": {"drafter": {"tokens_used": 1000, "cost_usd": 0.5, "calls": 2}}}
+        records = [_record("new", budget=snapshot), _record("old", budget=legacy)]
+        entries = [_entry("settled", charged_tokens=99, charged_nanodollars=0)]
 
-    def test_to_dict(self) -> None:
-        records = [_make_record()]
-        report = aggregate_runs(records)
-        d = report.to_dict()
-        assert "total_runs" in d
-        assert "success_rate" in d
-        assert "per_agent" in d
-        assert "algorithms" in d
+        usage = aggregate_runs(records, _usage(entries), "test").usage
 
-    def test_algorithms_list(self) -> None:
-        records = [
-            _make_record("algo1", status="completed"),
-            _make_record("algo2", status="failed", error="err"),
+        assert usage["known_zero_hosted"].tokens == 99
+        assert (
+            usage["historical_estimate"].tokens,
+            usage["historical_estimate"].estimated_usd,
+        ) == (
+            1000,
+            Decimal("0.5"),
+        )
+
+
+def _flat(text: str) -> str:
+    """Rendered text with every whitespace (including deliberate line wraps) removed."""
+    return "".join(text.split())
+
+
+class TestRenderedReport:
+    def test_every_category_amount_and_unit_survive_an_80_column_console_whole(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        out = io.StringIO()
+        monkeypatch.setattr(progress, "console", Console(file=out, width=80, force_terminal=False))
+        # A legacy record's binary-float estimate and ledger amounts far above
+        # any real use: nothing may be rounded, cut or elided.
+        legacy = _record(
+            "old",
+            budget={
+                "per_agent": {"drafter": {"tokens_used": 1000, "cost_usd": 0.1 + 0.2, "calls": 2}}
+            },
+        )
+        entries = [
+            _entry(
+                "settled",
+                basis="qualified-price-quote",
+                cycle=1,
+                charged_tokens=987_654_321_987,
+                charged_nanodollars=123_456_789_012_345_678_901,
+            ),
+            _entry(
+                "settled",
+                basis="sdk-reference-capacity",
+                cycle=2,
+                charged_tokens=1863,
+                charged_nanodollars=4_770_000,
+            ),
+            _entry("settled", cycle=3, charged_tokens=40, charged_nanodollars=0),
+            _entry("unknown", cycle=4, bound_tokens=5974, bound_nanodollars=66_092_500),
+            _entry("dispatched", cycle=5, bound_tokens=700, bound_nanodollars=1_000),
         ]
-        report = aggregate_runs(records)
-        assert len(report.algorithms) == 2
-        assert report.algorithms[0]["algorithm"] == "algo1"
-        assert report.algorithms[1]["error"] == "err"
+        running = _record("unsealed", status="in_progress")
+        report = aggregate_runs([legacy, running], _usage(entries), "test")
+
+        progress.IntegrationProgress(0, "", "").print_summary(report)
+
+        rendered = out.getvalue()
+        flat = _flat(rendered)
+        assert "…" not in rendered
+        assert max(len(line) for line in rendered.splitlines()) <= 80
+        categories = [*report.usage.items(), ("active_reservations", report.active_reservations)]
+        for name, category in categories:
+            amount = (
+                f"{category.estimated_usd}USDest."
+                if category.estimated_usd
+                else f"{Decimal(category.nanodollars).scaleb(-9).normalize():f}USD"
+            )
+            expected = f"{name}:{category.entries}entries,{category.tokens:,}tokens,{amount}"
+            assert expected in flat, name
+        assert "0.30000000000000004USDest." in flat
+        assert "123456789012.345678901USD" in flat
+        assert "987,654,321,987tokens" in flat
+        assert "unsealed" in flat and "inprogress" in flat

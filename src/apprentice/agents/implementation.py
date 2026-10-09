@@ -4,14 +4,19 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from google.adk.agents import LlmAgent, LoopAgent
+from google.adk.agents import BaseAgent, LlmAgent, LoopAgent
 
 from apprentice.core.artifacts import write_role
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
     from pathlib import Path
 
+    from google.adk.agents.invocation_context import InvocationContext
+    from google.adk.events import Event
     from google.adk.models.lite_llm import LiteLlm
+
+_PASSED = "implementation_passed"
 
 _DRAFTER_INSTRUCTION = """\
 You are an expert algorithm implementer for the no-magic educational project.
@@ -46,10 +51,11 @@ commenting standard IS the primary merge criterion.
 Minimum 3 assertions: normal case, edge case, stress case. Print a one-line
 pass summary on success.
 
-If session state contains `validation_feedback`, your previous attempt failed.
-Fix ALL listed issues.
-
 Return only the Python source code. No markdown fences, no prose.
+
+# Feedback on your previous attempt (empty on the first attempt)
+
+{validation_feedback?}
 """
 
 
@@ -86,11 +92,12 @@ def _run_validators(code: str, work_root: Path) -> dict[str, Any]:
 
 
 def _make_after_drafter_callback(work_root: Path) -> Any:
-    """Create a callback that validates the drafter's output after each generation.
+    """Create the drafter's after-agent callback that validates each draft.
 
-    If validation passes, sets _implementation_passed=True in state so the
-    LoopAgent's exit condition (checked via a trivial checker agent) fires.
-    If validation fails, writes feedback to session state for the next iteration.
+    Runs after every drafter iteration: writes the draft into the run's work
+    root, runs the validators and records whether it passed. A failed draft
+    leaves feedback in `validation_feedback`, which the next iteration's
+    instruction includes.
     """
 
     async def after_drafter(callback_context: Any) -> Any:
@@ -98,6 +105,7 @@ def _make_after_drafter_callback(work_root: Path) -> Any:
         code = state.get("generated_code", "")
 
         if not code:
+            state[_PASSED] = False
             state["validation_feedback"] = (
                 "No code was generated. Write complete Python source code."
             )
@@ -105,6 +113,7 @@ def _make_after_drafter_callback(work_root: Path) -> Any:
 
         result = _run_validators(code, work_root)
 
+        state[_PASSED] = result["all_passed"]
         if result["all_passed"]:
             state["validation_feedback"] = ""
             state["implementation_path"] = result["file_path"]
@@ -119,56 +128,43 @@ def _make_after_drafter_callback(work_root: Path) -> Any:
     return after_drafter
 
 
-def _make_exit_condition() -> Any:
-    """Create a callback that exits the loop when validation passes.
+class ValidationCheckpoint(BaseAgent):
+    """Ends the implementation loop once the latest draft passed validation.
 
-    Checked before each iteration. If validation_feedback is empty (meaning
-    the previous iteration passed), exits the loop.
+    Runs after the drafter in every iteration and escalates out of the
+    `LoopAgent` when the draft passed, so no further drafts are requested.
+    A failed draft continues to the next iteration until the loop's maximum.
     """
 
-    async def should_exit(callback_context: Any) -> Any:
-        from google.genai import types
+    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
+        from google.adk.events import Event, EventActions
 
-        state = callback_context.state
-        feedback = state.get("validation_feedback")
-
-        # On first iteration, validation_feedback doesn't exist yet — continue
-        if feedback is None:
-            return None
-
-        # Empty feedback means validation passed — exit
-        if feedback == "":
-            return types.Content(
-                role="model",
-                parts=[types.Part(text="Implementation validated successfully.")],
+        if ctx.session.state.get(_PASSED) is True:
+            yield Event(
+                invocation_id=ctx.invocation_id,
+                author=self.name,
+                branch=getattr(ctx, "branch", None),
+                actions=EventActions(escalate=True),
             )
-
-        # Non-empty feedback means validation failed — continue loop
-        return None
-
-    return should_exit
 
 
 def build_implementation_agent(
     model: LiteLlm,
     work_root: Path,
-    max_retries: int = 3,
+    max_attempts: int,
 ) -> LoopAgent:
     """Build an ADK LoopAgent for algorithm implementation with programmatic validation.
 
-    Architecture:
-    - Single LlmAgent (drafter) generates code. 1 LLM call per iteration.
-    - after_agent_callback runs validators programmatically (no LLM needed).
-    - If validation fails, feedback is written to session state.
-    - The drafter reads {validation_feedback} on the next iteration.
-    - before_agent_callback on the LoopAgent exits when validation passes.
-
-    This uses 1 LLM call per iteration instead of 5+ with an LLM reviewer.
+    Each iteration is one drafter call, the drafter's validation callback
+    and the checkpoint: a passing draft ends the loop, a failing one feeds
+    its issues into the next iteration. `max_attempts` is the total number of
+    drafts including the first (`agents.max_implementation_retries`); when
+    every draft failed the loop ends and the blocking gates fail the run.
 
     Args:
-        model: LiteLlm model instance.
+        model: Metered model of the implementation role.
         work_root: The run's exclusive work root the drafter output is validated in.
-        max_retries: Maximum loop iterations before giving up.
+        max_attempts: Total drafter iterations, including the first.
 
     Returns:
         A configured LoopAgent ready for pipeline integration.
@@ -184,7 +180,6 @@ def build_implementation_agent(
     return LoopAgent(
         name="implementation_loop",
         description="Generates and validates algorithm implementations.",
-        max_iterations=max_retries,
-        sub_agents=[drafter],
-        before_agent_callback=_make_exit_condition(),
+        max_iterations=max_attempts,
+        sub_agents=[drafter, ValidationCheckpoint(name="implementation_checkpoint")],
     )

@@ -5,11 +5,13 @@ from __future__ import annotations
 import logging
 import sys
 import time
+from decimal import Decimal
 from typing import Any
 
 from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
+from rich.text import Text
 
 console = Console(stderr=True)
 
@@ -17,20 +19,19 @@ _AGENT_LABELS: dict[str, str] = {
     "apprentice_pipeline": "Pipeline",
     "implementation_loop": "Implementation",
     "drafter": "Drafting code",
-    "self_reviewer": "Validating code",
+    "implementation_checkpoint": "Validating code",
     "artifact_generation": "Generating artifacts",
     "instrumentation": "Instrumenting",
     "visualization": "Creating Manim scene",
     "assessment": "Generating Anki cards",
-    "review_loop": "Reviewing artifacts",
-    "reviewer": "Running validators",
+    "reviewer": "Reviewing artifacts",
     "discovery": "Discovering algorithms",
 }
 
 _PIPELINE_STAGES = [
     "implementation_loop",
     "artifact_generation",
-    "review_loop",
+    "reviewer",
 ]
 
 
@@ -163,6 +164,13 @@ class PipelineProgress:
         console.print(table)
 
 
+def _usage_amount(category: Any) -> str:
+    """The category's exact amount with its unit: ledger nanodollars as USD, or the old estimate."""
+    if category.estimated_usd:
+        return f"{category.estimated_usd} USD est."
+    return f"{Decimal(category.nanodollars).scaleb(-9).normalize():f} USD"
+
+
 class IntegrationProgress:
     """Tracks progress across multiple algorithm runs."""
 
@@ -221,26 +229,27 @@ class IntegrationProgress:
         table.add_row("Total Runs", str(report.total_runs))
         table.add_row("Passed", f"[green]{report.successful_runs}[/]")
         table.add_row("Failed", f"[red]{report.failed_runs}[/]")
-        table.add_row("Total Cost", f"${report.total_cost_usd:.4f}")
-        table.add_row("Avg Cost/Algo", f"${report.avg_cost_per_algorithm:.4f}")
+        table.add_row("In Progress", str(report.in_progress_runs))
         table.add_row("Total Duration", f"{report.total_duration_seconds:.1f}s")
 
         console.print(table)
 
-        if report.per_agent:
-            agent_table = Table(title="Per-Agent Breakdown", border_style="dim")
-            agent_table.add_column("Agent", style="bold")
-            agent_table.add_column("Calls", justify="right")
-            agent_table.add_column("Tokens", justify="right")
-            agent_table.add_column("Cost", justify="right")
-            for name, metrics in sorted(report.per_agent.items()):
-                agent_table.add_row(
-                    name,
-                    str(metrics.total_calls),
-                    f"{metrics.total_tokens:,}",
-                    f"${metrics.total_cost_usd:.4f}",
-                )
-            console.print(agent_table)
+        # One line per category with its exact amount and unit, wrapped (never
+        # cut) at any console width; categories are never added together.
+        console.print(
+            Text(
+                f"Usage by Accounting Category ({report.usage_scope}; never summed, not an invoice)",
+                style="bold",
+            ),
+            overflow="fold",
+        )
+        rows = [*report.usage.items(), ("active_reservations", report.active_reservations)]
+        for name, category in rows:
+            line = (
+                f"{name}: {category.entries} entries, {category.tokens:,} tokens, "
+                f"{_usage_amount(category)}"
+            )
+            console.print(Text(line), overflow="fold")
 
         if report.algorithms:
             algo_table = Table(title="Algorithm Results", border_style="dim")
@@ -249,7 +258,9 @@ class IntegrationProgress:
             algo_table.add_column("Status")
             algo_table.add_column("Duration", justify="right")
             for algo in report.algorithms:
-                status_str = "[green]pass[/]" if algo["status"] == "completed" else "[red]fail[/]"
+                status_str = {"completed": "[green]pass[/]", "in_progress": "in progress"}.get(
+                    algo["status"], "[red]fail[/]"
+                )
                 algo_table.add_row(
                     algo["algorithm"],
                     str(algo["tier"]),

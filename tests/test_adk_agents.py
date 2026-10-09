@@ -1,109 +1,101 @@
-"""Tests for ADK agent builder functions."""
+"""ADK agents: implementation attempts, discovery tools and programmatic review."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import asyncio
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
-from google.adk.agents import LlmAgent, LoopAgent
-from google.adk.models.lite_llm import LiteLlm
+import pytest
 
-from apprentice.agents.assessment import build_assessment_agent
 from apprentice.agents.discovery import (
-    build_discovery_agent,
     check_duplicate,
     load_catalog,
     validate_name,
 )
 from apprentice.agents.implementation import build_implementation_agent
-from apprentice.agents.instrumentation import build_instrumentation_agent
 from apprentice.agents.review import build_review_agent
-from apprentice.agents.visualization import build_visualization_agent
+from apprentice.controls.authority import Authority
+from apprentice.controls.footprint import Footprint
+from apprentice.controls.policy import ControlPolicy
+from apprentice.core.config import load_config
+from apprentice.providers.factory import resolve_route
+from tests.conftest import fixture_outputs
+from tests.responses_fixture import ResponsesFixture, ResponsesServer, local_profile, write_config
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from apprentice.controls.authority import Cycle
     from apprentice.core.artifacts import RunScope
+    from apprentice.providers.factory import ModelRoute
 
 
-def _model() -> LiteLlm:
-    """Create a LiteLlm instance for testing agent construction."""
-    return LiteLlm(model="anthropic/claude-sonnet-4-20250514")
+async def _run(agent: Any, state: dict[str, Any] | None = None) -> dict[str, Any]:
+    from google.adk.runners import Runner
+    from google.adk.sessions import InMemorySessionService
+    from google.genai import types
+
+    service = InMemorySessionService()  # type: ignore[no-untyped-call]
+    runner = Runner(agent=agent, app_name="t", session_service=service)
+    session = await service.create_session(app_name="t", user_id="u", state=state or {})
+    message = types.Content(role="user", parts=[types.Part(text="Build selection sort.")])
+    async for _ in runner.run_async(user_id="u", session_id=session.id, new_message=message):
+        pass
+    stored = await service.get_session(app_name="t", user_id="u", session_id=session.id)
+    assert stored is not None
+    return dict(stored.state)
 
 
-class TestImplementationAgentBuilder:
-    def test_returns_loop_agent(self, scope: RunScope) -> None:
-        agent = build_implementation_agent(_model(), scope.work_root)
-        assert isinstance(agent, LoopAgent)
-
-    def test_name(self, scope: RunScope) -> None:
-        agent = build_implementation_agent(_model(), scope.work_root)
-        assert agent.name == "implementation_loop"
-
-    def test_max_iterations(self, scope: RunScope) -> None:
-        agent = build_implementation_agent(_model(), scope.work_root, max_retries=5)
-        assert agent.max_iterations == 5
-
-    def test_single_sub_agent(self, scope: RunScope) -> None:
-        agent = build_implementation_agent(_model(), scope.work_root)
-        assert len(agent.sub_agents) == 1
-
-    def test_drafter_name(self, scope: RunScope) -> None:
-        agent = build_implementation_agent(_model(), scope.work_root)
-        assert agent.sub_agents[0].name == "drafter"
+@pytest.fixture
+def toy(tmp_path: Path) -> Iterator[tuple[ResponsesFixture, ModelRoute, Cycle]]:
+    fixture = ResponsesFixture()
+    with ResponsesServer(fixture) as server:
+        config = load_config(
+            write_config(
+                tmp_path / "apprentice.toml",
+                profile=local_profile(tmp_path / "profile.json"),
+                base_url=server.base_url,
+            )
+        )
+        installation = tmp_path / "installation"
+        installation.mkdir()
+        authority = Authority.open(installation, Footprint(existing=()))
+        with authority.begin_cycle("build", ControlPolicy.from_config(config)) as cycle:
+            yield fixture, resolve_route(config.provider), cycle
 
 
-class TestInstrumentationAgentBuilder:
-    def test_returns_llm_agent(self) -> None:
-        agent = build_instrumentation_agent(_model())
-        assert isinstance(agent, LlmAgent)
+@pytest.mark.usefixtures("judged_execution")
+class TestImplementationLoop:
+    def test_valid_first_draft_ends_the_loop_after_one_call(
+        self, scope: RunScope, toy: tuple[ResponsesFixture, ModelRoute, Cycle]
+    ) -> None:
+        fixture, route, cycle = toy
+        fixture.outputs = fixture_outputs()
+        agent = build_implementation_agent(
+            route.model(cycle, "implementation", "implementation"), scope.work_root, max_attempts=3
+        )
 
-    def test_name(self) -> None:
-        agent = build_instrumentation_agent(_model())
-        assert agent.name == "instrumentation"
+        state = asyncio.run(_run(agent))
 
-    def test_output_key(self) -> None:
-        agent = build_instrumentation_agent(_model())
-        assert agent.output_key == "instrumented_code"
+        assert len(fixture.generations()) == 1
+        assert state["validation_feedback"] == ""
+        assert Path(state["implementation_path"]).read_text() == fixture.outputs["drafter"]
 
+    def test_failing_drafts_run_the_total_attempts_including_the_first(
+        self, scope: RunScope, toy: tuple[ResponsesFixture, ModelRoute, Cycle]
+    ) -> None:
+        fixture, route, cycle = toy
+        fixture.outputs = fixture_outputs(failing_implementation=True)
+        agent = build_implementation_agent(
+            route.model(cycle, "implementation", "implementation"), scope.work_root, max_attempts=2
+        )
 
-class TestVisualizationAgentBuilder:
-    def test_returns_llm_agent(self) -> None:
-        agent = build_visualization_agent(_model())
-        assert isinstance(agent, LlmAgent)
+        state = asyncio.run(_run(agent))
 
-    def test_name(self) -> None:
-        agent = build_visualization_agent(_model())
-        assert agent.name == "visualization"
-
-    def test_has_template_tool(self) -> None:
-        agent = build_visualization_agent(_model())
-        assert len(agent.tools) >= 1
-
-
-class TestAssessmentAgentBuilder:
-    def test_returns_llm_agent(self) -> None:
-        agent = build_assessment_agent(_model())
-        assert isinstance(agent, LlmAgent)
-
-    def test_name(self) -> None:
-        agent = build_assessment_agent(_model())
-        assert agent.name == "assessment"
-
-    def test_output_key(self) -> None:
-        agent = build_assessment_agent(_model())
-        assert agent.output_key == "anki_deck_content"
-
-
-class TestDiscoveryAgentBuilder:
-    def test_returns_llm_agent(self) -> None:
-        agent = build_discovery_agent(_model())
-        assert isinstance(agent, LlmAgent)
-
-    def test_name(self) -> None:
-        agent = build_discovery_agent(_model())
-        assert agent.name == "discovery"
-
-    def test_has_tools(self) -> None:
-        agent = build_discovery_agent(_model())
-        assert len(agent.tools) == 3
+        _first, second = fixture.generations()
+        assert "fixture" in second["instructions"]
+        assert "implementation_path" not in state
 
 
 class TestDiscoveryTools:
@@ -133,15 +125,29 @@ class TestDiscoveryTools:
         assert result["valid"] is True
 
 
-class TestReviewAgentBuilder:
-    def test_returns_loop_agent(self, scope: RunScope) -> None:
-        agent = build_review_agent(_model(), scope.work_root, scope.algorithm)
-        assert isinstance(agent, LoopAgent)
+class TestProgrammaticReview:
+    def test_review_validates_every_artifact_without_a_model(self, scope: RunScope) -> None:
+        outputs = fixture_outputs()
+        state = {
+            "generated_code": outputs["drafter"],
+            "instrumented_code": outputs["instrumentation"],
+            "manim_scene_code": outputs["visualization"],
+            "anki_deck_content": outputs["assessment"],
+        }
 
-    def test_name(self, scope: RunScope) -> None:
-        agent = build_review_agent(_model(), scope.work_root, scope.algorithm)
-        assert agent.name == "review_loop"
+        final = asyncio.run(_run(build_review_agent(scope.work_root, scope.algorithm), state))
 
-    def test_max_iterations(self, scope: RunScope) -> None:
-        agent = build_review_agent(_model(), scope.work_root, scope.algorithm, max_iterations=3)
-        assert agent.max_iterations == 3
+        assert final["review_verdict"] == "passed"
+
+    def test_review_reports_an_invalid_artifact(self, scope: RunScope) -> None:
+        outputs = fixture_outputs()
+        state = {
+            "generated_code": outputs["drafter"],
+            "instrumented_code": outputs["instrumentation"],
+            "manim_scene_code": outputs["visualization"],
+            "anki_deck_content": "one column only\n",
+        }
+
+        final = asyncio.run(_run(build_review_agent(scope.work_root, scope.algorithm), state))
+
+        assert final["review_verdict"].startswith("failed: ")
