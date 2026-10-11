@@ -19,6 +19,10 @@ from urllib.parse import urlsplit
 
 from google.adk.models.lite_llm import LiteLlm
 
+from apprentice.controls.credentials import (
+    PublicationCredentialError,
+    require_generation_environment,
+)
 from apprentice.core.config import backend_problem
 from apprentice.metering.client import MeteredResponsesClient
 from apprentice.metering.pricing import load_price_snapshot
@@ -66,7 +70,13 @@ class ModelRoute:
         )
 
     def model(self, cycle: Cycle, stage: str, role: str) -> LiteLlm:
-        """Return the factory model of one role, metered against `cycle`."""
+        """Return the factory model of one role, metered against `cycle`.
+
+        Raises:
+            PublicationCredentialError: If a known publication credential is
+                present in the environment.
+        """
+        require_generation_environment()
         return LiteLlm(
             model=self.model_string,
             llm_client=MeteredResponsesClient(self, cycle, stage, role),
@@ -123,13 +133,19 @@ def resolve_route(
     """Resolve the configured route, with optional backend/model overrides.
 
     Raises:
-        RouteError: If the backend is unsupported or misconfigured, or the
-            accounting profile does not apply to the route.
+        RouteError: If a known publication credential is present in the
+            environment (generation never runs next to one), the backend is
+            unsupported or misconfigured, or the accounting profile does not
+            apply to the route.
         apprentice.metering.profile.ProfileError: If the profile is missing
             or invalid.
         apprentice.metering.pricing.PriceAuthorityError: If the installed
             SDKs or price data are not the pinned authority.
     """
+    try:
+        require_generation_environment()
+    except PublicationCredentialError as exc:
+        raise RouteError(str(exc)) from exc
     chosen_backend = backend or provider.backend
     problem = backend_problem(chosen_backend)
     if problem:

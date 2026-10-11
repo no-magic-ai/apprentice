@@ -17,7 +17,8 @@ from apprentice.agents.packaging import (
     RepositorySubmission,
     submit_snapshot,
 )
-from tests.conftest import release
+from apprentice.controls.credentials import PublisherCapability
+from tests.conftest import PUBLISH_TOKEN, release
 
 if TYPE_CHECKING:
     from apprentice.core.artifacts import BundleSnapshot
@@ -29,6 +30,7 @@ _VIZ = "no-magic-ai/no-magic-viz"
 _APPROVAL = {"approved_by": "tester", "approved_at": "2026-10-06T12:00:00+00:00"}
 _CORE_PR = "https://github.com/no-magic-ai/no-magic/pull/offline-1"
 _VIZ_PR = "https://github.com/no-magic-ai/no-magic-viz/pull/offline-2"
+CAPABILITY = PublisherCapability(PUBLISH_TOKEN)
 
 
 def _admit_all(prepared: list[RepositorySubmission]) -> None:
@@ -39,7 +41,11 @@ def _submit(
     snapshot: BundleSnapshot, approval: dict[str, str], workspace: Path
 ) -> list[RepositorySubmission]:
     return submit_snapshot(
-        snapshot, approval, workspace, PublicationSteps(admit=_admit_all, before_step=_any_step)
+        snapshot,
+        approval,
+        workspace,
+        PublicationSteps(admit=_admit_all, before_step=_any_step),
+        CAPABILITY,
     )
 
 
@@ -47,12 +53,14 @@ def _any_step(step: str) -> None:
     """Per-step liveness belongs to the caller (the CLI checks the ledger); none here."""
 
 
-def _snapshot(store: SessionStore, algorithm: str = "selection") -> BundleSnapshot:
+def _snapshot(
+    store: SessionStore, algorithm: str = "selection", implementation: str = "impl = 1\n"
+) -> BundleSnapshot:
     record = store.create_run(algorithm, 2)
     store.complete_run(
         record,
         {
-            "generated_code": "impl = 1\n",
+            "generated_code": implementation,
             "manim_scene_code": "scene = 1\n",
             "instrumented_code": "trace = 1\n",
             "anki_deck_content": "front,back\n",
@@ -200,15 +208,17 @@ def test_second_push_failure_reports_the_pushed_core_branch(
     assert offline_remotes.gh_calls() == []
 
 
-def test_second_pull_request_failure_reports_the_opened_core_pr(
-    store: SessionStore, offline_remotes: OfflineRemotes, monkeypatch: pytest.MonkeyPatch
+def test_second_pull_request_failure_reports_the_opened_core_pr_without_the_token(
+    store: SessionStore, offline_remotes: OfflineRemotes
 ) -> None:
-    monkeypatch.setenv("OFFLINE_GH_FAIL_ON", "2")
+    offline_remotes.fail_pull_request_on(2)
 
     with pytest.raises(PackagingError, match="configured failure") as excinfo:
         _submit(_snapshot(store), _APPROVAL, store.allocate_work_root())
 
     assert _effects(excinfo) == [(_CORE, True, _CORE_PR), (_VIZ, True, "")]
+    assert PUBLISH_TOKEN not in str(excinfo.value)
+    assert "configured failure for token <redacted>" in str(excinfo.value)
 
 
 def test_packaging_uses_captured_bytes_even_if_the_bundle_changes_after_verification(
@@ -238,10 +248,12 @@ def test_packaging_uses_captured_bytes_even_if_the_bundle_changes_after_verifica
 def test_commit_whose_stored_blob_differs_is_never_pushed(
     store: SessionStore, offline_remotes: OfflineRemotes
 ) -> None:
-    offline_remotes.mutate_staged_python(_CORE)
+    offline_remotes.normalize_python_line_endings(_CORE)
 
     with pytest.raises(PackagingError, match="differs from approval") as excinfo:
-        _submit(_snapshot(store), _APPROVAL, store.allocate_work_root())
+        _submit(
+            _snapshot(store, implementation="impl = 1\r\n"), _APPROVAL, store.allocate_work_root()
+        )
 
     assert excinfo.value.effects == []
     assert offline_remotes.branches(_CORE) == ["main"]
@@ -249,55 +261,110 @@ def test_commit_whose_stored_blob_differs_is_never_pushed(
     assert offline_remotes.gh_calls() == []
 
 
-def test_extra_path_staged_by_native_git_is_never_committed_or_pushed(
-    store: SessionStore, offline_remotes: OfflineRemotes, tmp_path: Path
+_SENTINEL_PROGRAM = '#!/bin/sh\necho "$0" >> "{log}"\ncat\n'
+
+
+def test_operator_git_programs_never_run_and_only_their_identity_is_used(
+    store: SessionStore,
+    offline_remotes: OfflineRemotes,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A post-checkout hook in the isolated global config stages an extra file
-    # in every clone, so `git add` of the approved paths leaves more staged.
-    hooks = tmp_path / "hooks"
-    hooks.mkdir()
-    hook = hooks / "post-checkout"
-    hook.write_text("#!/bin/sh\necho extra > EXTRA.txt\ngit add EXTRA.txt\n")
-    hook.chmod(0o755)
-    with open(os.environ["GIT_CONFIG_GLOBAL"], "a", encoding="utf-8") as config:
-        config.write(f"[core]\n\thooksPath = {hooks}\n")
-
-    with pytest.raises(PackagingError) as excinfo:
-        _submit(_snapshot(store), _APPROVAL, store.allocate_work_root())
-
-    assert excinfo.value.effects == []
-    assert offline_remotes.branches(_CORE) == ["main"]
-    assert offline_remotes.branches(_VIZ) == ["main"]
-    assert offline_remotes.gh_calls() == []
-
-
-def test_extra_path_added_by_a_post_commit_amend_is_never_pushed(
-    store: SessionStore, offline_remotes: OfflineRemotes, tmp_path: Path
-) -> None:
-    # A post-commit hook amends every commit once to add an extra file, after
-    # the staged-path check has passed; only the committed-path check sees it.
-    hooks = tmp_path / "hooks"
-    hooks.mkdir()
-    hook = hooks / "post-commit"
-    hook.write_text(
-        "#!/bin/sh\n"
-        'if [ -z "$FIXTURE_AMENDED" ]; then\n'
-        "  export FIXTURE_AMENDED=1\n"
-        "  echo extra > EXTRA.txt\n"
-        "  git add EXTRA.txt\n"
-        "  git commit -q --amend --no-edit --no-verify\n"
-        "fi\n"
+    # The operator's global git configuration names hooks, a filter, an
+    # fsmonitor, a signing program and a credential helper, each of which would
+    # log its name. None may run during publication; only the configured
+    # identity is used, and the commit stays the same deterministic one.
+    log = tmp_path / "ran.log"
+    programs = tmp_path / "operator-programs"
+    hooks = programs / "hooks"
+    hooks.mkdir(parents=True)
+    for name in ("post-checkout", "prepare-commit-msg", "post-commit", "reference-transaction"):
+        (hooks / name).write_text(_SENTINEL_PROGRAM.format(log=log))
+    for name in ("clean-filter", "fsmonitor", "signer", "credential-helper"):
+        (programs / name).write_text(_SENTINEL_PROGRAM.format(log=log))
+    for path in programs.rglob("*"):
+        if path.is_file():
+            path.chmod(0o755)
+    (programs / "attributes").write_text("*.py filter=operator\n")
+    _git_config(
+        "[core]",
+        f"\thooksPath = {hooks}",
+        f"\tfsmonitor = {programs / 'fsmonitor'}",
+        f"\tattributesFile = {programs / 'attributes'}",
+        '[filter "operator"]',
+        f"\tclean = {programs / 'clean-filter'}",
+        "\trequired = true",
+        "[commit]",
+        "\tgpgSign = true",
+        "[gpg]",
+        f"\tprogram = {programs / 'signer'}",
+        "[credential]",
+        f"\thelper = {programs / 'credential-helper'}",
     )
-    hook.chmod(0o755)
-    with open(os.environ["GIT_CONFIG_GLOBAL"], "a", encoding="utf-8") as config:
-        config.write(f"[core]\n\thooksPath = {hooks}\n")
+    for name in ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EMAIL"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Explicit Author")
+    snapshot = _snapshot(store)
 
-    with pytest.raises(PackagingError) as excinfo:
-        _submit(_snapshot(store), _APPROVAL, store.allocate_work_root())
+    first = _submit(snapshot, _APPROVAL, store.allocate_work_root())
+
+    assert not log.exists()
+    branch = f"apprentice/{snapshot.run_id}"
+    approved = {a.role: a.data for a in snapshot.artifacts}
+    assert (
+        offline_remotes.blob(_CORE, branch, "02-alignment/microselection.py")
+        == (approved["implementation"])
+    )
+    header = subprocess.run(
+        ["git", "cat-file", "commit", branch],
+        cwd=offline_remotes.bare[_CORE],
+        capture_output=True,
+        check=True,
+    ).stdout.split(b"\n\n", 1)[0]
+    assert b"gpgsig" not in header
+    assert b"\nauthor Explicit Author <offline@fixture.invalid> " in header
+    assert b"\ncommitter Offline Fixture <offline@fixture.invalid> " in header
+
+    # The same approval on the same base prepares the same commit again.
+    prepared: list[str] = []
+
+    def capture(submissions: list[RepositorySubmission]) -> None:
+        prepared.extend(submission.commit for submission in submissions)
+        raise RuntimeError("stop before any push")
+
+    with pytest.raises(RuntimeError):
+        submit_snapshot(
+            snapshot,
+            _APPROVAL,
+            store.allocate_work_root(),
+            PublicationSteps(admit=capture, before_step=_any_step),
+            CAPABILITY,
+        )
+    assert prepared == [submission.commit for submission in first]
+    assert not log.exists()
+
+
+def test_missing_operator_identity_fails_before_any_clone_or_effect(
+    store: SessionStore, offline_remotes: OfflineRemotes, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    empty = Path(os.environ["GIT_CONFIG_GLOBAL"]).with_name("empty-gitconfig")
+    empty.write_text("")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(empty))
+    for name in (
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("EMAIL", raising=False)
+    workspace = store.allocate_work_root()
+
+    with pytest.raises(PackagingError, match="no git commit identity") as excinfo:
+        _submit(_snapshot(store), _APPROVAL, workspace)
 
     assert excinfo.value.effects == []
-    assert offline_remotes.branches(_CORE) == ["main"]
-    assert offline_remotes.branches(_VIZ) == ["main"]
+    assert sorted(p.name for p in workspace.iterdir()) == []
     assert offline_remotes.gh_calls() == []
 
 
@@ -456,6 +523,7 @@ def test_each_prepared_commit_is_measured_before_admission(
         _APPROVAL,
         store.allocate_work_root(),
         PublicationSteps(admit=record, before_step=_any_step),
+        CAPABILITY,
     )
 
     assert seen == [
@@ -478,6 +546,7 @@ def test_refused_admission_pushes_nothing(
             _APPROVAL,
             store.allocate_work_root(),
             PublicationSteps(admit=refuse, before_step=_any_step),
+            CAPABILITY,
         )
 
     assert offline_remotes.branches(_CORE) == ["main"]
@@ -513,7 +582,7 @@ def test_prepared_commit_changed_between_remote_steps_stops_the_next_effect(
 
     steps = PublicationSteps(admit=_admit_all, before_step=tamper)
     with pytest.raises(PackagingError, match="was replaced by"):
-        submit_snapshot(_snapshot(store), _APPROVAL, workspace, steps)
+        submit_snapshot(_snapshot(store), _APPROVAL, workspace, steps, CAPABILITY)
 
     assert offline_remotes.gh_calls() == []
     assert {s.repository: s.pushed for s in steps.progress} == published
@@ -530,7 +599,7 @@ def test_refused_step_check_stops_before_the_next_remote_effect(
 
     steps = PublicationSteps(admit=_admit_all, before_step=lost)
     with pytest.raises(RuntimeError):
-        submit_snapshot(_snapshot(store), _APPROVAL, store.allocate_work_root(), steps)
+        submit_snapshot(_snapshot(store), _APPROVAL, store.allocate_work_root(), steps, CAPABILITY)
 
     assert [s.pushed for s in steps.progress] == [True, False]
     assert offline_remotes.branches(_VIZ) == ["main"]
@@ -542,29 +611,31 @@ def _git_config(*lines: str) -> None:
         config.write("\n".join(lines) + "\n")
 
 
-def _rewrite(offline_remotes: OfflineRemotes, kind: str) -> None:
-    """Route the core repository's supported URL to the viz repository through git config."""
-    core = packaging._REPOSITORY_URLS[_CORE]
-    viz = offline_remotes.bare[_VIZ].as_uri()
-    _git_config(f'[url "{viz}"]', f"\t{kind} = {core}")
-
-
 @pytest.mark.parametrize("kind", ["insteadOf", "pushInsteadOf"])
-def test_git_routing_the_core_url_elsewhere_is_refused_before_any_commit_or_push(
+def test_global_url_rewrite_never_sends_approved_bytes_elsewhere(
     store: SessionStore, offline_remotes: OfflineRemotes, kind: str
 ) -> None:
-    _rewrite(offline_remotes, kind)
-    workspace = store.allocate_work_root()
+    # The operator's global configuration routes the core URL to the viz repository.
+    core = packaging._REPOSITORY_URLS[_CORE]
+    _git_config(f'[url "{offline_remotes.bare[_VIZ].as_uri()}"]', f"\t{kind} = {core}")
+    snapshot = _snapshot(store)
 
-    with pytest.raises(PackagingError) as excinfo:
-        _submit(_snapshot(store), _APPROVAL, workspace)
+    _submit(snapshot, _APPROVAL, store.allocate_work_root())
 
-    assert excinfo.value.effects == []
-    assert offline_remotes.branches(_CORE) == ["main"]
-    assert offline_remotes.branches(_VIZ) == ["main"]
-    assert offline_remotes.gh_calls() == []
-    if kind == "insteadOf":
-        assert not (workspace / "no-magic").exists()
+    branch = f"apprentice/{snapshot.run_id}"
+    approved = {a.role: a.data for a in snapshot.artifacts}
+    assert (
+        offline_remotes.blob(_CORE, branch, "02-alignment/microselection.py")
+        == (approved["implementation"])
+    )
+    viz_tree = subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", branch],
+        cwd=offline_remotes.bare[_VIZ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    assert viz_tree == ["README.md", "scenes/README.md", "scenes/scene_microselection.py"]
 
 
 def test_destination_rerouted_after_the_first_push_stops_every_later_step(
@@ -588,6 +659,7 @@ def test_destination_rerouted_after_the_first_push_stops_every_later_step(
             _APPROVAL,
             workspace,
             PublicationSteps(admit=_admit_all, before_step=before_step),
+            CAPABILITY,
         )
 
     branch = f"apprentice/{snapshot.run_id}"

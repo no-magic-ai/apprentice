@@ -703,7 +703,7 @@ class TestTerminalRecord:
 
         monkeypatch.setattr(packaging, "submit_snapshot", submit_then_change)
         if fail_on:
-            monkeypatch.setenv("OFFLINE_GH_FAIL_ON", fail_on)
+            offline_remotes.fail_pull_request_on(int(fail_on))
         capsys.readouterr()
 
         assert _submit(record.run_id) == 1
@@ -766,7 +766,7 @@ class TestTerminalRecord:
 
         monkeypatch.setattr(packaging, "submit_snapshot", submit_then_damage)
         if fail_on:
-            monkeypatch.setenv("OFFLINE_GH_FAIL_ON", fail_on)
+            offline_remotes.fail_pull_request_on(int(fail_on))
         capsys.readouterr()
         try:
             assert _submit(record.run_id) == 1

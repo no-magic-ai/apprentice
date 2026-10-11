@@ -47,6 +47,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from apprentice.controls.credentials import require_generation_environment
 from apprentice.sandbox.errors import SandboxInfrastructureError, SandboxUnavailableError
 from apprentice.sandbox.programs import (
     COLLECTOR_REJECTED,
@@ -401,7 +402,10 @@ def open_sandbox(config: ExecutionConfig) -> Sandbox:
         SandboxUnavailableError: If no backend is configured, the Docker CLI,
             context, daemon or image is missing or unsupported, or the image
             was not built from this package's recipe. Nothing is executed.
+        PublicationCredentialError: If a known publication credential is
+            present in the environment; validation never runs next to one.
     """
+    require_generation_environment()
     if not config.docker_context or not config.image:
         raise SandboxUnavailableError(
             "no execution backend is configured: set [execution].docker_context and "

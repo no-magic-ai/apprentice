@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from apprentice.controls.credentials import require_generation_environment
 from apprentice.models.work_item import WorkItem
 from apprentice.sandbox.errors import SandboxUnavailableError, UnsafeInputError
 from apprentice.sandbox.staging import MAX_ARTIFACT_BYTES, read_scoped, staged_copies
@@ -63,6 +64,13 @@ class ValidatorTools:
     """The validator tools of one trusted artifact root (and, for correctness, one sandbox)."""
 
     def __init__(self, root: Path, sandbox: Sandbox | None = None) -> None:
+        """Bind the tools to `root` (and `sandbox`).
+
+        Raises:
+            PublicationCredentialError: If a known publication credential is
+                present in the environment; validation never runs next to one.
+        """
+        require_generation_environment()
         self.root = root
         self._sandbox = sandbox
 

@@ -261,6 +261,8 @@ def run_build(
     sandbox infrastructure error ends the run `failed`.
 
     Raises:
+        PublicationCredentialError: If a known publication credential is present
+            in the environment (nothing is admitted or created).
         ControlDeniedError: If the cycle itself is not admitted (no run is created).
         StoreUnavailableError: If the run's record or work root cannot be
             created (its cycle has already ended `failed`).
@@ -271,8 +273,10 @@ def run_build(
             outcome it reached and the reason is added as a note to the
             interruption (or to the result's `error`).
     """
+    from apprentice.controls.credentials import require_generation_environment
     from apprentice.core.orchestrator import build_pipeline
 
+    require_generation_environment()
     algorithm, tier, description = request
     run_id = SessionStore.new_run_id(algorithm, tier)
     with recording_end():

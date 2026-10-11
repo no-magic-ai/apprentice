@@ -330,7 +330,7 @@ class TestChangeMeasurement:
         _git(repo, "add", "-A")
         _git(repo, "commit", "-q", "-m", "change")
 
-        size = measure_commit(repo)
+        size = measure_commit(repo, dict(os.environ))
 
         assert size.files == 4  # renamed old.py + new.py, edit.txt, the binary
         assert size.text_lines == 3  # edit.txt: +c +unterminated -b; the pure rename has none
@@ -1260,9 +1260,10 @@ class TestKnownRemoteOutcome:
         capsys.readouterr()
         with monkeypatch.context() as patch:
             patch.setattr(Authority, "publication_attempt", unreadable)
-            patch.setenv("OFFLINE_GH_FAIL_ON", "1")
+            offline_remotes.fail_pull_request_on(1)
 
             code = run_submit(args)
+        offline_remotes.fail_pull_request_on(None)
 
         reported = _json_objects(capsys.readouterr().out)[-1]
         stored = _submission(run_id)
