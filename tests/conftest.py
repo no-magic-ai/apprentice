@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -18,19 +19,28 @@ from apprentice.core.session_store import SessionStore
 if TYPE_CHECKING:
     from apprentice.core.artifacts import RunScope
 
+# The offline publication token of submit tests: a constructed stub in the
+# accepted opaque format, not a credential of any service.
+PUBLISH_TOKEN = "offline_publish_fixture_" + "t" * 16
+
 
 @pytest.fixture(autouse=True)
 def private_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Every test gets its own empty HOME and no hosted-provider environment.
+    """Every test gets its own empty HOME and no hosted-provider or publication environment.
 
     The default store/log roots and the installation footprint then never
-    see the real user's `~/.apprentice`, and no hosted credential or base URL
-    reaches a route.
+    see the real user's `~/.apprentice`, no hosted credential or base URL
+    reaches a route, and no ambient GitHub credential is visible to
+    generation (submit tests set only the offline publication token).
     """
+    from apprentice.controls.credentials import PUBLICATION_CREDENTIAL_VARIABLES
+
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     for name in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE"):
+        monkeypatch.delenv(name, raising=False)
+    for name in PUBLICATION_CREDENTIAL_VARIABLES:
         monkeypatch.delenv(name, raising=False)
     return home
 
@@ -242,9 +252,11 @@ class OfflineRemotes:
     file URLs — a declared test seam, not a claim of GitHub identity; child
     interpreters apply the same map from OFFLINE_REPOSITORY_URLS through
     `apply_offline_repository_urls`. Git config is isolated (no URL
-    rewrites), git may only use the file transport (GIT_ALLOW_PROTOCOL=file),
-    and `gh` on PATH is a recording stand-in, so packaging runs real git
-    without any remote effect.
+    rewrites), the supported file URLs make packaging allow only the file
+    transport, and `gh` on PATH is a recording stand-in, so packaging runs
+    real git without any remote effect. The stand-in records the environment
+    it was given and is configured through files, because packaging gives it
+    no ambient environment.
     """
 
     bare: dict[str, Path]
@@ -254,6 +266,41 @@ class OfflineRemotes:
         if not self.gh_log.exists():
             return []
         return [json.loads(line) for line in self.gh_log.read_text().splitlines()]
+
+    def gh_environments(self) -> list[dict[str, Any]]:
+        """The environment facts (GH_TOKEN, HOME, variable names) of every `gh` call."""
+        log = self.gh_log.with_name("gh-env.jsonl")
+        if not log.exists():
+            return []
+        return [json.loads(line) for line in log.read_text().splitlines()]
+
+    def fail_pull_request_on(self, number: int | None) -> None:
+        """Make the `number`-th `gh` call fail, echoing its token on stderr (None: never)."""
+        path = self.gh_log.with_name("gh-fail-on")
+        if number is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(str(number))
+
+    def record_git_environments(self) -> None:
+        """Put a `git` first on PATH that records each call's environment, then runs real git."""
+        real = shutil.which("git")
+        assert real is not None
+        wrapper = self.gh_log.parent / "bin" / "git"
+        wrapper.write_text(
+            _GIT_ENV_RECORDER.format(
+                python=sys.executable, git=real, log=str(self.gh_log.with_name("git-env.jsonl"))
+            )
+        )
+        wrapper.chmod(0o755)
+
+    def git_environments(self) -> list[dict[str, Any]]:
+        """Per git call: its subcommand, the git configuration given through the
+        environment, HOME and the names of every variable it received."""
+        log = self.gh_log.with_name("git-env.jsonl")
+        if not log.exists():
+            return []
+        return [json.loads(line) for line in log.read_text().splitlines()]
 
     def branches(self, repository: str) -> list[str]:
         out = subprocess.run(
@@ -289,25 +336,19 @@ class OfflineRemotes:
         hook.write_text("#!/bin/sh\necho 'offline fixture: push rejected' >&2\nexit 1\n")
         hook.chmod(0o755)
 
-    def mutate_staged_python(self, repository: str) -> None:
-        """Make native git rewrite staged `*.py` content through a clean filter.
+    def normalize_python_line_endings(self, repository: str) -> None:
+        """Make the repository's own `.gitattributes` mark `*.py` as text.
 
-        The repository's main branch gains a `.gitattributes` routing `*.py`
-        through a filter defined in the isolated global git config, so a
-        clone's `git add` stores different bytes than the working file.
+        The main branch gains the attribute, so a clone's `git add` stores a
+        file with CRLF line endings as LF: native git, driven by the base
+        repository's content rather than any configuration, stores different
+        bytes than the working file.
         """
-        config = Path(os.environ["GIT_CONFIG_GLOBAL"])
-        with config.open("a", encoding="utf-8") as handle:
-            handle.write(
-                '[filter "offline-mutate"]\n\tclean = sed -e s/$/_mutated/\n\trequired = true\n'
-            )
         seed = self.bare[repository].parent / f"attributes-{self.bare[repository].stem}"
         subprocess.run(["git", "clone", "-q", str(self.bare[repository]), str(seed)], check=True)
-        (seed / ".gitattributes").write_text("*.py filter=offline-mutate\n")
+        (seed / ".gitattributes").write_text("*.py text\n")
         subprocess.run(["git", "add", ".gitattributes"], cwd=seed, check=True)
-        subprocess.run(
-            ["git", "commit", "-q", "-m", "route python through a filter"], cwd=seed, check=True
-        )
+        subprocess.run(["git", "commit", "-q", "-m", "python is text"], cwd=seed, check=True)
         subprocess.run(["git", "push", "-q", "origin", "main"], cwd=seed, check=True)
 
     def blob(self, repository: str, ref: str, path: str) -> bytes:
@@ -360,11 +401,37 @@ with open({log!r}, "a", encoding="utf-8") as handle:
     handle.write(json.dumps(sys.argv[1:]) + "\\n")
 with open({log!r}, encoding="utf-8") as handle:
     number = sum(1 for _ in handle)
-if os.environ.get("OFFLINE_GH_FAIL_ON") == str(number):
-    sys.stderr.write("offline gh stand-in: configured failure\\n")
+facts = {{
+    "GH_TOKEN": os.environ.get("GH_TOKEN"),
+    "HOME": os.environ.get("HOME"),
+    "variables": sorted(os.environ),
+}}
+with open({envlog!r}, "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(facts) + "\\n")
+if os.path.exists({fail!r}) and open({fail!r}).read() == str(number):
+    token = os.environ.get("GH_TOKEN", "")
+    sys.stderr.write("offline gh stand-in: configured failure for token " + token + "\\n")
     sys.exit(1)
 host, _, repo = sys.argv[sys.argv.index("--repo") + 1].partition("/")
 print(f"https://{{host}}/{{repo}}/pull/offline-{{number}}")
+"""
+
+_GIT_ENV_RECORDER = """#!{python}
+import json, os, sys
+count = int(os.environ.get("GIT_CONFIG_COUNT") or 0)
+config = {{
+    os.environ["GIT_CONFIG_KEY_%d" % index]: os.environ["GIT_CONFIG_VALUE_%d" % index]
+    for index in range(count)
+}}
+facts = {{
+    "command": sys.argv[1] if len(sys.argv) > 1 else "",
+    "config": config,
+    "HOME": os.environ.get("HOME"),
+    "variables": sorted(os.environ),
+}}
+with open({log!r}, "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(facts) + "\\n")
+os.execv({git!r}, ["git", *sys.argv[1:]])
 """
 
 
@@ -385,7 +452,8 @@ def offline_remotes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> OfflineR
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(gitconfig))
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file")
-    monkeypatch.delenv("OFFLINE_GH_FAIL_ON", raising=False)
+    # Submit publishes only with this explicit (offline) token.
+    monkeypatch.setenv("APPRENTICE_PUBLISH_TOKEN", PUBLISH_TOKEN)
 
     for repository, path in bare.items():
         subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(path)], check=True)
@@ -403,7 +471,14 @@ def offline_remotes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> OfflineR
     bin_dir.mkdir()
     gh_log = root / "gh-calls.jsonl"
     gh = bin_dir / "gh"
-    gh.write_text(_FAKE_GH.format(python=sys.executable, log=str(gh_log)))
+    gh.write_text(
+        _FAKE_GH.format(
+            python=sys.executable,
+            log=str(gh_log),
+            envlog=str(root / "gh-env.jsonl"),
+            fail=str(root / "gh-fail-on"),
+        )
+    )
     gh.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
     return OfflineRemotes(bare=bare, gh_log=gh_log)

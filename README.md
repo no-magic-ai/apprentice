@@ -6,13 +6,14 @@ Agentic Algorithm Factory for [no-magic](https://github.com/no-magic-ai/no-magic
 
 `apprentice` is implemented software: package version 0.4.0 with a Google ADK pipeline and the CLI below. It is **not activated** for autonomous operation. The umbrella strategy keeps activation deferred until the no-magic catalog reaches at least 60 algorithms and the per-algorithm template is locked (48 catalog scripts today). Meeting that threshold would not be enough on its own: live use also needs separate safety, spend and human approvals, and the following gaps are open in the current code:
 
-- **Publisher credentials.** Generated code is contained (below), but packaging still pushes branches and opens pull requests with the operator's ambient `git` and `gh` credentials in the same process environment; there is no publisher-credential isolation.
 - **Budgets and limits.** Every model call is reserved before it is sent and settled once from the provider's raw usage in one durable installation ledger: monthly, cycle, stage, role-percentage and per-call token and USD ceilings are enforced across processes and restarts (see [Configuration](docs/configuration.md#budget-enforcement)). A paid route needs an operator-supplied accounting profile; apprentice ships none, so it denies paid calls until one is configured. Concurrent items, cooldown, rolling PR day/week windows, per-PR file and text-line limits and the automated-work circuit are enforced at cycle admission and before a submission's first remote write. These controls cover this installation only; older or foreign binaries can bypass them. `core/queue.py` and `core/scheduler.py` are empty modules.
 - **Paper-aware packaging.** Packaging targets `no-magic` and `no-magic-viz` only. Released no-magic v3 also requires a `no-magic-papers` card whose `implementations[]` references the script and an explicit `SCRIPT_TO_PAPER` entry in `no-magic/scripts/generate_catalog.py`; packaging produces neither yet. The M1 catalog extension to that generator defines an additional per-script `SCRIPT_CONTRACTS` record (teaching kind, data source, adaptation note) that released v3 does not contain; when the target no-magic generator revision defines `SCRIPT_CONTRACTS`, packaging must populate it as well.
 
 Approved-byte submission is in place: each run writes its artifacts under its own run-owned root and, on completion, seals them into an immutable bundle whose manifest binds the run identity, every artifact hash and each repository destination. `approve` binds a human approval to that manifest, and `submit` re-verifies the bundle and pushes exactly those bytes to their destinations without calling a model or regenerating anything. A run recorded before sealed bundles existed fails with a rebuild instruction. The approval is a local operator attestation, not a cryptographic identity.
 
 Generated code never runs on the host. Every implementation draft, the correctness gate and a render of the generated Manim scene run in one explicitly configured local Docker sandbox: no network, read-only root, no capabilities, bounded CPU, memory, processes, wall time and output, nothing from the host mounted, and every container removed (and its absence confirmed) before a result counts. Without a configured backend and an operator-built sandbox image, builds are refused before any admission or model request; there is no fallback. See [Configuration](docs/configuration.md#execution) for the image build and the exact limits; this is container isolation, not a certified sandbox.
+
+Publication credentials are separate from generation. `submit` publishes only with the token given explicitly in `APPRENTICE_PUBLISH_TOKEN`, validated before anything is admitted and handed only to the `git push` and `gh pr create` subprocesses, which run with a private, empty home and no ambient git, gh or credential-helper configuration; `gh` logins, `GH_TOKEN` and `GITHUB_TOKEN` are never used. Generation and validation refuse to start while one of the known GitHub or apprentice publication token variables is set ([CLI Reference: submit](docs/cli-reference.md#submit)). Processes of the same host user are not isolated from each other.
 
 `apprentice` is maintainer tooling, not a learner artifact. Its declared dependencies and hosted or local LLM providers are its own; the no-magic learner constraints (single file, standard library, CPU, no services) apply to the scripts it drafts, not to `apprentice` itself.
 
@@ -92,8 +93,9 @@ apprentice build "quicksort" --backend local --model openai/<profiled-model>
 # Record a human-review approval for a build run (required before submit)
 apprentice approve <run-id>
 
-# Open PRs in the no-magic repos with the exact approved bytes (no model call)
-apprentice submit "quicksort" --tier 2 --run-id <run-id>
+# Open PRs in the no-magic repos with the exact approved bytes (no model call); the
+# GitHub token is given to this command only, never to build/retry/suggest
+APPRENTICE_PUBLISH_TOKEN=<token> apprentice submit "quicksort" --tier 2 --run-id <run-id>
 
 # Suggest candidate algorithms for a tier
 apprentice suggest --tier 2 --limit 5

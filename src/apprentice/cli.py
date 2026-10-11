@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from apprentice.controls.authority import Authority, Cycle
+    from apprentice.controls.credentials import PublisherCapability
     from apprentice.controls.errors import ControlDeniedError
     from apprentice.controls.footprint import Footprint
     from apprentice.core.artifacts import BundleSnapshot
@@ -384,16 +385,20 @@ def _cmd_submit(cfg: ApprenticeConfig, footprint: Footprint, args: Any) -> int:
     """Promote the exact approved bytes of a run as one controlled publication cycle.
 
     No model or generation runs. Before any claim is saved, the approval and
-    the run's attempt history are checked, then one `submit` cycle is
-    admitted together with one PR slot per intended repository (item lease,
-    cooldown, circuit and rolling PR windows in one transaction). Every
-    commit is prepared and measured before the final admission persists the
-    remote-write intent immediately before the first push. An attempt that
-    ended before that intent wrote nothing; the same approved manifest may
-    be submitted again. Its outcome is recorded only if the stored attempt is
-    still the one this process reserved.
+    the run's attempt history are checked and the explicit publication token
+    (`APPRENTICE_PUBLISH_TOKEN`; nothing ambient) is validated locally, so a
+    missing or malformed token claims nothing and the run stays submittable.
+    Then one `submit` cycle is admitted together with one PR slot per
+    intended repository (item lease, cooldown, circuit and rolling PR windows
+    in one transaction). Every commit is prepared and measured before the
+    final admission persists the remote-write intent immediately before the
+    first push; only then do the push and `gh pr create` subprocesses receive
+    the token. An attempt that ended before that intent wrote nothing; the
+    same approved manifest may be submitted again. Its outcome is recorded
+    only if the stored attempt is still the one this process reserved.
     """
     from apprentice.agents.packaging import PackagingError, intended_repositories
+    from apprentice.controls.credentials import PublicationCredentialError, PublisherCapability
     from apprentice.controls.errors import AuthorityError, ControlDeniedError
     from apprentice.controls.policy import ControlPolicy
     from apprentice.core.cycles import (
@@ -427,6 +432,11 @@ def _cmd_submit(cfg: ApprenticeConfig, footprint: Footprint, args: Any) -> int:
         except PackagingError as exc:
             _print_json({"error": str(exc), "run_id": snapshot.run_id})
             return 1
+        try:
+            capability = PublisherCapability.from_environment()
+        except PublicationCredentialError as exc:
+            _print_json({"error": str(exc), "run_id": snapshot.run_id, "claimed": "nothing"})
+            return 1
         authority = authority_handle()
         # Operator stops wait while the admission, the claim and the ends are
         # committed; the remote work itself stays interruptible (`_publish`).
@@ -442,7 +452,7 @@ def _cmd_submit(cfg: ApprenticeConfig, footprint: Footprint, args: Any) -> int:
                 _print_denial(exc, run_id=snapshot.run_id, approval="kept; nothing was claimed")
                 return 1
             try:
-                return _publish(store, authority, cycle, args, previous)
+                return _publish(store, authority, cycle, args, previous, capability)
             except BaseException as exc:
                 # Any other end — an uncaught error or interruption — commits
                 # the terminal state, which closes an attempt that never
@@ -551,8 +561,13 @@ def _publish(
     cycle: Cycle,
     args: Any,
     previous: dict[str, Any],
+    capability: PublisherCapability,
 ) -> int:
-    """Save the pending claim, then prepare, admit and publish; record the outcome once."""
+    """Save the pending claim, then prepare, admit and publish; record the outcome once.
+
+    `capability` was validated before the cycle was admitted; it reaches only
+    the push and pull-request subprocesses, after the final admission.
+    """
     from datetime import UTC, datetime
 
     from apprentice.agents.packaging import PublicationSteps, submit_snapshot
@@ -594,7 +609,9 @@ def _publish(
     logger.info("submit started: run %s manifest %s", snapshot.run_id, snapshot.manifest_sha256)
     try:
         with interruptible():
-            submissions = submit_snapshot(snapshot, approval, Path(reserved["workspace"]), steps)
+            submissions = submit_snapshot(
+                snapshot, approval, Path(reserved["workspace"]), steps, capability
+            )
     except BaseException as exc:
         # The live effects, whatever ended the attempt: a step that was started
         # but not acknowledged is None (may have taken effect).

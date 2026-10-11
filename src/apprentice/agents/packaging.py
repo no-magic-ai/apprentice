@@ -8,6 +8,16 @@ paths, checked against the commit tree, then pushed and opened as pull
 requests. Every repository is prepared, verified and measured before anything
 is pushed; the caller's final admission sees every measured change and runs
 immediately before the first push.
+
+No subprocess inherits the process environment or the operator's git or gh
+configuration. Before anything is prepared, the operator's commit identity
+(name and email only) is read once from their git configuration; every git
+command of a publication — clone, checkout, add, commit, the local checks and
+reads, the push — then runs with a private empty HOME, no global or system
+git configuration, that explicit identity, no credential helper, hooks,
+fsmonitor or commit signing, no HTTP redirects, no proxy, host or trace
+settings and only the destination URL's protocol. Nothing but the push and
+`gh pr create` receives the caller's explicit `PublisherCapability`.
 """
 
 from __future__ import annotations
@@ -17,12 +27,14 @@ import subprocess
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 from apprentice.core.artifacts import CORE_REPOSITORY, VIZ_REPOSITORY
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from apprentice.controls.credentials import PublisherCapability
     from apprentice.core.artifacts import BundleSnapshot
 
 # Supported repositories in publication order; the core PR is referenced by the viz PR.
@@ -33,6 +45,132 @@ _REPOSITORY_URLS: dict[str, str] = {
     CORE_REPOSITORY: f"https://{_GITHUB_HOST}/{CORE_REPOSITORY}.git",
     VIZ_REPOSITORY: f"https://{_GITHUB_HOST}/{VIZ_REPOSITORY}.git",
 }
+
+# What every publisher subprocess keeps from the process environment.
+_INHERITED_VARIABLES = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR")
+# Where the operator's own git configuration (and so their identity) is found.
+_CONFIG_VARIABLES = (
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_NOSYSTEM",
+)
+
+
+def _inherited(names: tuple[str, ...]) -> dict[str, str]:
+    return {name: os.environ[name] for name in names if name in os.environ}
+
+
+def _operator_identity(workspace: Path) -> dict[str, str]:
+    """The operator's commit author and committer, as git would choose them, as env variables.
+
+    Read once, before anything is prepared, with a read-only `git config`
+    query outside any repository; it runs no helper or hook and only these
+    four scalars cross into the isolated publisher environment.
+
+    Raises:
+        PackagingError: If git cannot be queried or no complete identity is configured.
+    """
+    env = {
+        **_inherited(_INHERITED_VARIABLES + _CONFIG_VARIABLES),
+        "GIT_CEILING_DIRECTORIES": str(workspace.parent),
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    try:
+        result = subprocess.run(
+            ["git", "config", "--null", "--get-regexp", r"^(user|author|committer)\.(name|email)$"],
+            cwd=workspace,
+            capture_output=True,
+            timeout=30,
+            check=False,
+            env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PackagingError(f"cannot read the operator's git identity: {exc}") from exc
+    if result.returncode not in (0, 1):  # 1: none of the keys is set
+        stderr = result.stderr.decode("utf-8", "replace").strip()
+        raise PackagingError(f"cannot read the operator's git identity: {stderr}")
+    configured: dict[str, str] = {}
+    for entry in result.stdout.decode("utf-8", "replace").split("\0"):
+        key, _, value = entry.partition("\n")
+        if key:
+            configured[key] = value  # later (more specific) configuration wins
+
+    def choose(variable: str, *keys: str) -> str:
+        candidates = [os.environ.get(variable, ""), *(configured.get(key, "") for key in keys)]
+        return next((value for value in candidates if value), "")
+
+    email = os.environ.get("EMAIL", "")
+    identity = {
+        "GIT_AUTHOR_NAME": choose("GIT_AUTHOR_NAME", "author.name", "user.name"),
+        "GIT_AUTHOR_EMAIL": choose("GIT_AUTHOR_EMAIL", "author.email", "user.email") or email,
+        "GIT_COMMITTER_NAME": choose("GIT_COMMITTER_NAME", "committer.name", "user.name"),
+        "GIT_COMMITTER_EMAIL": choose("GIT_COMMITTER_EMAIL", "committer.email", "user.email")
+        or email,
+    }
+    missing = sorted(name for name, value in identity.items() if not value)
+    if missing:
+        raise PackagingError(
+            f"no git commit identity for {', '.join(missing)}: set user.name and user.email "
+            "in your git configuration; nothing was cloned or pushed"
+        )
+    return identity
+
+
+def _isolated(home: Path) -> dict[str, str]:
+    return {
+        **_inherited(_INHERITED_VARIABLES),
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(home / ".config"),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+
+
+def _git_env(
+    home: Path,
+    url: str,
+    identity: dict[str, str],
+    capability: PublisherCapability | None = None,
+) -> dict[str, str]:
+    """The environment of every git command of the repository at `url`.
+
+    Only `url`'s protocol is allowed; credential helpers, hooks, fsmonitor
+    and commit signing are off, so no external program runs; HTTP redirects
+    are refused (a redirect would send the approved bytes to another host or
+    repository); the commit identity is `identity`. The HTTP authorization
+    header for the supported host is set only when `capability` is given
+    (the push).
+    """
+    settings = [
+        ("credential.helper", ""),
+        ("core.hooksPath", os.devnull),
+        ("core.fsmonitor", "false"),
+        ("commit.gpgSign", "false"),
+        ("http.followRedirects", "false"),
+    ]
+    if capability is not None:
+        settings.append((f"http.https://{_GITHUB_HOST}/.extraHeader", capability.git_http_header()))
+    env = {**_isolated(home), **identity, "GIT_ALLOW_PROTOCOL": urlsplit(url).scheme}
+    env["GIT_CONFIG_COUNT"] = str(len(settings))
+    for index, (key, value) in enumerate(settings):
+        env[f"GIT_CONFIG_KEY_{index}"] = key
+        env[f"GIT_CONFIG_VALUE_{index}"] = value
+    return env
+
+
+def _gh_env(home: Path, capability: PublisherCapability) -> dict[str, str]:
+    """The environment of `gh pr create`: the explicit token only, no gh or git configuration."""
+    return {
+        **_isolated(home),
+        "GH_CONFIG_DIR": str(home / "gh"),
+        "GH_TOKEN": capability.gh_token(),
+        "GH_PROMPT_DISABLED": "1",
+        "GH_NO_UPDATE_NOTIFIER": "1",
+        "NO_COLOR": "1",
+    }
 
 
 class PackagingError(Exception):
@@ -116,7 +254,14 @@ class RepositorySubmission:
         }
 
 
-def _run(args: list[str], cwd: Path, timeout: int, env: dict[str, str] | None = None) -> bytes:
+def _run(
+    args: list[str],
+    cwd: Path,
+    timeout: int,
+    env: dict[str, str],
+    capability: PublisherCapability | None = None,
+) -> bytes:
+    """Run one fixed command with exactly `env`; the capability is redacted from any error."""
     try:
         result = subprocess.run(
             args, cwd=cwd, capture_output=True, timeout=timeout, check=False, env=env
@@ -129,56 +274,43 @@ def _run(args: list[str], cwd: Path, timeout: int, env: dict[str, str] | None = 
         raise PackagingError(f"{' '.join(args[:3])} timed out after {timeout}s") from exc
     if result.returncode != 0:
         stderr = result.stderr.decode("utf-8", "replace").strip()
+        if capability is not None:
+            stderr = capability.redact(stderr)
         raise PackagingError(f"{' '.join(args[:3])} failed ({result.returncode}): {stderr}")
     return result.stdout
 
 
-def _git(clone: Path, *args: str, timeout: int = 30, env: dict[str, str] | None = None) -> bytes:
-    return _run(["git", *args], clone, timeout, env)
+def _git(
+    clone: Path,
+    env: dict[str, str],
+    *args: str,
+    timeout: int = 30,
+    capability: PublisherCapability | None = None,
+) -> bytes:
+    """Run git in `clone` with exactly `env` (from `_git_env`)."""
+    return _run(["git", *args], clone, timeout, env, capability)
 
 
-def _remote_env() -> dict[str, str]:
-    """The environment of a git command that talks to a remote: HTTP redirects are refused.
+def _require_destination(repository: str, clone: Path, env: dict[str, str]) -> None:
+    """The clone fetches from and pushes to exactly the supported URL, checked without the network.
 
-    A redirect would send the approved bytes to a host or repository other
-    than the resolved destination; the operator's other git settings
-    (credentials, transport) are kept.
-    """
-    env = dict(os.environ)
-    count = env.get("GIT_CONFIG_COUNT", "0")
-    if not count.isdigit():
-        raise PackagingError(f"GIT_CONFIG_COUNT {count!r} is not a count")
-    env[f"GIT_CONFIG_KEY_{count}"] = "http.followRedirects"
-    env[f"GIT_CONFIG_VALUE_{count}"] = "false"
-    env["GIT_CONFIG_COUNT"] = str(int(count) + 1)
-    return env
-
-
-def _require_destination(repository: str, cwd: Path, clone: Path | None = None) -> None:
-    """Git resolves `repository` to exactly its supported URL, checked without the network.
-
-    Before the clone, the URL git would fetch from (after any
-    `url.<base>.insteadOf` rewrite) must be the supported URL. In a clone,
-    `origin` must have exactly that one fetch URL and that one push URL
-    (after `insteadOf`/`pushInsteadOf` rewrites and any `pushurl`). This
-    binds the approved destination to the logical repository; it is not a
-    check of the remote host's identity or of the account.
+    `origin` must have exactly that one fetch URL and that one push URL, after
+    any rewrite or `pushurl` in the clone's own configuration (the operator's
+    global and system configuration never apply). This binds the approved
+    destination to the logical repository; it is not a check of the remote
+    host's identity or of the account.
 
     Raises:
         PackagingError: If git would fetch from or push anywhere else.
     """
     expected = _REPOSITORY_URLS[repository]
-    if clone is None:
-        resolved = [_run(["git", "ls-remote", "--get-url", expected], cwd, 30).decode().strip()]
-        pushes = resolved
-    else:
-        resolved = _git(clone, "remote", "get-url", "--all", "origin").decode().split()
-        pushes = _git(clone, "remote", "get-url", "--push", "--all", "origin").decode().split()
+    resolved = _git(clone, env, "remote", "get-url", "--all", "origin").decode().split()
+    pushes = _git(clone, env, "remote", "get-url", "--push", "--all", "origin").decode().split()
     if resolved != [expected] or pushes != [expected]:
         raise PackagingError(
             f"{repository} resolves to fetch {resolved} / push {pushes} instead of its supported "
-            f"URL {expected} (a git URL rewrite or extra push URL is configured); nothing is "
-            "cloned, committed or pushed there"
+            f"URL {expected} (a URL rewrite or extra push URL is configured in the clone); "
+            "nothing more is committed or pushed there"
         )
 
 
@@ -242,32 +374,33 @@ def _prepare(
     snapshot: BundleSnapshot,
     approval: dict[str, Any],
     workspace: Path,
+    env: dict[str, str],
 ) -> RepositorySubmission:
     clone = workspace / repository.split("/")[1]
-    _require_destination(repository, workspace)
+    # The public clone is read without any credential.
     _run(
         ["git", "clone", "--depth", "1", _REPOSITORY_URLS[repository], str(clone)],
         workspace,
         120,
-        _remote_env(),
+        env,
     )
-    _require_destination(repository, workspace, clone)
-    base = _git(clone, "symbolic-ref", "--short", "HEAD").decode().strip()
+    _require_destination(repository, clone, env)
+    base = _git(clone, env, "symbolic-ref", "--short", "HEAD").decode().strip()
     branch = f"apprentice/{snapshot.run_id}"
-    _git(clone, "checkout", "-b", branch)
+    _git(clone, env, "checkout", "-b", branch)
 
     paths = [str(destination) for destination, _ in files]
     for destination, data in files:
         _place(clone, destination, data)
-    _git(clone, "add", "--", *paths)
-    staged = _git(clone, "diff", "--cached", "--name-only", "-z").decode().split("\0")
+    _git(clone, env, "add", "--", *paths)
+    staged = _git(clone, env, "diff", "--cached", "--name-only", "-z").decode().split("\0")
     if sorted(name for name in staged if name) != sorted(paths):
         raise PackagingError(f"{repository} staged files {staged} differ from {paths}")
 
     # Author and committer dates come from the approval, so the same approved
     # bundle on the same base always produces the same commit.
     commit_env = {
-        **os.environ,
+        **env,
         "GIT_AUTHOR_DATE": approval["approved_at"],
         "GIT_COMMITTER_DATE": approval["approved_at"],
     }
@@ -277,16 +410,20 @@ def _prepare(
         f"Apprentice-Manifest: {snapshot.manifest_sha256}\n"
         f"Approved-By: {approval['approved_by']}\n"
     )
-    _git(clone, "commit", "--no-verify", "--cleanup=verbatim", "-q", "-m", message, env=commit_env)
-    commit = _git(clone, "rev-parse", "HEAD").decode().strip()
-    _verify_commit(clone, repository, commit, files)
+    _git(clone, commit_env, "commit", "--no-verify", "--cleanup=verbatim", "-q", "-m", message)
+    commit = _git(clone, env, "rev-parse", "HEAD").decode().strip()
+    _verify_commit(clone, env, repository, commit, files)
     return RepositorySubmission(
-        repository, base, branch, commit, tuple(paths), measure_commit(clone)
+        repository, base, branch, commit, tuple(paths), measure_commit(clone, env)
     )
 
 
 def _verify_commit(
-    clone: Path, repository: str, commit: str, files: list[tuple[PurePosixPath, bytes]]
+    clone: Path,
+    env: dict[str, str],
+    repository: str,
+    commit: str,
+    files: list[tuple[PurePosixPath, bytes]],
 ) -> None:
     """Require that `commit` changes exactly the approved destinations to the approved bytes.
 
@@ -294,18 +431,21 @@ def _verify_commit(
         PackagingError: On any differing byte, extra or missing path.
     """
     for destination, data in files:
-        if _git(clone, "cat-file", "blob", f"{commit}:{destination}") != data:
+        if _git(clone, env, "cat-file", "blob", f"{commit}:{destination}") != data:
             raise PackagingError(
                 f"{repository} commit content of {destination} differs from approval"
             )
-    committed = _git(clone, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", commit)
+    committed = _git(clone, env, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", commit)
     paths = sorted(str(destination) for destination, _ in files)
     if sorted(name for name in committed.decode().split("\0") if name) != paths:
         raise PackagingError(f"{repository} commit touches files outside the approved destinations")
 
 
 def _require_prepared(
-    clone: Path, submission: RepositorySubmission, files: list[tuple[PurePosixPath, bytes]]
+    clone: Path,
+    env: dict[str, str],
+    submission: RepositorySubmission,
+    files: list[tuple[PurePosixPath, bytes]],
 ) -> None:
     """Re-verify a prepared repository immediately before one of its remote steps.
 
@@ -316,22 +456,24 @@ def _require_prepared(
     Raises:
         PackagingError: If the destination, the prepared commit or its content changed.
     """
-    _require_destination(submission.repository, clone, clone)
-    head = _git(clone, "rev-parse", "HEAD").decode().strip()
+    _require_destination(submission.repository, clone, env)
+    head = _git(clone, env, "rev-parse", "HEAD").decode().strip()
     if head != submission.commit:
         raise PackagingError(
             f"{submission.repository} prepared commit {submission.commit} was replaced by {head}"
         )
-    _verify_commit(clone, submission.repository, submission.commit, files)
+    _verify_commit(clone, env, submission.repository, submission.commit, files)
 
 
-def measure_commit(clone: Path) -> ChangeSize:
+def measure_commit(clone: Path, env: dict[str, str]) -> ChangeSize:
     """Count the prepared commit's changed paths and text lines from git's numstat.
 
     Raises:
         PackagingError: If any numstat record cannot be classified.
     """
-    raw = _git(clone, "diff", "--numstat", "-z", "-M", "HEAD~1", "HEAD").decode("utf-8", "strict")
+    raw = _git(clone, env, "diff", "--numstat", "-z", "-M", "HEAD~1", "HEAD").decode(
+        "utf-8", "strict"
+    )
     fields = raw.split("\0")
     files = 0
     lines = 0
@@ -352,8 +494,8 @@ def measure_commit(clone: Path) -> ChangeSize:
             index += 3
         files += len(paths)
         if (added, deleted) == ("-", "-"):
-            ref = "HEAD~1" if not _exists(clone, "HEAD", paths[-1]) else "HEAD"
-            size = _git(clone, "cat-file", "-s", f"{ref}:{paths[-1]}").decode().strip()
+            ref = "HEAD~1" if not _exists(clone, env, "HEAD", paths[-1]) else "HEAD"
+            size = _git(clone, env, "cat-file", "-s", f"{ref}:{paths[-1]}").decode().strip()
             if not size.isdigit():
                 raise PackagingError(f"unknown size of binary file {paths[-1]}")
             binary.append((paths[-1], int(size)))
@@ -364,9 +506,9 @@ def measure_commit(clone: Path) -> ChangeSize:
     return ChangeSize(files=files, text_lines=lines, binary=tuple(binary))
 
 
-def _exists(clone: Path, ref: str, path: str) -> bool:
+def _exists(clone: Path, env: dict[str, str], ref: str, path: str) -> bool:
     try:
-        _git(clone, "cat-file", "-e", f"{ref}:{path}")
+        _git(clone, env, "cat-file", "-e", f"{ref}:{path}")
     except PackagingError:
         return False
     return True
@@ -397,6 +539,7 @@ def submit_snapshot(
     approval: dict[str, Any],
     workspace: Path,
     steps: PublicationSteps,
+    capability: PublisherCapability,
 ) -> list[RepositorySubmission]:
     """Promote a verified approved snapshot into one pull request per repository.
 
@@ -414,6 +557,9 @@ def submit_snapshot(
         approval: The run's approval (approver and time are recorded in commits).
         workspace: Fresh exclusive directory for the repository clones.
         steps: The caller's admission and per-step checks and the live effects.
+        capability: The explicit publication credential, already validated
+            before anything was admitted; only the push and `gh pr create`
+            subprocesses receive it, after `steps.admit`.
 
     Returns:
         One submission per promoted repository, core repository first.
@@ -425,8 +571,16 @@ def submit_snapshot(
             with None for a step whose outcome is unknown.
     """
     groups = _group_by_repository(snapshot)
+    identity = _operator_identity(workspace)
+    # A private, empty HOME for every publisher subprocess: no gh login, git
+    # configuration, hook or credential store of the operator is consulted.
+    home = workspace / "publisher-home"
+    home.mkdir(mode=0o700)
+    envs = {
+        repository: _git_env(home, _REPOSITORY_URLS[repository], identity) for repository in groups
+    }
     prepared = [
-        _prepare(repository, files, snapshot, approval, workspace)
+        _prepare(repository, files, snapshot, approval, workspace, envs[repository])
         for repository, files in groups.items()
     ]
     steps.admit(prepared)
@@ -440,18 +594,21 @@ def submit_snapshot(
         clone = workspace / submission.repository.split("/")[1]
         steps.before_step(f"push {submission.repository}")
         try:
-            _require_prepared(clone, submission, groups[submission.repository])
+            _require_prepared(
+                clone, envs[submission.repository], submission, groups[submission.repository]
+            )
         except PackagingError as exc:
             raise failed(exc) from exc
         state[index] = replace(submission, pushed=None)
         try:
             _git(
                 clone,
+                _git_env(home, _REPOSITORY_URLS[submission.repository], identity, capability),
                 "push",
                 "origin",
                 f"{submission.commit}:refs/heads/{submission.branch}",
                 timeout=120,
-                env=_remote_env(),
+                capability=capability,
             )
         except PackagingError as exc:
             if not isinstance(exc.__cause__, subprocess.TimeoutExpired):
@@ -464,10 +621,9 @@ def submit_snapshot(
         clone = workspace / submission.repository.split("/")[1]
         steps.before_step(f"open pull request in {submission.repository}")
         try:
-            _require_prepared(clone, submission, groups[submission.repository])
-            remote = _git(
-                clone, "ls-remote", "origin", f"refs/heads/{submission.branch}", env=_remote_env()
-            )
+            env = envs[submission.repository]
+            _require_prepared(clone, env, submission, groups[submission.repository])
+            remote = _git(clone, env, "ls-remote", "origin", f"refs/heads/{submission.branch}")
         except PackagingError as exc:
             raise failed(exc) from exc
         if remote.decode().split("\t")[0].strip() != submission.commit:
@@ -486,8 +642,8 @@ def submit_snapshot(
                         "pr",
                         "create",
                         # HOST/OWNER/REPO: the pull request is opened on the
-                        # supported host whatever GH_HOST or gh's default
-                        # host says; credentials are gh's own.
+                        # supported host whatever gh's configuration says;
+                        # the only credential is the explicit capability.
                         "--repo",
                         f"{_GITHUB_HOST}/{submission.repository}",
                         "--base",
@@ -501,6 +657,8 @@ def submit_snapshot(
                     ],
                     clone,
                     60,
+                    _gh_env(home, capability),
+                    capability,
                 )
                 .decode()
                 .strip()

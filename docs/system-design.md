@@ -396,7 +396,7 @@ The drafter's instruction includes `{validation_feedback?}`, so a failed draft's
 4. Stage only those paths, commit with the approval time as author/committer date, and check that each commit contains exactly the approved bytes and paths.
 5. Push both branches, then open the `no-magic` PR and a `no-magic-viz` PR that references it, with `gh`. Under the lock again, the attempt ends `complete`, `partial` (with the branches pushed and PRs opened before the error, `null` for a push or PR whose command timed out) or `failed`, but only if the stored attempt is still the one reserved in step 1; otherwise nothing is saved and the known effects are printed. Any recorded attempt blocks another `submit` and any re-approval of that run, with no retry or resume.
 
-Packaging never merges. It uses the operator's ambient `git` and `gh` credentials; credential scoping is open containment work (see the [README status](../README.md#status)).
+Packaging never merges. It publishes only with the token given explicitly in `APPRENTICE_PUBLISH_TOKEN`, which only the push and `gh pr create` subprocesses receive, in environments without the operator's git, gh or credential-helper configuration ([CLI Reference: submit](cli-reference.md#submit)).
 
 **Design targets, not implemented**: rendering `micro{name}.gif` into `no-magic-viz/previews/`; updating `{tier_dir}/README.md`, the root `README.md` and `LEARNING_PATH.md`; and the paper-aware records released no-magic v3 requires (a `no-magic-papers` card and `SCRIPT_TO_PAPER`, plus `SCRIPT_CONTRACTS` where the target generator defines it).
 

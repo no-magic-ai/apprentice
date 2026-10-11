@@ -6,6 +6,7 @@ import ast
 import json
 import logging
 import os
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -20,10 +21,11 @@ from apprentice.cli import (
     _cmd_preview,
     main,
 )
+from apprentice.controls.credentials import PublisherCapability
 from apprentice.core.artifacts import canonical_json, manifest_digest
 from apprentice.core.config import load_config
 from apprentice.core.session_store import RunRecord, SessionStore, default_store_dir
-from tests.conftest import JudgedSandbox, fixture_outputs, run_submit
+from tests.conftest import PUBLISH_TOKEN, JudgedSandbox, fixture_outputs, run_submit
 from tests.responses_fixture import (
     ResponsesFixture,
     ResponsesServer,
@@ -368,7 +370,7 @@ class TestSubmitCommand:
     ) -> None:
         rec = _approved_run(store_dir)
         if fail == "second_pr":
-            monkeypatch.setenv("OFFLINE_GH_FAIL_ON", "2")
+            offline_remotes.fail_pull_request_on(2)
         elif fail == "second_push":
             offline_remotes.reject_pushes("no-magic-ai/no-magic-viz")
         else:
@@ -382,8 +384,10 @@ class TestSubmitCommand:
         assert printed["status"] == stored["status"] == status
         assert [(r["pushed"], r["pr_url"]) for r in stored["repositories"]] == effects
         assert stored["error"] and stored["manifest_sha256"] == rec.manifest_sha256
+        record_file = (store_dir / f"{rec.run_id}.json").read_text()
+        assert PUBLISH_TOKEN not in record_file + json.dumps(printed)
 
-        monkeypatch.delenv("OFFLINE_GH_FAIL_ON", raising=False)
+        offline_remotes.fail_pull_request_on(None)
         branches = {r: offline_remotes.branches(r) for r in offline_remotes.bare}
         gh_calls = len(offline_remotes.gh_calls())
         scratch = sorted((store_dir / "scratch").iterdir())
@@ -883,6 +887,133 @@ class TestBlockingGateFailures:
         assert _cmd_approve(_ApproveArgs(rec.run_id)) == 0
 
 
+def _submit_cycles(store_dir: Path) -> list[tuple[str, str]]:
+    ledger = store_dir / "controls" / "accounting.sqlite3"
+    if not ledger.exists():
+        return []
+    conn = sqlite3.connect(ledger)
+    try:
+        return conn.execute("SELECT kind, outcome FROM cycles WHERE kind = 'submit'").fetchall()
+    finally:
+        conn.close()
+
+
+class TestPublisherCapability:
+    @pytest.mark.parametrize(
+        ("token", "ambient"),
+        [
+            (None, {}),
+            ("", {}),
+            ("not a token\n", {}),
+            (None, {"GH_TOKEN": PUBLISH_TOKEN, "GITHUB_TOKEN": PUBLISH_TOKEN}),
+        ],
+    )
+    def test_without_a_valid_explicit_token_nothing_is_claimed_and_the_run_stays_submittable(
+        self,
+        store_dir: Path,
+        offline_remotes: OfflineRemotes,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        token: str | None,
+        ambient: dict[str, str],
+    ) -> None:
+        rec = _approved_run(store_dir)
+        if token is None:
+            monkeypatch.delenv("APPRENTICE_PUBLISH_TOKEN")
+        else:
+            monkeypatch.setenv("APPRENTICE_PUBLISH_TOKEN", token)
+        for name, value in ambient.items():
+            monkeypatch.setenv(name, value)
+        capsys.readouterr()
+
+        assert run_submit(_SubmitArgs("selection", rec.run_id)) == 1
+
+        out = json.loads(_last_json(capsys))
+        assert "APPRENTICE_PUBLISH_TOKEN" in out["error"]
+        assert out["claimed"] == "nothing"
+        assert SessionStore(store_dir=store_dir).load(rec.run_id).submission == {}
+        assert _submit_cycles(store_dir) == []
+        assert offline_remotes.gh_calls() == []
+        assert offline_remotes.branches("no-magic-ai/no-magic") == ["main"]
+
+        monkeypatch.setenv("APPRENTICE_PUBLISH_TOKEN", PUBLISH_TOKEN)
+        assert run_submit(_SubmitArgs("selection", rec.run_id)) == 0
+        assert SessionStore(store_dir=store_dir).load(rec.run_id).submission["status"] == (
+            "complete"
+        )
+
+    def test_only_the_push_and_pull_request_receive_the_explicit_token(
+        self,
+        store_dir: Path,
+        offline_remotes: OfflineRemotes,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rec = _approved_run(store_dir)
+        monkeypatch.setenv("GITHUB_TOKEN", "ambient_fixture_" + "a" * 24)
+        monkeypatch.setenv("GH_HOST", "ghe.example.invalid")
+        offline_remotes.record_git_environments()
+
+        assert run_submit(_SubmitArgs("selection", rec.run_id)) == 0
+
+        isolated = {
+            "credential.helper": "",
+            "core.hooksPath": os.devnull,
+            "core.fsmonitor": "false",
+            "commit.gpgSign": "false",
+            "http.followRedirects": "false",
+        }
+        header = PublisherCapability(PUBLISH_TOKEN).git_http_header()
+        calls = offline_remotes.git_environments()
+        # The one read of the operator's configuration: their identity, outside any repository.
+        (identity_read,) = [call for call in calls if call["command"] == "config"]
+        assert identity_read["config"] == {}
+        publishing = [call for call in calls if call["command"] != "config"]
+        pushes = [call for call in publishing if call["command"] == "push"]
+        assert [push["config"] for push in pushes] == [
+            {**isolated, "http.https://github.com/.extraHeader": header}
+        ] * 2
+        others = [call for call in publishing if call["command"] != "push"]
+        assert {call["command"] for call in others} >= {"clone", "checkout", "add", "commit"}
+        assert all(call["config"] == isolated for call in others)
+        requests = offline_remotes.gh_environments()
+        assert [request["GH_TOKEN"] for request in requests] == [PUBLISH_TOKEN] * 2
+        for facts in [*calls, *requests]:
+            assert not {"APPRENTICE_PUBLISH_TOKEN", "GITHUB_TOKEN", "GH_HOST"} & set(
+                facts["variables"]
+            )
+        for facts in [*publishing, *requests]:
+            assert facts["HOME"] != str(Path.home())
+        printed = capsys.readouterr().out
+        record_file = (store_dir / f"{rec.run_id}.json").read_text()
+        assert PUBLISH_TOKEN not in printed + record_file
+
+    @pytest.mark.parametrize(
+        "credential", ["APPRENTICE_PUBLISH_TOKEN", "GH_TOKEN", "GITHUB_PERSONAL_ACCESS_TOKEN"]
+    )
+    def test_build_next_to_a_publication_credential_is_refused_before_anything_runs(
+        self,
+        store_dir: Path,
+        toy_config: tuple[Path, ResponsesFixture],
+        judged_execution: JudgedSandbox,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        credential: str,
+    ) -> None:
+        config, fixture = toy_config
+        fixture.outputs = fixture_outputs()
+        monkeypatch.setenv(credential, PUBLISH_TOKEN)
+
+        assert main(["--config", str(config), "build", "selection"]) == 1
+
+        out = json.loads(_last_json(capsys))
+        assert credential in out["error"] and PUBLISH_TOKEN not in out["error"]
+        assert out["denied_before"] == "any cycle admission or request"
+        assert fixture.generations() == []
+        assert judged_execution.programs == []
+        assert SessionStore(store_dir=store_dir).list_runs(limit=None) == []
+
+
 class TestSubmitPublicationGuards:
     def test_mutated_commit_blob_is_not_pushed_or_reported_submitted(
         self,
@@ -890,8 +1021,15 @@ class TestSubmitPublicationGuards:
         offline_remotes: OfflineRemotes,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        rec = _approved_run(store_dir)
-        offline_remotes.mutate_staged_python("no-magic-ai/no-magic")
+        store = SessionStore(store_dir=store_dir)
+        rec = store.complete_run(
+            store.create_run("selection", tier=2),
+            session_state={**_STATE, "generated_code": "impl = 1\r\n"},
+            budget_summary={},
+            elapsed=1.0,
+        )
+        assert _cmd_approve(_ApproveArgs(rec.run_id)) == 0
+        offline_remotes.normalize_python_line_endings("no-magic-ai/no-magic")
         capsys.readouterr()
 
         assert run_submit(_SubmitArgs("selection", rec.run_id)) == 1
@@ -992,6 +1130,7 @@ class TestFreshSubmitProcess:
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_ALLOW_PROTOCOL": "file",
             "OFFLINE_REPOSITORY_URLS": os.environ["OFFLINE_REPOSITORY_URLS"],
+            "APPRENTICE_PUBLISH_TOKEN": PUBLISH_TOKEN,
         }
         argv = [str(config_path), rec.run_id, json.dumps(forbidden)]
         try:
