@@ -15,13 +15,16 @@ from apprentice.core.gate_agent import GateAgent
 from apprentice.gates.consistency import ConsistencyGate
 from apprentice.gates.correctness import CorrectnessGate
 from apprentice.gates.lint import LintGate
+from apprentice.gates.scene_render import SceneRenderGate
 from apprentice.gates.schema_compliance import SchemaComplianceGate
+from apprentice.validators.tools import ValidatorTools
 
 if TYPE_CHECKING:
     from apprentice.controls.authority import Cycle
     from apprentice.core.artifacts import RunScope
     from apprentice.core.budget import BudgetTracker
     from apprentice.providers.factory import ModelRoute
+    from apprentice.sandbox.docker import Sandbox
 
 IMPLEMENTATION_STAGE = "implementation"
 ARTIFACT_STAGE = "artifact_generation"
@@ -33,16 +36,18 @@ def build_pipeline(
     cycle: Cycle,
     scope: RunScope,
     tracker: BudgetTracker,
+    sandbox: Sandbox,
 ) -> SequentialAgent:
     """Build the full ADK pipeline as a SequentialAgent with gates between stages.
 
     Stage/gate ordering:
-        1. implementation_loop
-           → correctness gate (blocking)
+        1. implementation_loop (every draft runs in the sandbox)
+           → correctness gate (blocking, sandbox)
            → lint gate (blocking)
         2. artifact_generation (instrumentation | visualization | assessment)
            → consistency gate (blocking)
            → schema_compliance gate (blocking)
+           → scene_render gate (blocking, sandbox)
         3. reviewer (programmatic, no model call)
 
     The pipeline only generates; `submit` never runs it. Packaging promotes
@@ -59,13 +64,15 @@ def build_pipeline(
         scope: Identity and exclusive work root of the run; every gate and
             validation callback writes and evaluates artifacts only there.
         tracker: Collects the gate verdicts of this run.
+        sandbox: The verified execution backend every generated program and
+            scene runs in; nothing generated runs on the host.
 
     Returns:
         A configured SequentialAgent representing the full pipeline.
     """
     implementation_agent = build_implementation_agent(
         route.model(cycle, IMPLEMENTATION_STAGE, "implementation"),
-        scope.work_root,
+        ValidatorTools(scope.work_root, sandbox),
         max_attempts=cycle.policy.max_implementation_retries,
     )
     artifact_parallel = ParallelAgent(
@@ -80,11 +87,16 @@ def build_pipeline(
 
     sub_agents: list[Any] = [
         implementation_agent,
-        GateAgent.after(CorrectnessGate(), "implementation", scope, tracker=tracker),
+        GateAgent.after(
+            CorrectnessGate(sandbox, scope.work_root), "implementation", scope, tracker=tracker
+        ),
         GateAgent.after(LintGate(), "implementation", scope, tracker=tracker),
         artifact_parallel,
         GateAgent.after(ConsistencyGate(), "artifact_generation", scope, tracker=tracker),
         GateAgent.after(SchemaComplianceGate(), "artifact_generation", scope, tracker=tracker),
+        GateAgent.after(
+            SceneRenderGate(sandbox, scope.work_root), "artifact_generation", scope, tracker=tracker
+        ),
         build_review_agent(scope.work_root, scope.algorithm),
     ]
 

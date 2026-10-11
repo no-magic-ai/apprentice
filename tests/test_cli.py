@@ -23,7 +23,7 @@ from apprentice.cli import (
 from apprentice.core.artifacts import canonical_json, manifest_digest
 from apprentice.core.config import load_config
 from apprentice.core.session_store import RunRecord, SessionStore, default_store_dir
-from tests.conftest import fixture_outputs, run_submit
+from tests.conftest import JudgedSandbox, fixture_outputs, run_submit
 from tests.responses_fixture import (
     ResponsesFixture,
     ResponsesServer,
@@ -530,7 +530,10 @@ class TestGateHaltRecording:
         _assert_halted_with_diagnostics(store_dir, record, "correctness after implementation")
 
     def test_integration_runner_records_gate_halt_with_state(
-        self, store_dir: Path, toy_config: tuple[Path, ResponsesFixture]
+        self,
+        store_dir: Path,
+        toy_config: tuple[Path, ResponsesFixture],
+        judged_execution: JudgedSandbox,
     ) -> None:
         import importlib.util
 
@@ -558,12 +561,102 @@ class TestGateHaltRecording:
             authority,
             resolve_route(cfg.provider),
             ControlPolicy.from_config(cfg),
+            judged_execution,
             logging.getLogger("t"),
         )
 
         _assert_halted_with_diagnostics(
             store_dir, store.load(record.run_id), "correctness after implementation"
         )
+
+
+class _FailingBackend(JudgedSandbox):
+    """A sandbox whose backend fails while running the first draft."""
+
+    def run_program(self, source: bytes, *, scope: str) -> Any:
+        from apprentice.sandbox.errors import SandboxInfrastructureError
+
+        raise SandboxInfrastructureError("sandbox container could not be confirmed removed")
+
+
+class TestExecutionSandbox:
+    def test_build_without_a_backend_is_refused_before_any_admission_or_request(
+        self,
+        store_dir: Path,
+        toy_config: tuple[Path, ResponsesFixture],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        config, fixture = toy_config
+        fixture.outputs = fixture_outputs()
+
+        assert main(["--config", str(config), "build", "selection"]) == 1
+
+        out = json.loads(_last_json(capsys))
+        assert out["error"].startswith("execution sandbox unavailable: no execution backend")
+        assert out["denied_before"] == "any cycle admission or request"
+        assert fixture.generations() == []
+        assert SessionStore(store_dir=store_dir).list_runs(limit=None) == []
+
+    def test_sandbox_fault_ends_the_build_failed_without_another_draft(
+        self,
+        store_dir: Path,
+        toy_config: tuple[Path, ResponsesFixture],
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        monkeypatch.setattr(
+            "apprentice.sandbox.docker.open_sandbox", lambda config: _FailingBackend()
+        )
+        config, fixture = toy_config
+        fixture.outputs = fixture_outputs()
+
+        assert main(["--config", str(config), "build", "selection"]) == 1
+
+        record = _only_record(store_dir)
+        assert record.status == "failed"
+        assert "could not be confirmed removed" in record.error
+        assert _generated_roles(fixture) == ["drafter"]
+        assert not SessionStore(store_dir=store_dir).bundle_dir(record.run_id).exists()
+
+    def test_failed_scene_render_halts_the_build_before_sealing(
+        self,
+        store_dir: Path,
+        toy_config: tuple[Path, ResponsesFixture],
+        judged_execution: JudgedSandbox,
+    ) -> None:
+        config, fixture = toy_config
+        outputs = fixture_outputs()
+        outputs["visualization"] += "# fixture: deliberate scene failure\n"
+        fixture.outputs = outputs
+
+        assert main(["--config", str(config), "build", "selection"]) == 1
+
+        record = _only_record(store_dir)
+        assert record.error == "blocking gate failed: scene_render after artifact_generation"
+        assert judged_execution.scenes == ["SelectionSortScene"]
+        assert not SessionStore(store_dir=store_dir).bundle_dir(record.run_id).exists()
+
+    def test_rendered_preview_stays_derived_output_outside_the_sealed_bundle(
+        self,
+        store_dir: Path,
+        toy_config: tuple[Path, ResponsesFixture],
+        judged_execution: JudgedSandbox,
+    ) -> None:
+        config, fixture = toy_config
+        fixture.outputs = fixture_outputs()
+
+        assert main(["--config", str(config), "build", "selection"]) == 0
+
+        store = SessionStore(store_dir=store_dir)
+        record = _only_record(store_dir)
+        render = store.run_scope(record).work_root / "render" / "scene.mp4"
+        assert render.read_bytes() == b"judged preview"
+        assert sorted(a.role for a in store.load_bundle(record).artifacts) == [
+            "anki_deck",
+            "implementation",
+            "instrumented",
+            "manim_scene",
+        ]
 
 
 def _tree(root: Path) -> dict[str, tuple[bytes | None, int]]:

@@ -27,6 +27,8 @@ apprentice build <algorithm> [--tier N] [--description TEXT] [--backend NAME] [-
 
 Rejects algorithm names other than 1-64 lowercase letters, digits and underscores (starting with a letter) and tiers other than 1-4. Resolves the route before anything is admitted: an unsupported backend, a model the profile does not qualify, a missing or invalid profile, or a pinned SDK/price-data mismatch is reported and nothing is sent. The build then runs as one controlled cycle; every model call is reserved and settled in the installation ledger, and a call a ceiling refuses ends the run with `"outcome": "denied"` and the limiting `control`. Failure output includes the cycle's `accounting` entries. Persists the run record to `~/.apprentice/sessions/` and, on completion, seals the final artifacts into the run's immutable bundle (see [Architecture: Run-Owned Artifacts](architecture.md#run-owned-artifacts)).
 
+Generated code runs only in the configured execution sandbox ([Configuration: \[execution\]](configuration.md#execution)). The backend is verified together with the route, before anything is admitted: with no configured backend, an unreachable or non-local Docker context, or a missing image or one built from another recipe, the command prints `"error": "execution sandbox unavailable: ..."` with `"denied_before": "any cycle admission or request"` and creates no run. Every implementation draft and the correctness gate run in the sandbox, and the blocking `scene_render` gate renders the generated scene there and writes the verified preview to `render/scene.mp4` in the run's work root (not part of the sealed bundle). A sandbox infrastructure fault ends the run `failed` with that error; it is not retried with another draft. `retry` behaves the same way.
+
 ### submit
 
 Open PRs with the exact bytes a human approved. No model is called and nothing is regenerated or rendered.
@@ -155,13 +157,3 @@ Display current configuration.
 ```
 apprentice config
 ```
-
-### dev
-
-Launch ADK dev UI for interactive debugging.
-
-```
-apprentice dev [--port N]
-```
-
-- `--port` — dev UI port (default: 8080)

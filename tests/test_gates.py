@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import textwrap
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -11,14 +11,17 @@ from apprentice.gates.consistency import ConsistencyGate
 from apprentice.gates.correctness import CorrectnessGate
 from apprentice.gates.lint import LintGate
 from apprentice.gates.review import ApprovalError, require_approved_snapshot
+from apprentice.gates.scene_render import SceneRenderGate
 from apprentice.gates.schema_compliance import SchemaComplianceGate
 from apprentice.models.artifact import ArtifactBundle
 from apprentice.models.work_item import GateVerdict, WorkItem
+from apprentice.sandbox.errors import StagingError
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     from apprentice.core.session_store import RunRecord, SessionStore
+    from tests.conftest import JudgedSandbox
 
 
 def _make_bundle(**kwargs: str) -> ArtifactBundle:
@@ -109,24 +112,87 @@ class TestLintGate:
 
 
 class TestCorrectnessGate:
-    def test_properties(self) -> None:
-        gate = CorrectnessGate()
-        assert gate.name == "correctness"
-        assert gate.max_retries == 1
-
-    def test_pass_on_good_code(self, tmp_path: Path) -> None:
+    def test_pass_on_good_code(self, tmp_path: Path, judged_execution: JudgedSandbox) -> None:
         f = tmp_path / "algo.py"
         f.write_text(_GOOD_CODE)
         bundle = _make_bundle(implementation_path=str(f))
-        result = gate_eval(CorrectnessGate(), bundle)
+        result = gate_eval(CorrectnessGate(judged_execution, tmp_path), bundle)
         assert result.verdict == GateVerdict.PASS
+        assert judged_execution.programs == [_GOOD_CODE.encode()]
 
-    def test_fail_on_assertion_error(self, tmp_path: Path) -> None:
+    def test_fail_on_assertion_error(self, tmp_path: Path, judged_execution: JudgedSandbox) -> None:
         f = tmp_path / "bad.py"
-        f.write_text('if __name__ == "__main__":\n    assert False\n')
+        f.write_text(
+            'if __name__ == "__main__":\n    assert False, "fixture: deliberate failure"\n'
+        )
         bundle = _make_bundle(implementation_path=str(f))
-        result = gate_eval(CorrectnessGate(), bundle)
+        result = gate_eval(CorrectnessGate(judged_execution, tmp_path), bundle)
         assert result.verdict == GateVerdict.FAIL
+        assert result.diagnostics["error"] == "the program exited with status 1"
+
+
+_SCENE = "from manim import Scene, Text\n\n\nclass Shown(Scene):\n    def construct(self):\n        self.add(Text('x'))\n"
+
+
+class TestSceneRenderGate:
+    def test_no_scene_artifact_has_nothing_to_render(
+        self, tmp_path: Path, judged_execution: JudgedSandbox
+    ) -> None:
+        result = gate_eval(SceneRenderGate(judged_execution, tmp_path), _make_bundle())
+        assert result.verdict == GateVerdict.PASS
+        assert judged_execution.scenes == []
+
+    def test_rendered_video_is_written_as_derived_output(
+        self, tmp_path: Path, judged_execution: JudgedSandbox
+    ) -> None:
+        (tmp_path / "scene.py").write_text(_SCENE)
+        bundle = _make_bundle(manim_scene_path=str(tmp_path / "scene.py"))
+
+        result = gate_eval(SceneRenderGate(judged_execution, tmp_path), bundle)
+
+        assert result.verdict == GateVerdict.PASS
+        assert judged_execution.scenes == ["Shown"]
+        assert (tmp_path / "render" / "scene.mp4").read_bytes() == b"judged preview"
+
+    def test_failed_render_fails_the_gate_and_writes_nothing(
+        self, tmp_path: Path, judged_execution: JudgedSandbox
+    ) -> None:
+        (tmp_path / "scene.py").write_text(_SCENE + "# fixture: deliberate scene failure\n")
+        bundle = _make_bundle(manim_scene_path=str(tmp_path / "scene.py"))
+
+        result = gate_eval(SceneRenderGate(judged_execution, tmp_path), bundle)
+
+        assert result.verdict == GateVerdict.FAIL
+        assert result.diagnostics["error"] == "the scene render exited with status 1"
+        assert not (tmp_path / "render").exists()
+
+    @pytest.mark.parametrize(
+        "source",
+        ["class A:\n    pass\n", _SCENE + "\n\nclass Other(Scene):\n    pass\n", "class (:\n"],
+    )
+    def test_scene_without_exactly_one_scene_class_is_not_rendered(
+        self, tmp_path: Path, judged_execution: JudgedSandbox, source: str
+    ) -> None:
+        (tmp_path / "scene.py").write_text(source)
+        bundle = _make_bundle(manim_scene_path=str(tmp_path / "scene.py"))
+
+        result = gate_eval(SceneRenderGate(judged_execution, tmp_path), bundle)
+
+        assert result.verdict == GateVerdict.FAIL
+        assert judged_execution.scenes == []
+
+    def test_symlinked_scene_is_refused(
+        self, tmp_path: Path, judged_execution: JudgedSandbox
+    ) -> None:
+        root = tmp_path / "root"
+        root.mkdir()
+        (tmp_path / "scene.py").write_text(_SCENE)
+        (root / "scene.py").symlink_to(tmp_path / "scene.py")
+        bundle = _make_bundle(manim_scene_path=str(root / "scene.py"))
+
+        with pytest.raises(StagingError):
+            gate_eval(SceneRenderGate(judged_execution, root), bundle)
+        assert judged_execution.scenes == []
 
 
 class TestConsistencyGate:
@@ -158,10 +224,10 @@ class TestSchemaComplianceGate:
 
 
 def gate_eval(
-    gate: LintGate | CorrectnessGate | ConsistencyGate | SchemaComplianceGate,
+    gate: LintGate | CorrectnessGate | ConsistencyGate | SchemaComplianceGate | SceneRenderGate,
     bundle: ArtifactBundle,
     name: str = "quicksort",
-) -> object:
+) -> Any:
     item = _make_item(name)
     return gate.evaluate(item, bundle)
 

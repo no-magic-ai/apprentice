@@ -6,11 +6,13 @@ Agentic Algorithm Factory for [no-magic](https://github.com/no-magic-ai/no-magic
 
 `apprentice` is implemented software: package version 0.4.0 with a Google ADK pipeline and the CLI below. It is **not activated** for autonomous operation. The umbrella strategy keeps activation deferred until the no-magic catalog reaches at least 60 algorithms and the per-algorithm template is locked (48 catalog scripts today). Meeting that threshold would not be enough on its own: live use also needs separate safety, spend and human approvals, and the following gaps are open in the current code:
 
-- **Execution containment.** The correctness checks run generated code with `subprocess.run` and a 5-second timeout — after every implementation draft (the drafter's validation callback) and again in the correctness gate. That is a timeout, not a sandbox. Packaging pushes branches and opens pull requests with the operator's ambient `git` and `gh` credentials in the same process environment; there is no publisher-credential isolation.
+- **Publisher credentials.** Generated code is contained (below), but packaging still pushes branches and opens pull requests with the operator's ambient `git` and `gh` credentials in the same process environment; there is no publisher-credential isolation.
 - **Budgets and limits.** Every model call is reserved before it is sent and settled once from the provider's raw usage in one durable installation ledger: monthly, cycle, stage, role-percentage and per-call token and USD ceilings are enforced across processes and restarts (see [Configuration](docs/configuration.md#budget-enforcement)). A paid route needs an operator-supplied accounting profile; apprentice ships none, so it denies paid calls until one is configured. Concurrent items, cooldown, rolling PR day/week windows, per-PR file and text-line limits and the automated-work circuit are enforced at cycle admission and before a submission's first remote write. These controls cover this installation only; older or foreign binaries can bypass them. `core/queue.py` and `core/scheduler.py` are empty modules.
 - **Paper-aware packaging.** Packaging targets `no-magic` and `no-magic-viz` only. Released no-magic v3 also requires a `no-magic-papers` card whose `implementations[]` references the script and an explicit `SCRIPT_TO_PAPER` entry in `no-magic/scripts/generate_catalog.py`; packaging produces neither yet. The M1 catalog extension to that generator defines an additional per-script `SCRIPT_CONTRACTS` record (teaching kind, data source, adaptation note) that released v3 does not contain; when the target no-magic generator revision defines `SCRIPT_CONTRACTS`, packaging must populate it as well.
 
 Approved-byte submission is in place: each run writes its artifacts under its own run-owned root and, on completion, seals them into an immutable bundle whose manifest binds the run identity, every artifact hash and each repository destination. `approve` binds a human approval to that manifest, and `submit` re-verifies the bundle and pushes exactly those bytes to their destinations without calling a model or regenerating anything. A run recorded before sealed bundles existed fails with a rebuild instruction. The approval is a local operator attestation, not a cryptographic identity.
+
+Generated code never runs on the host. Every implementation draft, the correctness gate and a render of the generated Manim scene run in one explicitly configured local Docker sandbox: no network, read-only root, no capabilities, bounded CPU, memory, processes, wall time and output, nothing from the host mounted, and every container removed (and its absence confirmed) before a result counts. Without a configured backend and an operator-built sandbox image, builds are refused before any admission or model request; there is no fallback. See [Configuration](docs/configuration.md#execution) for the image build and the exact limits; this is container isolation, not a certified sandbox.
 
 `apprentice` is maintainer tooling, not a learner artifact. Its declared dependencies and hosted or local LLM providers are its own; the no-magic learner constraints (single file, standard library, CPU, no services) apply to the scripts it drafts, not to `apprentice` itself.
 
@@ -23,7 +25,7 @@ Approved-byte submission is in place: each run writes its artifacts under its ow
 - **Visualization** — Manim animation scene from scaffold templates
 - **Assessment** — Anki flashcard deck (concept, complexity, implementation, comparison)
 
-Every artifact passes through quality gates (lint, correctness, consistency, schema compliance) before a human reviews it. Nothing is merged by `apprentice`; a human reviews and merges every PR.
+Every artifact passes through quality gates (lint, correctness, consistency, schema compliance, scene render) before a human reviews it. Nothing is merged by `apprentice`; a human reviews and merges every PR.
 
 ## Architecture
 
@@ -33,14 +35,15 @@ Built on [Google ADK](https://github.com/google/adk-python) with [LiteLLM](https
 SequentialAgent("apprentice_pipeline")
 ├── LoopAgent("implementation_loop", max=agents.max_implementation_retries)
 │   ├── LlmAgent("drafter")                    → generates code; its callback runs
-│   │                                            stdlib/lint/correctness validators
+│   │                                            stdlib/lint validators and the draft
+│   │                                            in the sandbox (correctness)
 │   └── BaseAgent("implementation_checkpoint")  → ends the loop once a draft passed
-├── gates: correctness, lint (blocking)
+├── gates: correctness (sandbox), lint (blocking)
 ├── ParallelAgent("artifact_generation")
 │   ├── LlmAgent("instrumentation")  → adds trace hooks
 │   ├── LlmAgent("visualization")    → generates Manim scene
 │   └── LlmAgent("assessment")       → generates Anki cards
-├── gates: consistency, schema compliance (blocking)
+├── gates: consistency, schema compliance, scene render (sandbox) (blocking)
 └── BaseAgent("reviewer")            → programmatic consistency + schema review, no model
 ```
 
@@ -50,11 +53,12 @@ Session state flows data between agents via `output_key`. Each role's model is m
 
 ## Setup
 
-Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
+Requires Python 3.12+, [uv](https://docs.astral.sh/uv/) and a local Docker daemon with the sandbox image built from `src/apprentice/sandbox/image/` ([Configuration](docs/configuration.md#execution)).
 
 ```bash
 uv sync
 export OPENAI_API_KEY=...  # the openai backend needs this and an accounting profile (below)
+# build the sandbox image, then set [execution].docker_context and [execution].image
 ```
 
 `google-adk`, `litellm` and `openai` are pinned exactly (1.28.1, 1.83.3, 2.30.0): generation prices come only from the price data inside the pinned `litellm`, verified by SHA-256, and a mismatch denies every model call.
@@ -119,9 +123,6 @@ apprentice controls prepare-rollback --operator <name>
 
 # Display configuration
 apprentice config
-
-# Launch ADK dev UI
-apprentice dev
 ```
 
 ## Integration Testing

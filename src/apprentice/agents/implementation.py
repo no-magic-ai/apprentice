@@ -10,11 +10,12 @@ from apprentice.core.artifacts import write_role
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
-    from pathlib import Path
 
     from google.adk.agents.invocation_context import InvocationContext
     from google.adk.events import Event
     from google.adk.models.lite_llm import LiteLlm
+
+    from apprentice.validators.tools import ValidatorTools
 
 _PASSED = "implementation_passed"
 
@@ -59,15 +60,18 @@ Return only the Python source code. No markdown fences, no prose.
 """
 
 
-def _run_validators(code: str, work_root: Path) -> dict[str, Any]:
-    """Write code into the run's work root, run all validators and combine results."""
-    from apprentice.validators.tools import correctness_validate, lint_validate, stdlib_check
+def _run_validators(code: str, tools: ValidatorTools) -> dict[str, Any]:
+    """Write code into the run's work root, run all validators and combine results.
 
-    file_path = str(write_role(work_root, "implementation", code))
+    Raises:
+        SandboxInfrastructureError: If the draft could not be run safely; it is
+            not feedback for the drafter and ends the cycle.
+    """
+    file_path = str(write_role(tools.root, "implementation", code))
 
-    stdlib_result = stdlib_check(file_path)
-    lint_result = lint_validate(file_path)
-    correctness_result = correctness_validate(file_path)
+    stdlib_result = tools.stdlib_check(file_path)
+    lint_result = tools.lint_validate(file_path)
+    correctness_result = tools.correctness_validate(file_path)
 
     all_passed = stdlib_result["passed"] and lint_result["passed"] and correctness_result["passed"]
 
@@ -91,13 +95,14 @@ def _run_validators(code: str, work_root: Path) -> dict[str, Any]:
     }
 
 
-def _make_after_drafter_callback(work_root: Path) -> Any:
+def _make_after_drafter_callback(tools: ValidatorTools) -> Any:
     """Create the drafter's after-agent callback that validates each draft.
 
     Runs after every drafter iteration: writes the draft into the run's work
-    root, runs the validators and records whether it passed. A failed draft
-    leaves feedback in `validation_feedback`, which the next iteration's
-    instruction includes.
+    root, runs the validators (correctness in the sandbox) and records whether
+    it passed. A failed draft leaves feedback in `validation_feedback`, which
+    the next iteration's instruction includes. A sandbox infrastructure error
+    propagates and ends the cycle instead of becoming feedback.
     """
 
     async def after_drafter(callback_context: Any) -> Any:
@@ -111,7 +116,7 @@ def _make_after_drafter_callback(work_root: Path) -> Any:
             )
             return None
 
-        result = _run_validators(code, work_root)
+        result = _run_validators(code, tools)
 
         state[_PASSED] = result["all_passed"]
         if result["all_passed"]:
@@ -150,7 +155,7 @@ class ValidationCheckpoint(BaseAgent):
 
 def build_implementation_agent(
     model: LiteLlm,
-    work_root: Path,
+    tools: ValidatorTools,
     max_attempts: int,
 ) -> LoopAgent:
     """Build an ADK LoopAgent for algorithm implementation with programmatic validation.
@@ -163,7 +168,7 @@ def build_implementation_agent(
 
     Args:
         model: Metered model of the implementation role.
-        work_root: The run's exclusive work root the drafter output is validated in.
+        tools: Validator tools of the run's work root and execution sandbox.
         max_attempts: Total drafter iterations, including the first.
 
     Returns:
@@ -174,7 +179,7 @@ def build_implementation_agent(
         model=model,
         instruction=_DRAFTER_INSTRUCTION,
         output_key="generated_code",
-        after_agent_callback=_make_after_drafter_callback(work_root),
+        after_agent_callback=_make_after_drafter_callback(tools),
     )
 
     return LoopAgent(

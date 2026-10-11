@@ -1245,6 +1245,7 @@ class TestUnlistableStore:
 
 
 class TestRunsRootThatIsNotOwned:
+    @pytest.mark.usefixtures("judged_execution")
     def test_a_symlinked_runs_root_is_refused_typed_and_nothing_is_written_through_it(
         self,
         tmp_path: Path,

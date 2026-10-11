@@ -24,6 +24,7 @@ from apprentice.core.artifacts import (
     seal_bundle,
     write_role,
 )
+from apprentice.validators.tools import ValidatorTools
 from tests.conftest import fixture_outputs
 
 if TYPE_CHECKING:
@@ -32,6 +33,7 @@ if TYPE_CHECKING:
 
     from apprentice.core.artifacts import RunScope
     from apprentice.core.session_store import SessionStore
+    from tests.conftest import JudgedSandbox
 
 
 def _sealed(store: SessionStore) -> Path:
@@ -328,15 +330,19 @@ class TestOwnedRootCallbacks:
         return shared
 
     def test_drafter_callback_validates_in_the_run_root(
-        self, scope: RunScope, shared_temp: Path
+        self, scope: RunScope, shared_temp: Path, judged_execution: JudgedSandbox
     ) -> None:
         code = fixture_outputs()["drafter"]
         context = _CallbackContext({"generated_code": code})
 
-        anyio.run(_make_after_drafter_callback(scope.work_root), context)
+        anyio.run(
+            _make_after_drafter_callback(ValidatorTools(scope.work_root, judged_execution)),
+            context,
+        )
 
         assert context.state["implementation_path"] == str(scope.work_root / "implementation.py")
         assert (scope.work_root / "implementation.py").read_text() == code
+        assert judged_execution.programs == [code.encode()]
         assert context.state["validation_feedback"] == ""
         assert list(shared_temp.iterdir()) == []
 

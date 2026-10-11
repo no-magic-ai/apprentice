@@ -311,6 +311,20 @@ class TemplatesConfig:
 
 
 @dataclass(frozen=True)
+class ExecutionConfig:
+    """The one execution backend generated code and scenes run in.
+
+    `docker_context` names a local Unix-socket Docker context and `image` the
+    concrete ID (`sha256:...`) of the operator-built sandbox image. Either
+    empty means no backend is configured: every execution of generated code
+    is refused, never run on the host.
+    """
+
+    docker_context: str
+    image: str
+
+
+@dataclass(frozen=True)
 class AgentsConfig:
     max_implementation_retries: int
 
@@ -324,6 +338,7 @@ class ApprenticeConfig:
     provider: ProviderConfig
     observability: ObservabilityConfig
     templates: TemplatesConfig
+    execution: ExecutionConfig
 
 
 def _parse_budget(data: dict[str, object]) -> BudgetConfig:
@@ -435,6 +450,14 @@ def _parse_templates(data: dict[str, object]) -> TemplatesConfig:
     )
 
 
+def _parse_execution(data: dict[str, object]) -> ExecutionConfig:
+    raw = _get_section(data, "execution")
+    return ExecutionConfig(
+        docker_context=_require_str(raw, "docker_context", "execution"),
+        image=_require_str(raw, "image", "execution"),
+    )
+
+
 def load_config(path: Path | None = None) -> ApprenticeConfig:
     """Load and validate config from a TOML file.
 
@@ -463,4 +486,5 @@ def load_config(path: Path | None = None) -> ApprenticeConfig:
         provider=_parse_provider(data, config_path.absolute().parent),
         observability=_parse_observability(data),
         templates=_parse_templates(data),
+        execution=_parse_execution(data),
     )
