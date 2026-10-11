@@ -1,85 +1,74 @@
-"""Correctness gate — reference test execution, 1 retry with re-prompt."""
+"""Correctness gate — runs the implementation in the sandbox and requires a clean exit."""
 
 from __future__ import annotations
 
-import subprocess
-import sys
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-if TYPE_CHECKING:
-    from apprentice.models.artifact import ArtifactBundle
-
 from apprentice.models.work_item import GateResult, GateVerdict, WorkItem
+from apprentice.validators.correctness import output_excerpt, run_implementation
 
-_EXECUTION_TIMEOUT = 5  # seconds
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from apprentice.models.artifact import ArtifactBundle
+    from apprentice.sandbox.docker import Sandbox
 
 
 class CorrectnessGate:
-    """Execute the implementation file and validate it exits cleanly."""
+    """Run the implementation file in the sandbox and validate it exits cleanly.
+
+    `root` is the trusted artifact root the bundle's implementation must be
+    in; nothing runs on the host.
+    """
 
     name = "correctness"
     max_retries = 1
     blocking = True
 
+    def __init__(self, sandbox: Sandbox, root: Path) -> None:
+        self._sandbox = sandbox
+        self._root = root
+
     def evaluate(self, work_item: WorkItem, artifacts: ArtifactBundle) -> GateResult:
-        """Execute the implementation file and check its exit code.
+        """Run the implementation file and check its exit status.
 
         Args:
             work_item: The work item being evaluated.
             artifacts: Bundle of generated artifacts.
 
         Returns:
-            GateResult with PASS or FAIL and stdout/stderr diagnostics.
-        """
-        diagnostics: dict[str, Any] = {}
+            GateResult with PASS or FAIL and the bounded program output.
 
-        path_str = artifacts.implementation_path
-        if not path_str:
+        Raises:
+            UnsafeInputError: If the implementation is outside the root or
+                names no stageable file.
+            SandboxInfrastructureError: If the program could not be run safely.
+        """
+        path = artifacts.implementation_path
+        if not path:
             return GateResult(
                 gate_name=self.name,
                 verdict=GateVerdict.FAIL,
                 diagnostics={"error": "implementation_path is empty"},
             )
-
-        path = Path(path_str)
-        if not path.exists():
+        checked = run_implementation(self._sandbox, self._root, path)
+        if checked is None:
             return GateResult(
                 gate_name=self.name,
                 verdict=GateVerdict.FAIL,
-                diagnostics={"error": f"file not found: {path_str}"},
+                diagnostics={"error": f"file not found: {path}"},
             )
-
-        source = path.read_text(encoding="utf-8")
-        has_main_block = (
-            'if __name__ == "__main__"' in source or "if __name__ == '__main__'" in source
-        )
-        diagnostics["has_main_block"] = has_main_block
-
-        try:
-            result = subprocess.run(
-                [sys.executable, str(path)],
-                capture_output=True,
-                timeout=_EXECUTION_TIMEOUT,
-                text=True,
-            )
-        except subprocess.TimeoutExpired:
-            return GateResult(
-                gate_name=self.name,
-                verdict=GateVerdict.FAIL,
-                diagnostics={
-                    **diagnostics,
-                    "error": f"execution timed out after {_EXECUTION_TIMEOUT}s",
-                },
-            )
-
-        diagnostics["return_code"] = result.returncode
-        diagnostics["stdout"] = result.stdout
-        diagnostics["stderr"] = result.stderr
-
-        verdict = GateVerdict.PASS if result.returncode == 0 else GateVerdict.FAIL
+        run = checked.run
+        diagnostics: dict[str, Any] = {
+            "has_main_block": checked.has_main_block,
+            "return_code": run.returncode,
+            "limit": run.limit,
+            "output": output_excerpt(run.output),
+        }
+        if not run.passed:
+            diagnostics["error"] = f"the program {run.problem()}"
         return GateResult(
             gate_name=self.name,
-            verdict=verdict,
+            verdict=GateVerdict.PASS if run.passed else GateVerdict.FAIL,
             diagnostics=diagnostics,
         )

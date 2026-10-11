@@ -5,7 +5,11 @@ from __future__ import annotations
 import textwrap
 from typing import TYPE_CHECKING
 
+import pytest
+
 from apprentice.models.work_item import WorkItem
+from apprentice.sandbox.docker import PROGRAM, ProgramRun
+from apprentice.sandbox.errors import OutsideScopeError
 from apprentice.validators.base import ValidationResult
 from apprentice.validators.consistency import ConsistencyValidator
 from apprentice.validators.correctness import CorrectnessValidator
@@ -14,6 +18,8 @@ from apprentice.validators.schema_compliance import SchemaComplianceValidator
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from tests.conftest import JudgedSandbox
 
 _GOOD_CODE = textwrap.dedent('''\
     """Quicksort — divide and conquer sorting.
@@ -98,26 +104,62 @@ class TestLintValidator:
         assert result.passed is False
 
 
+class _TimedOut:
+    """A sandbox whose every program hits the time limit."""
+
+    def run_program(self, source: bytes, *, scope: str) -> ProgramRun:
+        return ProgramRun(None, "", "time", PROGRAM)
+
+
 class TestCorrectnessValidator:
-    def test_pass_on_good_code(self, tmp_path: Path) -> None:
+    def test_pass_on_good_code(self, tmp_path: Path, judged_execution: JudgedSandbox) -> None:
         f = tmp_path / "algo.py"
         f.write_text(_GOOD_CODE)
-        result = CorrectnessValidator().validate({"implementation": str(f)}, _make_item())
+        validator = CorrectnessValidator(judged_execution, tmp_path)
+        result = validator.validate({"implementation": str(f)}, _make_item())
         assert result.passed is True
+        assert judged_execution.programs == [_GOOD_CODE.encode()]
 
-    def test_fail_on_assertion_error(self, tmp_path: Path) -> None:
+    def test_failing_program_is_reported_with_its_output(
+        self, tmp_path: Path, judged_execution: JudgedSandbox
+    ) -> None:
         f = tmp_path / "bad.py"
-        f.write_text('if __name__ == "__main__":\n    assert False\n')
-        result = CorrectnessValidator().validate({"implementation": str(f)}, _make_item())
+        f.write_text(
+            'if __name__ == "__main__":\n    assert False, "fixture: deliberate failure"\n'
+        )
+        validator = CorrectnessValidator(judged_execution, tmp_path)
+        result = validator.validate({"implementation": str(f)}, _make_item())
         assert result.passed is False
-        assert any("failed" in i.message.lower() for i in result.issues)
+        (issue,) = result.issues
+        assert "failed" in issue.message
+        assert "AssertionError: fixture" in issue.suggestion
 
-    def test_issues_have_suggestions(self, tmp_path: Path) -> None:
-        f = tmp_path / "bad.py"
-        f.write_text('if __name__ == "__main__":\n    assert False\n')
-        result = CorrectnessValidator().validate({"implementation": str(f)}, _make_item())
-        for issue in result.issues:
-            assert issue.suggestion != ""
+    def test_time_limit_is_reported_as_a_timeout(self, tmp_path: Path) -> None:
+        f = tmp_path / "slow.py"
+        f.write_text(_GOOD_CODE)
+        validator = CorrectnessValidator(_TimedOut(), tmp_path)
+        result = validator.validate({"implementation": str(f)}, _make_item())
+        assert result.passed is False
+        assert "timed out after 5s" in result.issues[0].message
+
+    def test_missing_file_fails_without_running(
+        self, tmp_path: Path, judged_execution: JudgedSandbox
+    ) -> None:
+        validator = CorrectnessValidator(judged_execution, tmp_path)
+        result = validator.validate({"implementation": str(tmp_path / "x.py")}, _make_item())
+        assert result.passed is False
+        assert judged_execution.programs == []
+
+    def test_implementation_outside_the_root_is_refused(
+        self, tmp_path: Path, judged_execution: JudgedSandbox
+    ) -> None:
+        root = tmp_path / "root"
+        root.mkdir()
+        (tmp_path / "algo.py").write_text(_GOOD_CODE)
+        validator = CorrectnessValidator(judged_execution, root)
+        with pytest.raises(OutsideScopeError):
+            validator.validate({"implementation": str(tmp_path / "algo.py")}, _make_item())
+        assert judged_execution.programs == []
 
 
 class TestConsistencyValidator:

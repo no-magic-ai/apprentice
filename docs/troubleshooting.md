@@ -59,7 +59,7 @@ The lint validator requires:
 
 The correctness validator requires:
 - An `if __name__ == "__main__":` block
-- Clean exit (return code 0) within 5 seconds
+- Clean exit (return code 0) within 5 seconds in the execution sandbox, inside its memory, process and output limits, with no network ([Configuration: \[execution\]](configuration.md#execution))
 
 ## Session state issues
 
@@ -70,15 +70,17 @@ rm -rf ~/.apprentice/sessions/
 
 Logs are in `~/.apprentice/logs/apprentice.jsonl`.
 
-## ADK dev UI not starting
+## Execution sandbox unavailable
 
-```bash
-# Verify adk is installed
-uv run adk --version
+`build` or `retry` printing `"error": "execution sandbox unavailable: ..."` with `"denied_before": "any cycle admission or request"` admitted nothing. The message names the cause:
 
-# Try a different port
-apprentice dev --port 9090
-```
+- `no execution backend is configured` — set `[execution].docker_context` and `[execution].image`;
+- `Docker context ... cannot be resolved` or `is not a local Unix socket` — use a local context (`docker context ls`); remote TCP/SSH contexts are not supported;
+- `sandbox image ... is not present` or `was built from recipe ...` — build the image from the current recipe and configure its ID ([Building the sandbox image](configuration.md#building-the-sandbox-image)); apprentice never pulls or builds it.
+
+A run that ended `failed` with `sandbox container ... could not be confirmed removed`, `the sandbox could not start the program`, `cannot count the processes of sandbox container` or `collecting the rendered video failed` hit a sandbox infrastructure fault: check the Docker daemon (`docker --context <name> ps --filter label=ai.no-magic.apprentice.sandbox`) and retry. `sandbox container ... of this artifact root is still alive` means an earlier execution of that run ended abnormally; its container removes itself at the printed UNIX time. A generated program's own exit status or output never causes these errors: it is always correctness feedback.
+
+A `scene_render` gate failure carries the renderer's output tail in its diagnostics: a scene must define exactly one top-level `Scene` subclass, render with Manim 0.21.0 within 180 seconds and leave no process or thread running when it ends.
 
 ## Local server refused
 

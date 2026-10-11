@@ -14,13 +14,13 @@ SequentialAgent("apprentice_pipeline")
 │   ├── LlmAgent("instrumentation")
 │   ├── LlmAgent("visualization")
 │   └── LlmAgent("assessment")
-├── GateAgent(consistency), GateAgent(schema_compliance)
+├── GateAgent(consistency), GateAgent(schema_compliance), GateAgent(scene_render)
 └── BaseAgent("reviewer")
 ```
 
 ### Implementation Loop
 
-Each iteration is one drafter call followed by its after-agent callback, which writes the draft into the run's work root and runs the stdlib, lint and correctness validators (the correctness validator executes the draft; see the README's containment note). A passing draft sets `implementation_passed`, and the `implementation_checkpoint` agent escalates out of the loop, so no further draft is requested. A failing draft leaves its issues in `validation_feedback`, which the drafter's instruction includes on the next iteration. `agents.max_implementation_retries` is the loop's `max_iterations`: the total number of drafts including the first. When every draft fails, the blocking gates fail the run.
+Each iteration is one drafter call followed by its after-agent callback, which writes the draft into the run's work root and runs the stdlib, lint and correctness validators; the correctness validator runs the draft in the execution sandbox (see [Contained Execution](#contained-execution)). A passing draft sets `implementation_passed`, and the `implementation_checkpoint` agent escalates out of the loop, so no further draft is requested. A failing draft leaves its issues in `validation_feedback`, which the drafter's instruction includes on the next iteration. `agents.max_implementation_retries` is the loop's `max_iterations`: the total number of drafts including the first. When every draft fails, the blocking gates fail the run. A sandbox infrastructure error is not feedback: it propagates out of the callback and ends the cycle without another draft.
 
 ### Artifact Generation
 
@@ -33,13 +33,17 @@ Three agents run concurrently:
 
 The reviewer is a programmatic agent, not a model: it runs the consistency and schema compliance validators once across all artifacts and records `review_verdict` (`passed` or `failed: …`). It never calls a model, so it has no budget share.
 
+### Contained Execution
+
+Nothing generated runs in the apprentice process or as a host subprocess. `sandbox/docker.open_sandbox` verifies the one configured backend — a local Unix-socket Docker context and a concrete image built from `sandbox/image/` — before a build is admitted, and `run_build` passes that `Sandbox` to `build_pipeline`. The drafter callback (through `ValidatorTools`), `CorrectnessGate` and `SceneRenderGate` stage the files they run from the run's work root with `sandbox/staging` (no-follow, bounded single-link regular files whose producer has finished writing them; paths outside the root, links, directories and special or oversized files are refused with `UnsafeInputError`) and call `Sandbox.run_program` or `Sandbox.render_scene`; each execution gets a fresh, fully bounded container that is removed and confirmed absent before its result is returned. `ValidatorTools` is the library surface for callers and agents: it is bound to one trusted root (and sandbox) when created, and its arguments only name files inside that root; a request for an unsafe path or file kind gets the tool's ordinary failed result, while a fault reading the root (`StagingError`) still aborts. `SandboxInfrastructureError` (backend, image, staging, collection or teardown faults) is never a verdict or feedback; `GateAgent` lets it propagate and the cycle ends `failed`. Limits, the image recipe and interruption handling are in [Configuration: \[execution\]](configuration.md#execution).
+
 ### Gate Verdicts
 
 Each `GateAgent` computes one verdict entry (gate, stage, verdict, whether the gate blocks, diagnostics). It records the entry in the run's `BudgetTracker` and yields it as an `EventActions.state_delta` appended to `gate_verdicts`, so the session service stores it. PASS, WARN and a FAIL from a non-blocking gate continue. A FAIL from a blocking gate, including a gate that raised, then raises `BlockingGateError`; the error propagates through `SequentialAgent` and the Runner, so no later agent runs. (ADK copies each child's invocation context, so setting a flag on it would not stop the parent.)
 
 The CLI runner catches only that error, reads the stored session back from the same session service and attaches it. `build`, `retry` and `scripts/integration_test.py` (all through `core/cycles.run_build`) then record the run once as `failed` with that state, the budget summary (gate verdicts plus the cycle's ledger reference), the elapsed time and an error naming the gate; the work-root files stay and nothing is sealed, so the run cannot be approved or submitted. Other exceptions are recorded as before. With an empty draft the correctness gate fails first, so such a run also ends `failed` with the gate's diagnostics.
 
-The same recorded verdicts decide whether a run can be sealed and published. `complete_run` refuses to seal a budget summary that holds a blocking FAIL, and `approve` and `submit` refuse a completed run whose `budget_summary.gate_verdicts` include one (runs sealed before the halt existed). Verdicts recorded without the `blocking` flag come from the four pipeline gates, which all block; WARN and non-blocking FAIL verdicts do not.
+The same recorded verdicts decide whether a run can be sealed and published. `complete_run` refuses to seal a budget summary that holds a blocking FAIL, and `approve` and `submit` refuse a completed run whose `budget_summary.gate_verdicts` include one (runs sealed before the halt existed). Verdicts recorded without the `blocking` flag come from the four pipeline gates of that time, which all block; WARN and non-blocking FAIL verdicts do not. The `scene_render` gate's verified preview is derived output in the work root (`render/scene.mp4`); it is never part of the sealed bundle or its manifest.
 
 Metering never replaces agent callbacks: it lives in each role's model client (see [Metered Model Calls](#metered-model-calls)), so the drafter's validation callback and the loop checkpoint run in the assembled pipeline.
 
@@ -114,7 +118,7 @@ Run IDs are `<algorithm>-<UTC second>-<uuid>`, created exclusively, so two runs 
 ~/.apprentice/sessions/scratch/<uuid>/         exclusive roots for work without a run record
 ```
 
-Every writer (`GateAgent`, the drafter's validation callback and the reviewer) uses the shared fixed role filenames in `core/artifacts.py` (`implementation.py`, `instrumented.py`, `scene.py`, `cards.csv`, `validation_report.json`, `discovery.json`) and refuses a missing or symlinked root and symlinked or multiply-linked files. No path is derived from the algorithm name, the current directory or a temporary directory.
+Every writer (`GateAgent`, the drafter's validation callback and the reviewer) uses the shared fixed role filenames in `core/artifacts.py` (`implementation.py`, `instrumented.py`, `scene.py`, `cards.csv`, `validation_report.json`, `discovery.json`) and refuses a missing or symlinked root and symlinked or multiply-linked files. No path is derived from the algorithm name, the current directory or a temporary directory. The `scene_render` gate writes its verified preview only to `work/render/scene.mp4`, through descriptors that follow no links; it is never sealed.
 
 Completing a run seals its final artifacts into `bundle/` with a `manifest.json`: canonical UTF-8 JSON (sorted keys, fixed separators) with the run ID, algorithm, integer tier and, per artifact, its role, file name, size, SHA-256 and repository destination (`null` when the role is kept but not promoted). The manifest digest is the SHA-256 of that JSON without its own `manifest_sha256` field. `preview`, `approve` and `submit` reload the bundle and reject a malformed or non-canonical manifest, changed identity or destinations, added or removed files, symlinks and any byte change. A run recorded before sealed bundles existed has no bundle; it fails with an instruction to rebuild rather than being regenerated.
 

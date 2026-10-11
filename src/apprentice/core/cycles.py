@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     from apprentice.core.config import ApprenticeConfig
     from apprentice.core.session_store import RunRecord
     from apprentice.providers.factory import ModelRoute
+    from apprentice.sandbox.docker import Sandbox
 
 
 def log_dir(config: ApprenticeConfig) -> Path:
@@ -249,12 +250,15 @@ def run_build(
     policy: ControlPolicy,
     request: tuple[str, int, str],
     kind: str,
+    sandbox: Sandbox,
     progress: Any = None,
 ) -> BuildResult:
     """Admit one build cycle, run the pipeline in it and record the run.
 
     `request` is (algorithm, tier, description). The run ID is registered
-    with the cycle before its record is written.
+    with the cycle before its record is written. Every generated program and
+    scene runs in `sandbox` (verified before admission by `open_sandbox`); a
+    sandbox infrastructure error ends the run `failed`.
 
     Raises:
         ControlDeniedError: If the cycle itself is not admitted (no run is created).
@@ -303,7 +307,7 @@ def run_build(
         gate: dict[str, Any] | None = None
         controls: list[str] = []
         try:
-            pipeline = build_pipeline(route, cycle, store.run_scope(record), tracker)
+            pipeline = build_pipeline(route, cycle, store.run_scope(record), tracker, sandbox)
             with interruptible():
                 state = asyncio.run(_run_pipeline(pipeline, algorithm, tier, description, progress))
             outcome, error = (

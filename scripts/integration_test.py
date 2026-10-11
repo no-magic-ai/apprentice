@@ -35,10 +35,13 @@ from apprentice.core.session_store import RunRecord, SessionStore, StoreUnavaila
 from apprentice.metering.pricing import PriceAuthorityError
 from apprentice.metering.profile import ProfileError
 from apprentice.providers.factory import RouteError, resolve_route
+from apprentice.sandbox.docker import open_sandbox
+from apprentice.sandbox.errors import SandboxUnavailableError
 
 if TYPE_CHECKING:
     from apprentice.controls.authority import Authority
     from apprentice.providers.factory import ModelRoute
+    from apprentice.sandbox.docker import Sandbox
 
 _REPORT_DIR = Path.home() / ".apprentice" / "reports"
 
@@ -94,6 +97,7 @@ def _run_single(
     authority: Authority,
     route: ModelRoute,
     policy: ControlPolicy,
+    sandbox: Sandbox,
     logger: Any,
 ) -> RunRecord:
     """Run one controlled library build cycle for an algorithm and return its run record.
@@ -111,6 +115,7 @@ def _run_single(
         policy=policy,
         request=(algorithm, tier, ""),
         kind="library",
+        sandbox=sandbox,
     )
     if result.outcome == "completed":
         logger.info("completed: %s in %.1fs", algorithm, result.elapsed)
@@ -204,38 +209,46 @@ def main() -> int:
         print(f"Cannot run: {exc}", file=sys.stderr)
         return 1
     try:
-        authority = open_authority(store, footprint)
-    except AuthorityError as exc:
-        print(f"control authority unavailable: {exc}", file=sys.stderr)
+        sandbox = open_sandbox(cfg.execution)
+    except SandboxUnavailableError as exc:
+        print(f"execution sandbox unavailable: {exc}", file=sys.stderr)
         return 1
-    policy = ControlPolicy.from_config(cfg)
-    ip = IntegrationProgress(len(algorithms), backend, model_str)
-    records: list[RunRecord] = []
+    with sandbox:
+        try:
+            authority = open_authority(store, footprint)
+        except AuthorityError as exc:
+            print(f"control authority unavailable: {exc}", file=sys.stderr)
+            return 1
+        policy = ControlPolicy.from_config(cfg)
+        ip = IntegrationProgress(len(algorithms), backend, model_str)
+        records: list[RunRecord] = []
 
-    try:
-        with ip.start():
-            for algorithm, tier in algorithms:
-                ip.on_algorithm_start(algorithm, tier)
-                try:
-                    record = _run_single(algorithm, tier, store, authority, route, policy, logger)
-                except ControlDeniedError as exc:
-                    print(f"Stopped: {exc}", file=sys.stderr)
-                    break
-                records.append(record)
-                ip.on_algorithm_complete(
-                    algorithm,
-                    record.status == "completed",
-                    record.elapsed_seconds,
-                )
-        usage = authority.usage({record.run_id for record in records})
-    except StoreUnavailableError as exc:
-        print(f"run store unavailable: {exc}", file=sys.stderr)
-        return 1
-    except AuthorityError as exc:
-        print(f"control authority unavailable: {exc}", file=sys.stderr)
-        return 1
-    finally:
-        authority.close()
+        try:
+            with ip.start():
+                for algorithm, tier in algorithms:
+                    ip.on_algorithm_start(algorithm, tier)
+                    try:
+                        record = _run_single(
+                            algorithm, tier, store, authority, route, policy, sandbox, logger
+                        )
+                    except ControlDeniedError as exc:
+                        print(f"Stopped: {exc}", file=sys.stderr)
+                        break
+                    records.append(record)
+                    ip.on_algorithm_complete(
+                        algorithm,
+                        record.status == "completed",
+                        record.elapsed_seconds,
+                    )
+            usage = authority.usage({record.run_id for record in records})
+        except StoreUnavailableError as exc:
+            print(f"run store unavailable: {exc}", file=sys.stderr)
+            return 1
+        except AuthorityError as exc:
+            print(f"control authority unavailable: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            authority.close()
 
     report = aggregate_runs(records, usage, "ledger cycles of the runs in this report")
     report_path = _save_report(report)

@@ -327,6 +327,10 @@ metrics_enabled = true
 [templates]
 version = "1.0.0"
 base_path = "config/templates"
+
+[execution]
+docker_context = ""
+image = ""
 """,
         encoding="utf-8",
     )

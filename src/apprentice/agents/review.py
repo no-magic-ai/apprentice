@@ -25,7 +25,9 @@ def _validate_all_artifacts(
     state: dict[str, Any], work_root: Path, algorithm_name: str
 ) -> dict[str, Any]:
     """Write session-state artifacts into the run's work root and validate them all."""
-    from apprentice.validators.tools import consistency_validate, schema_validate
+    from apprentice.validators.tools import ValidatorTools
+
+    tools = ValidatorTools(work_root)
 
     paths = {role: str(path) for role, path in write_state_roles(work_root, state).items()}
 
@@ -37,8 +39,8 @@ def _validate_all_artifacts(
         }
 
     artifacts_json = json.dumps(paths)
-    consistency = consistency_validate(artifacts_json, algorithm_name)
-    schema = schema_validate(artifacts_json)
+    consistency = tools.consistency_validate(artifacts_json, algorithm_name)
+    schema = tools.schema_validate(artifacts_json)
 
     all_passed = consistency["passed"] and schema["passed"]
 

@@ -20,6 +20,7 @@ from apprentice.core.artifacts import (
 from apprentice.core.budget import BudgetTracker  # noqa: TC001 — pydantic needs at runtime
 from apprentice.core.observability import get_logger
 from apprentice.models.work_item import BlockingGateError, GateVerdict
+from apprentice.sandbox.errors import SandboxInfrastructureError
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -43,10 +44,13 @@ class GateAgent(BaseAgent):
     raised — then raises `BlockingGateError`, which propagates through the
     `SequentialAgent` and Runner so no later sub-agent runs. ADK copies each
     child's invocation context, so a flag on it would not stop the parent.
+    A `SandboxInfrastructureError` is not a verdict: it propagates unrecorded
+    and ends the cycle.
 
-    Session-state outputs are written into the run's own work root (gates exec
-    files, parse CSVs, etc.) and the gate sees the run's identity, never a
-    shared temporary directory or an identity rebuilt from state.
+    Session-state outputs are written into the run's own work root (gates stage
+    files from it into the sandbox, parse CSVs, etc.) and the gate sees the
+    run's identity, never a shared temporary directory or an identity rebuilt
+    from state.
     """
 
     gate: Any
@@ -85,6 +89,10 @@ class GateAgent(BaseAgent):
             result = self.gate.evaluate(work_item, bundle)
             verdict_value = result.verdict.value
             diagnostics = result.diagnostics
+        except SandboxInfrastructureError:
+            # The sandbox could not run or tear down generated code safely: that
+            # is not a verdict on the artifacts, and the cycle ends with it.
+            raise
         except Exception as exc:
             _logger.exception(
                 "gate_exception",

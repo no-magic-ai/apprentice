@@ -175,6 +175,56 @@ version = "1.0.0"
 base_path = "config/templates"
 ```
 
+## [execution]
+
+```toml
+[execution]
+docker_context = "desktop-linux"   # a local Docker context whose endpoint is a unix:// socket
+image = "sha256:<64 hex>"          # ID of the operator-built sandbox image
+```
+
+Generated implementations and Manim scenes run only in this one local Docker sandbox, never on the host, and there is no other backend. The shipped values are empty, which configures no backend: `build`, `retry` and `scripts/integration_test.py` are refused before any cycle admission or model request. Validation never enables networking; a generated program that tries to download data fails like any other failing program (no-magic scripts carry their small data inline).
+
+When a build starts, apprentice verifies the backend:
+
+- the context is resolved through Docker's own context metadata to an existing local Unix socket; TCP, SSH and other remote endpoints are refused;
+- every later Docker command talks to that socket with an empty, private client configuration and a minimal environment, so an ambient `DOCKER_HOST`, `DOCKER_CONTEXT`, configured proxies, registry credentials and debug settings never reach the daemon or a container; nothing is pulled, built or installed;
+- the image exists locally with exactly this ID, is a Linux image whose user is `65532:65532`, and its `ai.no-magic.apprentice.sandbox-recipe` label equals the digest of the recipe in this checkout (an image built from another recipe is refused).
+
+### Building the sandbox image
+
+The operator builds the image explicitly from `src/apprentice/sandbox/image/` and configures the resulting ID:
+
+```bash
+cd src/apprentice/sandbox/image
+RECIPE=$(shasum -a 256 Dockerfile requirements.in requirements.lock | shasum -a 256 | cut -d' ' -f1)
+docker --context desktop-linux build --build-arg APPRENTICE_RECIPE_SHA256="$RECIPE" \
+    -t "apprentice-sandbox:${RECIPE:0:12}" .
+docker --context desktop-linux image inspect --format '{{.Id}}' "apprentice-sandbox:${RECIPE:0:12}"
+```
+
+The recipe pins its inputs: the uv 0.6.14 and `python:3.13.14-slim-bookworm` base images by manifest digest, Debian packages (Cairo, Pango, FFmpeg, fonts, TeX Live, dvisvgm) to the snapshot.debian.org archive of 2026-10-01, and Manim 0.21.0 with every transitive Python dependency by version and hash in `requirements.lock` (regenerate it with the command in its header). Pinned inputs are not a claim that two builds are bit-identical: what is trusted is the image ID you built and configured. Changing any recipe file changes the digest, and the previous image is then refused until it is rebuilt.
+
+### What a contained execution is
+
+Each execution runs in its own new container: no network, read-only root filesystem, all capabilities dropped, no new privileges, core dumps and container logging off, and nothing from the host mounted (no Docker socket, home directory, credentials or workspace). The container's main process is a keeper running as UID 65531 that ends the container at a hard lifetime, after which Docker removes it automatically; generated code runs as UID 65532 and cannot signal or modify the keeper or its inputs. The bytes to run are read from the run's work root without following links (a path outside the root, a symlink or symlinked directory, a hard-linked, special, directory or oversized file is refused; the validator tools return that refusal as an ordinary failed result) and written over stdin into a keeper-owned `noexec` tmpfs the code can read but not change. Staging assumes the file's producer has finished writing it — closed or atomically published, as apprentice's own writers do — before it is read: the file identity, size and time checks around the read detect a change only on a best-effort basis, and a process of the same host user that keeps writing the file in place (for example through `pwrite` or a shared mapping) can produce torn bytes without changing them. Such host processes are outside this boundary. Once read, the bounded bytes are a private copy: only they reach the sandbox, and the sealed bundle that `submit` publishes is verified separately against its manifest. Scratch space is a size- and inode-bounded `noexec,nosuid,nodev` tmpfs.
+
+| Profile | Runs | CPUs | Memory (no swap) | Processes | Wall time | Output | Hard lifetime |
+|---|---|---|---|---|---|---|---|
+| program | every implementation draft and the correctness gate (`python -I`) | 1 | 512 MB | 64 | 5 s | 64 KiB | 60 s |
+| scene | the scene render (Manim, Cairo renderer, 320x180 at 5 fps) | 2 | 1024 MB | 128 | 180 s | 256 KiB | 300 s |
+| media | the probe of the collected preview video (`ffprobe`) | 1 | 256 MB | 32 | 30 s | 64 KiB | 90 s |
+
+Every program, render and probe is started as UID 65532 through a fixed trusted launcher that writes a start marker and then replaces itself with the command (`/usr/local/bin/python` or `/usr/bin/ffprobe` of the image), with stderr joined to stdout. The marker is apprentice's only evidence that Docker started the command: everything after it — the exit status (including 125–127) and any output, even text that looks like a Docker error — is the program's own result. The combined output after the marker is read incrementally and cut at the output limit (the marker does not count). A program that reaches its wall time or output limit is stopped by destroying the whole container with every process it started; one that exits non-zero for any reason, is killed by the memory or process limit, or fails its assertions is an ordinary validation failure fed back to the next draft. Whatever happens, apprentice force-removes the container and has the daemon confirm it is gone before it reports a result.
+
+A fault of the sandbox itself — backend or daemon unavailable, image refused, staging refused, Docker unable to start the launcher (no start marker), the container stopping while the program ran, a process count that cannot be read, collected output failing its integrity check, or a container whose removal cannot be confirmed — is an infrastructure error: the cycle ends `failed` with it, it is never turned into drafter feedback (no model call is spent retrying it) and never into a pass.
+
+**Scene render.** After the consistency and schema gates, the blocking `scene_render` gate renders the scene's one top-level `Scene` subclass (found statically; none or several fail the gate). While the render container is still alive, a trusted collector running as UID 65531 copies the one fixed output file `videos/scene/180p5/preview.mp4` by walking directory descriptors without following links and requires a bounded, single-link regular file that did not change during the read; it never parses the video (by then no source process is left in the container, so nothing can still write it). Before collecting, apprentice reads the container's kernel task count (`docker stats`, from outside the container, so a scene that exhausted the process limit cannot block it): any task beyond the keeper's own means the render left processes or threads running, which fails the render (none can appear later, because a new task can only come from a live one). A render that left processes running, a missing, linked or changing output, or more than 16 MiB is a failed render; a scene that never plays an animation or waits renders only a still image, so it fails too. The collected bytes are then probed, as immutable read-only input, in a fresh `media` container: `ffprobe` decodes the first video stream only, which must be H.264 at 320x180 with at least one and at most 3000 frames, and the container must report a duration of at most 600 s and the collected byte size. Other streams the file may carry (for example audio) are neither decoded nor qualified; they are bounded only by the 16 MiB collection limit and the `media` profile's time, memory and output limits, and apprentice makes no further claim about them. Only then are they written to `render/scene.mp4` in the run's work root: derived output that is not part of the sealed bundle, its manifest or anything `submit` promotes.
+
+**Interruption and crashes.** On Ctrl-C or an operator SIGTERM the running container is still removed and confirmed before the command ends: the SIGTERM stop waits for the removal, and a Ctrl-C that arrives during the removal is held and raised afterwards (Docker clients run in their own process group). If apprentice itself is killed, the keeper's hard lifetime ends the container and Docker removes it. Until then a new execution for the same work root is refused rather than racing the leftover; an expired leftover is removed. Only containers of that work root are ever touched — nothing is pruned.
+
+This is container isolation by one local Docker daemon (on macOS, inside Docker Desktop's Linux VM). It is not a certified sandbox, and it does not isolate apprentice's own host process from other processes of the same user.
+
 ## Removed settings
 
 These keys were accepted earlier but never enforced; they are now rejected with their migration instead of being ignored:

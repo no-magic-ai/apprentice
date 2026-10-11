@@ -45,3 +45,10 @@ metrics_enabled = true
 [templates]
 version = "1.0.0"
 base_path = "config/templates"
+
+[execution]
+# Generated code and Manim scenes run only in this local Docker sandbox, never
+# on the host. Empty values configure no backend: builds are refused before any
+# admission or model request. See docs/configuration.md#execution.
+docker_context = ""
+image = ""

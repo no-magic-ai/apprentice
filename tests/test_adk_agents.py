@@ -20,6 +20,8 @@ from apprentice.controls.footprint import Footprint
 from apprentice.controls.policy import ControlPolicy
 from apprentice.core.config import load_config
 from apprentice.providers.factory import resolve_route
+from apprentice.sandbox.errors import SandboxInfrastructureError
+from apprentice.validators.tools import ValidatorTools
 from tests.conftest import fixture_outputs
 from tests.responses_fixture import ResponsesFixture, ResponsesServer, local_profile, write_config
 
@@ -29,6 +31,7 @@ if TYPE_CHECKING:
     from apprentice.controls.authority import Cycle
     from apprentice.core.artifacts import RunScope
     from apprentice.providers.factory import ModelRoute
+    from tests.conftest import JudgedSandbox
 
 
 async def _run(agent: Any, state: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -65,15 +68,26 @@ def toy(tmp_path: Path) -> Iterator[tuple[ResponsesFixture, ModelRoute, Cycle]]:
             yield fixture, resolve_route(config.provider), cycle
 
 
-@pytest.mark.usefixtures("judged_execution")
+class _BrokenSandbox:
+    """A sandbox whose backend fails while running a draft."""
+
+    def run_program(self, source: bytes, *, scope: str) -> Any:
+        raise SandboxInfrastructureError("sandbox container could not be confirmed removed")
+
+
 class TestImplementationLoop:
     def test_valid_first_draft_ends_the_loop_after_one_call(
-        self, scope: RunScope, toy: tuple[ResponsesFixture, ModelRoute, Cycle]
+        self,
+        scope: RunScope,
+        toy: tuple[ResponsesFixture, ModelRoute, Cycle],
+        judged_execution: JudgedSandbox,
     ) -> None:
         fixture, route, cycle = toy
         fixture.outputs = fixture_outputs()
         agent = build_implementation_agent(
-            route.model(cycle, "implementation", "implementation"), scope.work_root, max_attempts=3
+            route.model(cycle, "implementation", "implementation"),
+            ValidatorTools(scope.work_root, judged_execution),
+            max_attempts=3,
         )
 
         state = asyncio.run(_run(agent))
@@ -81,14 +95,20 @@ class TestImplementationLoop:
         assert len(fixture.generations()) == 1
         assert state["validation_feedback"] == ""
         assert Path(state["implementation_path"]).read_text() == fixture.outputs["drafter"]
+        assert judged_execution.programs == [fixture.outputs["drafter"].encode()]
 
     def test_failing_drafts_run_the_total_attempts_including_the_first(
-        self, scope: RunScope, toy: tuple[ResponsesFixture, ModelRoute, Cycle]
+        self,
+        scope: RunScope,
+        toy: tuple[ResponsesFixture, ModelRoute, Cycle],
+        judged_execution: JudgedSandbox,
     ) -> None:
         fixture, route, cycle = toy
         fixture.outputs = fixture_outputs(failing_implementation=True)
         agent = build_implementation_agent(
-            route.model(cycle, "implementation", "implementation"), scope.work_root, max_attempts=2
+            route.model(cycle, "implementation", "implementation"),
+            ValidatorTools(scope.work_root, judged_execution),
+            max_attempts=2,
         )
 
         state = asyncio.run(_run(agent))
@@ -96,6 +116,22 @@ class TestImplementationLoop:
         _first, second = fixture.generations()
         assert "fixture" in second["instructions"]
         assert "implementation_path" not in state
+
+    def test_sandbox_fault_ends_the_loop_instead_of_feeding_back_a_retry(
+        self, scope: RunScope, toy: tuple[ResponsesFixture, ModelRoute, Cycle]
+    ) -> None:
+        fixture, route, cycle = toy
+        fixture.outputs = fixture_outputs()
+        agent = build_implementation_agent(
+            route.model(cycle, "implementation", "implementation"),
+            ValidatorTools(scope.work_root, _BrokenSandbox()),
+            max_attempts=3,
+        )
+
+        with pytest.raises(SandboxInfrastructureError):
+            asyncio.run(_run(agent))
+
+        assert len(fixture.generations()) == 1
 
 
 class TestDiscoveryTools:

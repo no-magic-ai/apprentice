@@ -9,7 +9,6 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -36,30 +35,58 @@ def private_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return home
 
 
-@pytest.fixture
-def judged_execution(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Replace generated-code execution in validators and gates with a non-executing judge.
+class JudgedSandbox:
+    """Stands in for the Docker sandbox in pipeline tests; nothing generated is ever run.
 
-    Model output (even from the loopback fixture) is never run: the judge
-    reads the file and passes it unless it contains the fixture's deliberate
-    failure marker. Returns the judged paths in order.
+    A program passes unless it contains the fixture's deliberate failure
+    marker; a scene "renders" unless it contains the scene failure marker.
+    The real backend is exercised against Docker in `test_sandbox.py`.
     """
-    judged: list[str] = []
 
-    def judge(
-        args: list[str], *positional: Any, **keyword: Any
-    ) -> subprocess.CompletedProcess[str]:
-        path = Path(args[-1])
-        judged.append(str(path))
-        failing = "fixture: deliberate failure" in path.read_text(encoding="utf-8")
-        return subprocess.CompletedProcess(
-            args, 1 if failing else 0, "", "AssertionError: fixture" if failing else ""
+    image = "sha256:" + "0" * 64
+
+    def __init__(self) -> None:
+        self.programs: list[bytes] = []
+        self.scenes: list[str] = []
+
+    def run_program(self, source: bytes, *, scope: str) -> Any:
+        from apprentice.sandbox.docker import PROGRAM, ProgramRun
+
+        self.programs.append(source)
+        failing = b"fixture: deliberate failure" in source
+        return ProgramRun(
+            1 if failing else 0, "AssertionError: fixture" if failing else "", None, PROGRAM
         )
 
-    judged_subprocess = SimpleNamespace(run=judge, TimeoutExpired=subprocess.TimeoutExpired)
-    monkeypatch.setattr("apprentice.validators.correctness.subprocess", judged_subprocess)
-    monkeypatch.setattr("apprentice.gates.correctness.subprocess", judged_subprocess)
-    return judged
+    def render_scene(self, source: bytes, scene_class: str, *, scope: str) -> Any:
+        from apprentice.sandbox.docker import SceneRender
+
+        self.scenes.append(scene_class)
+        if b"fixture: deliberate scene failure" in source:
+            return SceneRender(problem="the scene render exited with status 1", output="")
+        return SceneRender(problem="", output="", video=b"judged preview")
+
+    def close(self) -> None:
+        pass
+
+    def __enter__(self) -> JudgedSandbox:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        pass
+
+
+@pytest.fixture
+def judged_execution(monkeypatch: pytest.MonkeyPatch) -> JudgedSandbox:
+    """Make every command open a judging stand-in instead of the Docker sandbox.
+
+    Model output (even from the loopback fixture) is never run: the stand-in
+    judges programs and scenes by their fixture markers. Returns the stand-in,
+    which records what it judged.
+    """
+    sandbox = JudgedSandbox()
+    monkeypatch.setattr("apprentice.sandbox.docker.open_sandbox", lambda config: sandbox)
+    return sandbox
 
 
 @pytest.fixture

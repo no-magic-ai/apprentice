@@ -105,7 +105,6 @@ Google ADK is an open-source, code-first Python framework for building multi-age
 - **`FunctionTool`** — wraps Python functions as agent-callable tools
 - **Lifecycle callbacks** — `before_agent`, `after_agent`, `before_model`, `after_model` hooks
 - **Session state** — shared state across agents via `output_key` / `{variable}` interpolation
-- **Dev web UI** — built-in debugging interface (`adk web`)
 
 **Metered model routes via LiteLlm:** every agent's `LiteLlm` gets a `MeteredResponsesClient` bound to its cycle, stage and role (`metering/client.py`). The client counts each request at `/responses/input_tokens`, reserves its bound in the installation ledger, sends it to `/responses` with the admitted `max_output_tokens`, and settles the raw usage once (see section 7.1).
 
@@ -405,25 +404,21 @@ Packaging never merges. It uses the operator's ambient `git` and `gh` credential
 
 ## 6. Validators as FunctionTools
 
-Validators are pure Python functions wrapped with ADK's `FunctionTool`. Agents call them as tools during their execution — the LLM decides when to invoke validation based on its instruction.
+Validators are methods of `ValidatorTools`, which the trusted caller binds to one run's work root (and, for correctness, the execution sandbox) when it creates them; their arguments only name files inside that root, and every file is staged from it without following links. The drafter callback and the review agent call them programmatically; the bound methods can also be wrapped as ADK tools without letting a model choose the root.
 
 ```python
 from google.adk.tools import FunctionTool
 
+from apprentice.validators.tools import ValidatorTools
 
-def lint_validate(code_path: str) -> dict:
-    """Validate Python code for syntax, docstrings, type annotations, and style."""
-    result = LintValidator().validate({"implementation": code_path}, work_item)
-    return result.to_dict()
-
-
-lint_tool = FunctionTool(func=lint_validate)
+tools = ValidatorTools(scope.work_root, sandbox)
+lint_tool = FunctionTool(func=tools.lint_validate)
 ```
 
 | Validator | Tool Name | Returns |
 |---|---|---|
 | Lint | `lint_validate` | Issues with suggestions: "Add type annotations to 'foo'" |
-| Correctness | `correctness_validate` | Pass/fail with stderr excerpt |
+| Correctness | `correctness_validate` | Pass/fail from the sandboxed run with an output excerpt |
 | Consistency | `consistency_validate` | Cross-artifact name/complexity match |
 | Schema Compliance | `schema_validate` | Convention conformance per `no-magic-schema.yaml` |
 
@@ -431,7 +426,7 @@ lint_tool = FunctionTool(func=lint_validate)
 
 ## 7. Containment System
 
-**Current implementation.** Budgets are enforced as described in 7.1. Correctness validation runs generated code with `subprocess.run` and a 5-second timeout after every draft and in the correctness gate, which is not a sandbox. Concurrent items, cooldown, rolling PR windows, per-PR file/text-line limits and the automated-work circuit are enforced by the same ledger at cycle admission and before a submission's first remote write ([Configuration](configuration.md#rate_limits)). `core/queue.py` and `core/scheduler.py` are empty modules. None of this is certified containment, and older or foreign binaries can bypass application guards.
+**Current implementation.** Budgets are enforced as described in 7.1. Generated code runs only in the one configured local Docker sandbox — every draft and the correctness gate, plus a render of the generated scene — with no network, read-only root, no capabilities, bounded resources and output and confirmed container removal; without a configured backend nothing is admitted ([Configuration](configuration.md#execution)). Concurrent items, cooldown, rolling PR windows, per-PR file/text-line limits and the automated-work circuit are enforced by the same ledger at cycle admission and before a submission's first remote write ([Configuration](configuration.md#rate_limits)). `core/queue.py` and `core/scheduler.py` are empty modules. None of this is certified containment, and older or foreign binaries can bypass application guards.
 
 ### 7.1 Budget Enforcement (reserve, dispatch, settle)
 
@@ -532,7 +527,6 @@ apprentice metrics                                      # Aggregated run metrics
 apprentice history [--status S] [--limit N]             # Past runs
 apprentice retry <run-id>                               # Re-run a failed pipeline run
 apprentice config                                       # Display apprentice.toml
-apprentice dev [--port N]                               # ADK dev UI
 ```
 
 `build --from-issue` is not implemented. `apprentice controls reset-circuit|prepare-rollback --operator NAME` are the operator actions on the circuit and rollback continuity.
@@ -705,10 +699,12 @@ no-magic-ai/apprentice/
 │       │   └── packaging.py          # Deterministic approved-byte PR creation
 │       ├── validators/
 │       │   ├── base.py               # ValidationResult, ValidationIssue
-│       │   ├── lint.py               # → FunctionTool
-│       │   ├── correctness.py        # → FunctionTool
-│       │   ├── consistency.py        # → FunctionTool
-│       │   └── schema_compliance.py  # → FunctionTool
+│       │   ├── lint.py               # LintValidator
+│       │   ├── correctness.py        # CorrectnessValidator (runs in the sandbox)
+│       │   ├── consistency.py        # ConsistencyValidator
+│       │   ├── schema_compliance.py  # SchemaComplianceValidator
+│       │   └── tools.py              # ValidatorTools bound to one trusted root
+│       ├── sandbox/                  # Docker execution backend, trusted staging, image recipe
 │       ├── controls/                 # Ledger, leases, policy, footprint, limits, publication
 │       ├── metering/                 # Price authority, accounting profiles, metered client
 │       ├── providers/
@@ -735,7 +731,7 @@ no-magic-ai/apprentice/
 |---|---|---|
 | 1 | State persistence | **SQLite** — queryable budget history, transaction safety. |
 | 2 | Template engine | **Jinja2** — one dependency, massive complexity reduction. |
-| 3 | Manim validation | **Headless render** — AST can't catch runtime errors. |
+| 3 | Manim validation | **Headless render** in the execution sandbox (`scene_render` gate) — AST can't catch runtime errors. |
 | 4 | Anki export format | **CSV for v1.0**, `.apkg` as enhancement. |
 | 5 | Autonomous trigger | **GitHub Actions** — runs where the repo lives. |
 
@@ -744,5 +740,4 @@ no-magic-ai/apprentice/
 | # | Question | Context |
 |---|---|---|
 | 6 | ADK session persistence | ADK supports `InMemorySessionService` and custom backends. Use SQLite-backed session for durable state across runs? |
-| 7 | ADK dev web UI deployment | Run `adk web` locally during development. How to integrate with CI? |
-| 8 | Local model quality threshold | Non-hosted models may produce lower quality than hosted ones. Should validators be stricter for local models? |
+| 7 | Local model quality threshold | Non-hosted models may produce lower quality than hosted ones. Should validators be stricter for local models? |

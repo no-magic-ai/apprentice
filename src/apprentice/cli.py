@@ -138,9 +138,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     rollback_parser.add_argument("--operator", type=str, required=True, help="Operator identity")
 
-    dev_parser = subparsers.add_parser("dev", help="Launch ADK dev UI for interactive debugging")
-    dev_parser.add_argument("--port", type=int, default=8080, help="Dev UI port (default: 8080)")
-
     args = parser.parse_args(argv)
 
     if args.command is None:
@@ -232,8 +229,6 @@ def _dispatch(
         return _cmd_controls(footprint, args)
     if args.command == "config":
         return _cmd_config(cfg)
-    if args.command == "dev":
-        return _cmd_dev(cfg, args)
 
     parser.print_help()
     return 1
@@ -314,12 +309,18 @@ def _controlled_build(
     kind: str,
     progress: Any,
 ) -> BuildResult | None:
-    """Run one controlled build cycle, or print why none was admitted."""
+    """Run one controlled build cycle, or print why none was admitted.
+
+    The route and the execution sandbox are both verified before any
+    admission: without a usable backend nothing is admitted or requested.
+    """
     from apprentice.controls.errors import AuthorityError, ControlDeniedError
     from apprentice.controls.policy import ControlPolicy
     from apprentice.core.artifacts import ArtifactError
     from apprentice.core.cycles import run_build
     from apprentice.core.session_store import SessionStore
+    from apprentice.sandbox import docker
+    from apprentice.sandbox.errors import SandboxUnavailableError
 
     try:
         SessionStore.new_run_id(request[0], request[1])
@@ -329,28 +330,40 @@ def _controlled_build(
     route = _resolve_route(cfg, args)
     if route is None:
         return None
-    store = SessionStore()
-    authority = _open_authority(store, footprint)
-    if authority is None:
-        return None
     try:
-        return run_build(
-            store=store,
-            authority=authority,
-            route=route,
-            policy=ControlPolicy.from_config(cfg),
-            request=request,
-            kind=kind,
-            progress=progress,
+        sandbox = docker.open_sandbox(cfg.execution)
+    except SandboxUnavailableError as exc:
+        _print_json(
+            {
+                "error": f"execution sandbox unavailable: {exc}",
+                "denied_before": "any cycle admission or request",
+            }
         )
-    except ControlDeniedError as exc:
-        _print_denial(exc)
         return None
-    except AuthorityError as exc:
-        _print_json({"error": f"control authority unavailable: {exc}"})
-        return None
-    finally:
-        authority.close()
+    with sandbox:
+        store = SessionStore()
+        authority = _open_authority(store, footprint)
+        if authority is None:
+            return None
+        try:
+            return run_build(
+                store=store,
+                authority=authority,
+                route=route,
+                policy=ControlPolicy.from_config(cfg),
+                request=request,
+                kind=kind,
+                sandbox=sandbox,
+                progress=progress,
+            )
+        except ControlDeniedError as exc:
+            _print_denial(exc)
+            return None
+        except AuthorityError as exc:
+            _print_json({"error": f"control authority unavailable: {exc}"})
+            return None
+        finally:
+            authority.close()
 
 
 def _print_build_failure(result: BuildResult) -> None:
@@ -1153,24 +1166,6 @@ def _cmd_controls(footprint: Footprint, args: Any) -> int:
 
 def _cmd_config(cfg: ApprenticeConfig) -> int:
     _print_json(asdict(cfg))
-    return 0
-
-
-def _cmd_dev(cfg: ApprenticeConfig, args: Any) -> int:
-    import subprocess
-
-    port = args.port
-    _print_json({"message": f"Starting ADK dev UI on port {port}", "command": "adk web"})
-    try:
-        subprocess.run(
-            ["adk", "web", "--port", str(port)],
-            check=True,
-        )
-    except FileNotFoundError:
-        _print_json({"error": "adk CLI not found. Install google-adk: uv add google-adk"})
-        return 1
-    except subprocess.CalledProcessError:
-        return 1
     return 0
 
 
